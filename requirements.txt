@@ -1,0 +1,6 @@
+anthropic
+chromadb
+psycopg[binary]
+python-dotenv
+httpx
+slack_bolt
