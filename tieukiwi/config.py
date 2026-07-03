@@ -18,6 +18,18 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
+# ---- Ingestion LLM (see tieukiwi/llm.py) --------------------------------
+# LLM used by ingestion pipelines to extract entities from BRD/PDF/etc.
+# The agent's tool-use loop (agent.py) still talks to Anthropic directly.
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "anthropic").lower()
+
+# Anthropic (default provider when key is set)
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+# Ollama fallback (offline / dev without key)
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+OLLAMA_LLM_MODEL = os.getenv("OLLAMA_LLM_MODEL", "qwen2.5:7b")
+
 # --- Model configuration ---
 # Default model for the agent; override with ANTHROPIC_MODEL in .env.
 DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
