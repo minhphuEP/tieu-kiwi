@@ -51,6 +51,16 @@ def _adf_to_text(node):
     return None
 
 
+def _story_points(fields):
+    # Story points live in a custom field whose id varies per Jira instance.
+    # Try the common ids and return the first numeric value; skip if none present.
+    for k in ("customfield_10016", "customfield_10026", "customfield_10004", "customfield_10002"):
+        v = fields.get(k)
+        if isinstance(v, (int, float)):
+            return v
+    return None
+
+
 def fetch_jira(issue_key):
     # Read a Jira Cloud issue (REST v3) and upsert it into the graph as a Requirement.
     if not (config.JIRA_BASE_URL and config.JIRA_EMAIL and config.JIRA_API_TOKEN):
@@ -86,25 +96,48 @@ def fetch_jira(issue_key):
     description = _adf_to_text(fields.get("description"))
     issuetype = (fields.get("issuetype") or {}).get("name")
     status = (fields.get("status") or {}).get("name")
+    priority = (fields.get("priority") or {}).get("name")
 
-    node_id = db.upsert_node_by_ref(
-        "Requirement",
-        key,
-        {
-            "source": "jira",
-            "summary": summary,
-            "status": status,
-            "issuetype": issuetype,
-            "description": description,
-        },
-    )
+    # People: assignee may be JSON null -> "Unassigned". Guard every level with `or {}`.
+    assignee = (fields.get("assignee") or {}).get("displayName") or "Unassigned"
+    reporter = (fields.get("reporter") or {}).get("displayName")
 
-    return {
-        "tool": "fetch_jira",
-        "status": "ok",
-        "issue": {"key": key, "summary": summary, "issuetype": issuetype, "status": status},
-        "node_id": node_id,
+    # Optional fields — vary per Jira instance; never fail if absent.
+    fix_versions = [v.get("name") for v in (fields.get("fixVersions") or []) if v.get("name")]
+    story_points = _story_points(fields)
+
+    props = {
+        "source": "jira",
+        "summary": summary,
+        "status": status,
+        "issuetype": issuetype,
+        "priority": priority,
+        "assignee": assignee,
+        "reporter": reporter,
+        "description": description,
     }
+    if fix_versions:
+        props["fix_versions"] = fix_versions
+    if story_points is not None:
+        props["story_points"] = story_points
+
+    node_id = db.upsert_node_by_ref("Requirement", key, props)
+
+    issue = {
+        "key": key,
+        "summary": summary,
+        "issuetype": issuetype,
+        "status": status,
+        "priority": priority,
+        "assignee": assignee,
+        "reporter": reporter,
+    }
+    if fix_versions:
+        issue["fix_versions"] = fix_versions
+    if story_points is not None:
+        issue["story_points"] = story_points
+
+    return {"tool": "fetch_jira", "status": "ok", "issue": issue, "node_id": node_id}
 
 
 TOOLS = [
@@ -189,7 +222,8 @@ TOOLS = [
     "name": "fetch_jira",
     "description": (
         "Fetch a Jira issue by key (e.g. PROJ-123) from Jira Cloud and store it in the "
-        "graph as a Requirement node. Returns key/summary/issuetype/status + node id."
+        "graph as a Requirement node. Returns key, summary, issuetype, status, priority, "
+        "assignee (or 'Unassigned'), reporter (+ optional fix_versions / story_points) and node id."
     ),
     "input_schema": {
       "type": "object",

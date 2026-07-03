@@ -13,7 +13,7 @@ ANTHROPIC_API_KEY for the agent). Importing this module does NOT require the tok
 
 import re
 
-from . import agent, config
+from . import agent, config, slack_format
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
@@ -61,14 +61,16 @@ def _strip_mention(text):
 
 
 def handle_question(text, logger=None):
-    # Shared logic for both entry points: run the Layer A agent and return an
-    # answer string. Never raises — a failure comes back as an error message.
+    # Shared logic for both entry points: run the Layer A agent and return a
+    # Slack-friendly answer string. Never raises — a failure comes back as an error message.
+    # The agent returns GitHub Markdown; convert it to Slack mrkdwn before sending.
     try:
-        return agent.ask(text)
+        answer = agent.ask(text)
     except Exception as e:
         if logger is not None:
             logger.exception("agent.ask failed")
         return f":warning: Error: {e}"
+    return slack_format.markdown_to_mrkdwn(answer)
 
 
 def build_app():
