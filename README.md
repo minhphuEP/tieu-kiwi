@@ -13,17 +13,18 @@ loop — never a rewrite.**
 
 ## ⚠️ Current status
 
-Tieu Kiwi is built agent‑first, in three layers. Only **Layer A runs today**:
+Tieu Kiwi is built agent‑first, in three layers. **Layers A and B run today**:
 
 | Layer | Scope | Status |
 |-------|-------|--------|
 | **A — Agent core** | CLI tool‑use loop + graph/RAG tools (Claude API) | ✅ Working |
-| **B — Slack wrapper** | Slack app (Socket Mode), `/tieukiwi` command, Bolt handler | 🚧 Planned (`slack_bolt` installed, not wired) |
+| **B — Slack wrapper** | Slack app (Socket Mode), `/tieukiwi` command, Bolt handler | ✅ Working |
 | **C — Loop & learning** | Thread feedback loop, KB promotion, curator approval | 🚧 Planned |
 
-Some tools are **live** (`search_kb`, `coverage_gap`, `trace`, `bug_blast_radius`, `go_no_go`)
-while others are **skeletons with clear TODOs** (`gen_testcase`, `gen_test_plan`, `gen_critic`,
-`fetch_jira`). Jira and Slack integrations are on the roadmap — see
+Live tools: `search_kb`, `coverage_gap`, `trace`, `bug_blast_radius`, `go_no_go`, and
+**`fetch_jira`** (reads a Jira issue and writes it into the graph). The content‑generation tools
+`gen_testcase`, `gen_test_plan`, `gen_critic` are still **skeletons with clear TODOs**. The
+remaining feedback/learning loop (Layer C) is on the roadmap — see
 [`docs/ROADMAP.md`](docs/ROADMAP.md). This README marks planned pieces explicitly so you always
 know what actually works.
 
@@ -35,24 +36,25 @@ know what actually works.
 - 🧠 **Postgres knowledge graph** — Requirements, Acceptance Criteria, Test Cases, Test Runs, Bugs and Components stored as `nodes`/`edges`, queried with plain parameterized SQL (no Neo4j).
 - 📚 **Chroma RAG** — team rules, glossary, and QE skills indexed into a local Chroma vector store for retrieval.
 - ✅ **QE decision tools** — coverage‑gap detection, requirement tracing, bug blast‑radius, and an aggregate **GO / NO‑GO** call with concrete next actions.
-- 🔌 **Jira integration** — credentials wired in config; `fetch_jira` tool scaffolded (skeleton). *(planned)*
-- 💬 **Slack integration** — Socket‑Mode app + `/tieukiwi` command. *(planned, Layer B)*
+- 🔌 **Jira integration** — the `fetch_jira` tool reads a Jira Cloud issue (REST v3) and upserts it into the graph as a `Requirement` node.
+- 💬 **Slack integration** — Socket‑Mode app with a `/tieukiwi` slash command (acks <3s, dedups, replies in Block Kit).
 
 ---
 
 ## Architecture
 
-Today the agent runs on the **CLI**; Slack and Jira are the target wireframe (dashed = planned).
+Users reach the agent via the **CLI** or the **Slack `/tieukiwi` command**; the agent reads Jira
+through the `fetch_jira` tool.
 
 ```mermaid
 flowchart TD
     user([User])
     cli[CLI  python -m tieukiwi.cli]
-    slack[/Slack  /tieukiwi/]:::planned
+    slack[/Slack  /tieukiwi<br/>slack_app.py/]
 
     user --> cli
-    user -.-> slack
-    slack -.-> agent
+    user --> slack
+    slack --> agent
 
     cli --> agent
 
@@ -66,17 +68,15 @@ flowchart TD
 
     tools --> rag[(Chroma RAG<br/>./chroma_db)]
     tools --> pg[(Postgres<br/>knowledge graph)]
-    tools -.-> jira[[Jira REST]]:::planned
-
-    classDef planned stroke-dasharray: 5 5,opacity:0.7;
+    tools --> jira[[Jira REST v3]]
 ```
 
 Plain‑text view:
 
 ```
-User ─▶ CLI ─▶ Agent loop (Claude) ─▶ tools ─┬─▶ Chroma RAG   (rules/glossary/skills)
-              (Slack ─▶ …  planned)          ├─▶ Postgres     (Requirement→AC→TestCase→TestRun→Bug)
-                                             └─▶ Jira REST    (planned)
+User ─▶ CLI ───────▶ Agent loop (Claude) ─▶ tools ─┬─▶ Chroma RAG  (rules/glossary/skills)
+     ▶ Slack /tieukiwi ▲                            ├─▶ Postgres    (Requirement→AC→TestCase→TestRun→Bug)
+       (slack_app.py) ─┘                            └─▶ Jira REST   (fetch_jira → upsert Requirement)
 ```
 
 **Knowledge‑graph ontology** (stored relationally in `nodes`/`edges`):
@@ -100,8 +100,8 @@ Requirement          -impacts->    Component
 | **Python 3.11+** | Developed and tested on CPython 3.11. |
 | **Docker + Docker Compose** | For the local Postgres instance (`docker-compose.yml`). |
 | **Anthropic API key** | Required — the agent won't start without it. Get one at <https://console.anthropic.com>. |
-| **Jira account + API token** | *Optional/planned* — for the `fetch_jira` tool. Token: <https://id.atlassian.com/manage-profile/security/api-tokens>. |
-| **Slack tokens** (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`) | *Optional/planned (Layer B)* — a Socket‑Mode app; not required to run the CLI today. |
+| **Jira account + API token** | *Optional* — enables the `fetch_jira` tool. Token: <https://id.atlassian.com/manage-profile/security/api-tokens>. |
+| **Slack tokens** (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`) | *Optional* — needed only to run the Slack app (`python -m tieukiwi.slack_app`); the CLI works without them. |
 
 ---
 
@@ -149,25 +149,26 @@ ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx
 # Matches the credentials in docker-compose.yml for local dev.
 DATABASE_URL=postgresql://tieukiwi_app:devpass@localhost:5432/tieukiwi
 
-# ── Jira (reserved) — consumed by the fetch_jira tool (currently a skeleton) ──
+# ── Jira — consumed by the fetch_jira tool ───────────────────────────────
 JIRA_BASE_URL=          # e.g. https://your-org.atlassian.net
 JIRA_EMAIL=             # Jira account email (Basic-auth username)
 JIRA_API_TOKEN=         # Jira API token
 
-# ── Slack (planned, Layer B) — not read by code yet ──────────────────────
+# ── Slack (Layer B, Socket Mode) — run: python -m tieukiwi.slack_app ──────
 SLACK_BOT_TOKEN=        # Bot User OAuth token (xoxb-...)
 SLACK_APP_TOKEN=        # App-level token for Socket Mode (xapp-...)
+SLACK_SIGNING_SECRET=   # Signing secret (app Basic Information page)
 ```
 
-| Variable | Used by | Required now? |
-|----------|---------|---------------|
+| Variable | Used by | Required? |
+|----------|---------|-----------|
 | `ANTHROPIC_API_KEY` | `agent.py` (Claude client), `config.py` | ✅ Yes |
 | `DATABASE_URL` | `config.py` → `db.py` (all graph tools) | ✅ Yes (for graph tools) |
-| `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | `fetch_jira` tool | ⚠️ Reserved (skeleton) |
-| `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | Slack app (Layer B) | ⚠️ Reserved (planned) |
+| `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | `fetch_jira` tool | ⚙️ For Jira |
+| `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` | `slack_app.py` (Layer B) | ⚙️ For Slack |
 
-> 🔒 `.env` is git‑ignored. Never commit real keys. The Slack tokens are **not read by any code
-> yet** — they're placeholders for the planned Layer B Slack app.
+> 🔒 `.env` is git‑ignored. Never commit real keys. Jira vars are only needed for `fetch_jira`, and
+> the Slack vars only to run the Slack app — the CLI runs with just `ANTHROPIC_API_KEY` + `DATABASE_URL`.
 
 ---
 
@@ -239,24 +240,44 @@ python -c "import tieukiwi.tools, tieukiwi.db, tieukiwi.memory, tieukiwi.routing
 python -c "from tieukiwi.db import go_no_go; print('config OK')"
 ```
 
-> Slack “is it connected?” checks don’t apply yet — Layer B (Slack) is not implemented.
+### Running the Slack app (Layer B)
+
+With `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and `SLACK_SIGNING_SECRET` set in `.env` (and the app
+installed with Socket Mode + the `/tieukiwi` command registered):
+
+```bash
+python -m tieukiwi.slack_app
+# → "Tieu Kiwi Slack app starting (Socket Mode). Ctrl+C to stop."
+```
+
+Then in Slack: `/tieukiwi is JIRA-101 ready to go live?` — you'll get an immediate “Processing…”
+ack, followed by the agent's answer as a formatted message. If tokens are missing the app exits
+with a clear message listing which ones.
 
 ---
 
 ## Integrations Setup
 
-### Jira *(reserved — `fetch_jira` is a skeleton)*
+### Jira
 1. Create an API token at <https://id.atlassian.com/manage-profile/security/api-tokens>.
 2. Set `JIRA_BASE_URL` (e.g. `https://your-org.atlassian.net`), `JIRA_EMAIL`, `JIRA_API_TOKEN` in `.env`.
-3. The `fetch_jira` tool authenticates via HTTP Basic (`email:token`) over `httpx`. The tool is
-   currently scaffolded (returns a `not_implemented` marker) — implementing the REST call is a
-   Layer A follow‑up.
+3. The `fetch_jira` tool calls `GET /rest/api/3/issue/{key}` with HTTP Basic auth (`email:token`)
+   over `httpx`. It parses key/summary/description/issuetype/status and **upserts** a `Requirement`
+   node into the graph (keyed by `ref`, so re‑fetching the same issue updates rather than duplicates).
+   If the Jira env vars are missing it returns a clear error instead of crashing.
 
-### Slack *(planned — Layer B)*
-Not implemented yet. When built (see `docs/ROADMAP.md`), it will be a **Socket Mode** app with a
-`/tieukiwi` slash command and these scopes: `app_mentions:read`, `chat:write`, `commands`,
-`channels:history`, `groups:history`, `im:history`, `files:read`, `users:read`. The Bolt handler
-will ack within 3 s, dedup events, call the Layer A agent, and reply with Block Kit.
+### Slack (Layer B — Socket Mode)
+1. Create a Slack app and **enable Socket Mode**.
+2. Add bot scopes: `commands`, `chat:write` (plus `app_mentions:read`, `channels:history`,
+   `groups:history`, `im:history`, `files:read`, `users:read` for future features).
+3. Create the `/tieukiwi` slash command; generate an **App‑Level Token** (`connections:write`) for
+   Socket Mode.
+4. Put `SLACK_BOT_TOKEN` (xoxb‑), `SLACK_APP_TOKEN` (xapp‑), and `SLACK_SIGNING_SECRET` in `.env`.
+5. Run `python -m tieukiwi.slack_app`. The Bolt handler acks within 3 s, dedups retries/duplicate
+   invocations, calls the Layer A agent (`agent.ask`), and replies in Block Kit `mrkdwn`.
+
+> Note: routing action items *to specific owners* via Slack (`routing.py`) is still a Layer C TODO —
+> the `/tieukiwi` command itself is fully working.
 
 ---
 
@@ -322,9 +343,25 @@ failing, and BUG‑1 (high) is still open. Next: write a test for AC‑2, fix TC
 
 **Other prompts to try:** *“Which acceptance criteria have no tests?”* (`coverage_gap`),
 *“Trace JIRA‑101”* (`trace`), *“What's the blast radius of BUG‑1?”* (`bug_blast_radius`),
-*“Search the KB for our code‑review standards”* (`search_kb`).
+*“Fetch PROJ‑123 from Jira”* (`fetch_jira`), *“Search the KB for our code‑review standards”* (`search_kb`).
 
-> There is no HTTP/API surface today — the interface is the CLI. A Slack surface is planned (Layer B).
+**Via Slack:**
+
+```
+/tieukiwi is JIRA-101 ready to go live?
+```
+
+Slack immediately shows *“Processing…”*, then Tieu Kiwi posts the GO/NO‑GO answer back into the
+channel as a formatted message.
+
+**Pulling a requirement from Jira** (writes it into the graph as a `Requirement` node):
+
+```bash
+python -c "from tieukiwi.tools import fetch_jira; print(fetch_jira('PROJ-123'))"
+# → {'tool': 'fetch_jira', 'status': 'ok',
+#    'issue': {'key': 'PROJ-123', 'summary': '...', 'issuetype': 'Story', 'status': 'In Progress'},
+#    'node_id': 42}
+```
 
 ---
 
@@ -347,13 +384,14 @@ tieu-kiwi/
 ├── docs/
 │   └── ROADMAP.md           # Layer B (Slack) & Layer C (feedback loop) plan
 └── tieukiwi/                # The Python package
-    ├── config.py            # Loads .env; exposes ANTHROPIC_API_KEY, DATABASE_URL
-    ├── db.py                # Postgres connection + graph tools (coverage_gap, trace, go_no_go, …)
+    ├── config.py            # Loads .env; exposes ANTHROPIC/DATABASE/model/JIRA_*/SLACK_* settings
+    ├── db.py                # Postgres connection + graph tools (coverage_gap, trace, go_no_go, upsert_node_by_ref, …)
     ├── rag.py               # Chroma: index_docs() / search()
     ├── memory.py            # 3-tier memory (Tier 2 = thread_state; Tier 3 TODO)
     ├── routing.py           # Entity-type → owner-role routing (Slack delivery TODO)
-    ├── tools.py             # TOOLS definitions + run_tool dispatcher
-    ├── agent.py             # Claude tool-use loop (model: claude-sonnet-4-6)
+    ├── tools.py             # TOOLS definitions + run_tool dispatcher (incl. fetch_jira)
+    ├── agent.py             # Claude tool-use loop (model configurable via config)
+    ├── slack_app.py         # Slack Socket-Mode app (python -m tieukiwi.slack_app)
     └── cli.py               # CLI entry point (python -m tieukiwi.cli)
 ```
 
@@ -370,12 +408,16 @@ tieu-kiwi/
 | First `search_kb`/`seed.py` is slow or downloads a file | Chroma is fetching the `all-MiniLM-L6-v2` embedding model (~80 MB) once. Ensure network access; subsequent runs use the cache. |
 | Anthropic `RateLimitError` / `429` | You've hit API rate limits. Back off and retry, reduce request frequency, or check your plan/limits in the Anthropic console. |
 | `chromadb ... InvalidArgumentError: name ... 3-512 characters` | Chroma collection names must be ≥3 chars — this repo uses `knowledge_base` (not `kb`). Keep the name in `rag.py` as‑is. |
+| `fetch_jira` returns `{"status": "error", "error": "Jira is not configured…"}` | Set `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` in `.env`. An HTTP 401/403 means bad email/token; 404 means the issue key doesn't exist or isn't visible to that account. |
+| `SystemExit: Slack is not configured. Missing: …` | The Slack app needs `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` (and ideally `SLACK_SIGNING_SECRET`). Add them to `.env`. |
+| `/tieukiwi` shows a Slack timeout / "failed" | The handler must ack within 3 s. It does by default; if you see this, the app process isn't running (`python -m tieukiwi.slack_app`) or Socket Mode / the slash command isn't configured in the Slack app. |
 
 ---
 
 ## Contributing / Roadmap
 
-The next milestones are the **Slack wrapper (Layer B)** and the **feedback/learning loop
-(Layer C)** — including KB promotion with a curator approval step. See
-[`docs/ROADMAP.md`](docs/ROADMAP.md). When adding a capability, follow the project convention:
-**add one entry to `TOOLS` + one branch in `run_tool` — don't rewrite the agent loop.**
+Layers A (agent core) and B (Slack wrapper) are in place. The next milestone is the
+**feedback/learning loop (Layer C)** — thread feedback, KB promotion with a curator approval step,
+and routing action items to owners via Slack. See [`docs/ROADMAP.md`](docs/ROADMAP.md). When adding
+a capability, follow the project convention: **add one entry to `TOOLS` + one branch in `run_tool`
+— don't rewrite the agent loop.**

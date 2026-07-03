@@ -1,4 +1,6 @@
-from . import db, rag
+import httpx
+
+from . import config, db, rag
 
 
 # --- Layer A skeletons (TODO: implement) ---
@@ -10,32 +12,99 @@ def _not_implemented(tool, todo):
 
 
 def gen_testcase(requirement_ref):
+    model = config.model_for("gen_testcase")  # TODO: pass into the Claude call when implemented
     # TODO: load requirement + ACs (db.trace) and relevant KB (rag.search),
-    # then call the Claude API to draft TestCase nodes; return proposed testcases.
+    # then call the Claude API (model=model) to draft TestCase nodes; return proposed testcases.
     return _not_implemented(
         "gen_testcase", "Generate testcases via Claude from requirement + KB context."
     )
 
 
 def gen_test_plan(requirement_ref):
-    # TODO: aggregate ACs/testcases for the requirement and draft a structured test plan.
+    model = config.model_for("gen_test_plan")  # TODO: pass into the Claude call when implemented
+    # TODO: aggregate ACs/testcases for the requirement and draft a structured test plan (model=model).
     return _not_implemented(
         "gen_test_plan", "Generate a structured test plan via Claude."
     )
 
 
 def gen_critic(text):
-    # TODO: critique PRD/Design/spec text against KB review rules (rag.search) via Claude.
+    model = config.model_for("gen_critic")  # TODO: pass into the Claude call when implemented
+    # TODO: critique PRD/Design/spec text against KB review rules (rag.search) via Claude (model=model).
     return _not_implemented(
         "gen_critic", "Critique PRD/Design against KB review rules via Claude."
     )
 
 
+def _adf_to_text(node):
+    # Best-effort flatten of Atlassian Document Format (or a plain string) to text.
+    if node is None:
+        return None
+    if isinstance(node, str):
+        return node
+    if isinstance(node, dict):
+        if node.get("type") == "text":
+            return node.get("text", "")
+        return "".join(t for t in (_adf_to_text(c) for c in node.get("content", [])) if t)
+    if isinstance(node, list):
+        return "".join(_adf_to_text(n) or "" for n in node)
+    return None
+
+
 def fetch_jira(issue_key):
-    # TODO: call the Jira REST API with httpx (Basic auth: email + API token from .env).
-    return _not_implemented(
-        "fetch_jira", "Fetch a Jira issue via httpx REST (Basic auth from .env)."
+    # Read a Jira Cloud issue (REST v3) and upsert it into the graph as a Requirement.
+    if not (config.JIRA_BASE_URL and config.JIRA_EMAIL and config.JIRA_API_TOKEN):
+        return {
+            "tool": "fetch_jira",
+            "status": "error",
+            "error": "Jira is not configured. Set JIRA_BASE_URL, JIRA_EMAIL, and "
+                     "JIRA_API_TOKEN in .env (see .env.example).",
+        }
+
+    url = f"{config.JIRA_BASE_URL.rstrip('/')}/rest/api/3/issue/{issue_key}"
+    try:
+        resp = httpx.get(
+            url,
+            auth=(config.JIRA_EMAIL, config.JIRA_API_TOKEN),
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        return {
+            "tool": "fetch_jira",
+            "status": "error",
+            "error": f"Jira API returned HTTP {e.response.status_code} for {issue_key}.",
+        }
+    except httpx.HTTPError as e:
+        return {"tool": "fetch_jira", "status": "error", "error": f"Jira request failed: {e}"}
+
+    data = resp.json()
+    fields = data.get("fields", {}) or {}
+    key = data.get("key", issue_key)
+    summary = fields.get("summary")
+    description = _adf_to_text(fields.get("description"))
+    issuetype = (fields.get("issuetype") or {}).get("name")
+    status = (fields.get("status") or {}).get("name")
+
+    node_id = db.upsert_node_by_ref(
+        "Requirement",
+        key,
+        {
+            "source": "jira",
+            "summary": summary,
+            "status": status,
+            "issuetype": issuetype,
+            "description": description,
+        },
     )
+
+    return {
+        "tool": "fetch_jira",
+        "status": "ok",
+        "issue": {"key": key, "summary": summary, "issuetype": issuetype, "status": status},
+        "node_id": node_id,
+    }
 
 
 TOOLS = [
@@ -118,7 +187,10 @@ TOOLS = [
   },
   {
     "name": "fetch_jira",
-    "description": "Fetch a Jira issue (requirement/ticket) by key. (SKELETON — TODO: httpx REST call.)",
+    "description": (
+        "Fetch a Jira issue by key (e.g. PROJ-123) from Jira Cloud and store it in the "
+        "graph as a Requirement node. Returns key/summary/issuetype/status + node id."
+    ),
     "input_schema": {
       "type": "object",
       "properties": {"issue_key": {"type": "string"}},

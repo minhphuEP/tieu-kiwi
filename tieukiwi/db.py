@@ -27,6 +27,28 @@ def add_edge(src_id, rel, dst_id, props=None):
             (src_id, rel, dst_id, psycopg.types.json.Json(props or {})),
         )
 
+def upsert_node_by_ref(type_, ref, props=None):
+    # Insert a node, or update its props if one with the same (type, ref) already exists.
+    # Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
+    props = props or {}
+    with conn() as c:
+        row = c.execute(
+            "SELECT id FROM nodes WHERE type=%s AND ref=%s ORDER BY id LIMIT 1",
+            (type_, ref),
+        ).fetchone()
+        if row:
+            node_id = row[0]
+            c.execute(
+                "UPDATE nodes SET props_json=%s WHERE id=%s",
+                (psycopg.types.json.Json(props), node_id),
+            )
+            return node_id
+        row = c.execute(
+            "INSERT INTO nodes(type, ref, props_json) VALUES (%s,%s,%s) RETURNING id",
+            (type_, ref, psycopg.types.json.Json(props)),
+        ).fetchone()
+        return row[0]
+
 # Bug severities that block a go-live decision.
 HIGH_SEVERITIES = ("critical", "high")
 

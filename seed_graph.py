@@ -10,13 +10,13 @@ Requirements:
 This wipes the nodes/edges tables and inserts a small deterministic sample,
 so run it only against a development/test database.
 
-Sample (JIRA-101):
+Sample (FRONT-3494):
     - AC-1: covered by a passing test  -> ok
     - AC-2: no test                    -> coverage gap
     - AC-3: covered by a failing test  -> failing test
     - BUG-1: open, severity=high, violates AC-1 -> blocking bug
 
-Expected: go_no_go("JIRA-101") -> NO-GO with all three problem types.
+Expected: go_no_go("FRONT-3494") -> NO-GO with all three problem types.
 """
 
 from dotenv import load_dotenv; load_dotenv()
@@ -34,7 +34,7 @@ def reset_graph():
 def seed():
     reset_graph()
 
-    req = db.add_node("Requirement", "JIRA-101")
+    req = db.add_node("Requirement", "FRONT-3494")
 
     # AC-1: covered by a passing test
     ac1 = db.add_node("AcceptanceCriterion", "AC-1")
@@ -65,8 +65,8 @@ def seed():
 
 def main():
     seed()
-    print("Seeded sample graph for JIRA-101.")
-    print("go_no_go('JIRA-101') =", db.go_no_go("JIRA-101"))
+    print("Seeded sample graph for FRONT-3494.")
+    print("go_no_go('FRONT-3494') =", db.go_no_go("FRONT-3494"))
 
 
 if __name__ == "__main__":

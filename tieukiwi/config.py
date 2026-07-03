@@ -17,3 +17,31 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+# --- Model configuration ---
+# Default model for the agent; override with ANTHROPIC_MODEL in .env.
+DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+# Per-task model overrides. Each falls back to DEFAULT_MODEL when its env var is unset.
+TASK_MODELS = {
+    "agent":         os.getenv("MODEL_AGENT", DEFAULT_MODEL),
+    "gen_critic":    os.getenv("MODEL_GEN_CRITIC", DEFAULT_MODEL),
+    "gen_testcase":  os.getenv("MODEL_GEN_TESTCASE", DEFAULT_MODEL),
+    "gen_test_plan": os.getenv("MODEL_GEN_TEST_PLAN", DEFAULT_MODEL),
+}
+
+
+def model_for(task):
+    """Return the model configured for a task, or DEFAULT_MODEL if none."""
+    return TASK_MODELS.get(task, DEFAULT_MODEL)
+
+
+# --- Jira (data source read through the fetch_jira tool) ---
+JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
+JIRA_EMAIL = os.getenv("JIRA_EMAIL")
+JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+
+# --- Slack (Layer B, Socket Mode) ---
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
