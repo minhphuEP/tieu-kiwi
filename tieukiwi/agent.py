@@ -7,7 +7,7 @@ client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
 def ask(user_msg, system="You are Tieu Kiwi, a QE support agent.",
-        project_id=None, role=None):
+        project_id=None, role=None, model = None):
     """Drive one tool-use conversation to completion and return the final text.
 
     Args:
@@ -19,6 +19,9 @@ def ask(user_msg, system="You are Tieu Kiwi, a QE support agent.",
       role:       persona for RAG filtering (e.g. 'QE'). Passed to search_kb.
     """
     context = {"project_id": project_id, "role": role}
+    messages = [{"role": "user", "content": user_msg}]
+    if model is None:
+        model = config.model_for("agent")
     messages = [{"role": "user", "content": user_msg}]
     while True:
         resp = client.messages.create(
