@@ -19,9 +19,14 @@ def ask(user_msg, system="You are Tieu Kiwi, a QE support agent.",
       role:       persona for RAG filtering (e.g. 'QE'). Passed to search_kb.
     """
     context = {"project_id": project_id, "role": role}
-    messages = [{"role": "user", "content": user_msg}]
     if model is None:
         model = config.model_for("agent")
+    if not isinstance(model, str):
+        raise TypeError(
+            f"model must be a string, got {type(model).__name__}. "
+            f"Did you pass the config module by mistake? Use config.DEFAULT_MODEL "
+            f"or config.model_for('agent')."
+        )
     messages = [{"role": "user", "content": user_msg}]
     while True:
         resp = client.messages.create(
