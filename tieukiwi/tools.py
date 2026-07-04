@@ -183,6 +183,20 @@ TOOLS = [
     },
   },
   {
+    "name": "classify_bug",
+    "description": (
+        "Classify how a bug was detected to route it into the improvement loop. "
+        "Returns one of: caught_by_test | leaked_tc_missing | leaked_tc_not_run | "
+        "leaked_tc_ran_missed | leaked_no_ac_link. Each 'leaked_*' category points at "
+        "which pipeline needs improvement (gen_testcase, impact_analysis, execution_quality)."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {"bug_ref": {"type": "string"}},
+      "required": ["bug_ref"],
+    },
+  },
+  {
     "name": "gen_testcase",
     "description": "Generate test cases for a requirement/AC. (SKELETON — TODO: implement LLM generation.)",
     "input_schema": {
@@ -259,6 +273,8 @@ def run_tool(name, args, context=None):
         return db.trace(args["requirement_ref"], project_id=project_id)
     if name == "bug_blast_radius":
         return db.bug_blast_radius(args["bug_ref"], project_id=project_id)
+    if name == "classify_bug":
+        return db.classify_bug(args["bug_ref"], project_id=project_id)
     if name == "gen_testcase":
         return gen_testcase(args["requirement_ref"])
     if name == "gen_test_plan":
