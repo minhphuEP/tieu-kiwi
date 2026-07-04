@@ -1,33 +1,132 @@
 """Ask routing: map an entity type to the owner role responsible for it.
 
+Two-tier API:
+  - owner_for(entity_type)            -> role name (string). Legacy, class-level.
+  - resolve_owner_slack(node_id)      -> user dict (or None). Instance-level with
+                                         3-tier fallback + Feedback hop.
+
 Used to route coverage gaps / go-no-go action items to the right person.
 The Slack delivery part (actually posting to the owner) is TODO (Layer B).
 """
 
+from . import db
+
+
 # Entity type (per ontology) -> owner role responsible for fixing gaps on it.
 ENTITY_OWNER = {
-    "Requirement": "product-owner",
-    "AcceptanceCriterion": "qa-lead",
-    "TestCase": "qa-engineer",
-    "TestPlan": "qa-lead",
-    "TestRun": "qa-engineer",
-    "Bug": "dev-owner",
-    "Component": "tech-lead",
+    "Sprint":              "product-owner",
+    "UserStory":           "product-owner",
+    "Requirement":         "product-owner",
+    "AcceptanceCriterion": "product-owner",   # decided 2026-07-02: AC owned by PO
+    "TestCase":            "qa-lead",         # per docs/ontology.md
+    "TestPlan":            "qa-lead",
+    "TestRun":             "qa-engineer",
+    "Bug":                 "dev-owner",
+    "Component":           "tech-lead",
+    # Feedback: resolves via edge 'about' -> handled in resolve_owner_slack()
 }
 
 DEFAULT_OWNER = "qa-lead"
 
+# Canonical role names in the users table (upper snake case).
+ROLE_MAP = {
+    "product-owner": "PO",
+    "qa-lead":       "QE_LEAD",
+    "qa-engineer":   "QE_EXECUTOR",
+    "dev-owner":     "DEV",
+    "tech-lead":     "TECH_LEAD",
+    "ba":            "BA",
+}
+
 
 def owner_for(entity_type):
+    """Legacy: return the class-level role name for a given entity type."""
     return ENTITY_OWNER.get(entity_type, DEFAULT_OWNER)
 
 
 def route_gap(entity_type, ref, note=None):
-    # Build a routing record for a gap/action item.
-    # TODO (Layer B): deliver this to the owner via Slack (Bolt, chat:write).
+    """Legacy: build a routing record for a gap/action item.
+
+    Prefer resolve_owner_slack() which returns a real user dict.
+    """
     return {
         "entity_type": entity_type,
         "ref": ref,
         "owner": owner_for(entity_type),
         "note": note,
     }
+
+
+def resolve_owner_slack(node_id):
+    """Resolve a node to a concrete Slack user, with 3-tier fallback.
+
+    Order:
+      1. Instance override: nodes.props_json.owner_slack_id (if present in users)
+      2. Project-scoped: users WHERE role = <canonical> AND project_id = <node.project_id>
+      3. Global default: users WHERE role = <canonical> AND project_id IS NULL
+
+    Feedback nodes: hop through edge 'about' and resolve the target entity's owner.
+
+    Returns a dict {id, slack_id, display_name, role, project_id, ...} or None.
+    """
+    with db.conn() as c:
+        cur = c.cursor()
+        cur.execute(
+            "SELECT id, type, ref, project_id, props_json FROM nodes WHERE id = %s",
+            (node_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        _, node_type, ref_id, project_id, props = row
+
+        # Feedback: hop to the entity it is 'about'
+        if node_type == "Feedback":
+            cur.execute(
+                """
+                SELECT dst_id FROM edges
+                WHERE src_id = %s AND rel = 'about' LIMIT 1
+                """,
+                (node_id,),
+            )
+            about = cur.fetchone()
+            if about:
+                return resolve_owner_slack(about[0])
+            return None
+
+        # 1. instance-level override via props_json.owner_slack_id
+        slack_id = (props or {}).get("owner_slack_id")
+        if slack_id:
+            cur.execute(
+                "SELECT * FROM users WHERE slack_id = %s", (slack_id,)
+            )
+            r = cur.fetchone()
+            if r:
+                return _row_to_dict(cur, r)
+
+        # 2 + 3. role-based lookup (project-scoped first, then global)
+        role_label = ENTITY_OWNER.get(node_type, DEFAULT_OWNER)
+        role_canonical = ROLE_MAP.get(role_label)
+        if not role_canonical:
+            return None
+
+        cur.execute(
+            """
+            SELECT * FROM users
+            WHERE role = %s
+              AND (project_id = %s OR project_id IS NULL)
+            ORDER BY (project_id = %s) DESC NULLS LAST
+            LIMIT 1
+            """,
+            (role_canonical, project_id, project_id),
+        )
+        r = cur.fetchone()
+        if r:
+            return _row_to_dict(cur, r)
+        return None
+
+
+def _row_to_dict(cur, row):
+    """psycopg returns tuples; zip with cursor.description to make a dict."""
+    cols = [d.name for d in cur.description]
+    return dict(zip(cols, row))

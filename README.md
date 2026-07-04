@@ -217,8 +217,8 @@ With `.env` filled in, Postgres up, and the schema applied:
 
 ```bash
 # (optional) load sample graph + KB so the tools have data to reason over
-python3 seed.py           # index skills/ + kb/ into Chroma (RAG)
-python3 seed_graph.py     # insert a sample requirement graph (JIRA-101) for testing
+python3 scripts/seed/kb.py           # index skills/ + kb/ into Chroma (RAG)
+python3 scripts/seed/graph.py     # insert a sample requirement graph (JIRA-101) for testing
 
 # start the interactive agent
 python3 -m tieukiwi.cli
@@ -288,14 +288,14 @@ Tieu Kiwi uses a **3‑tier memory** model (`tieukiwi/memory.py`); the RAG layer
 **Chroma RAG (Tier 1 — team shared knowledge):**
 - Store: local `chromadb.PersistentClient(path="./chroma_db")`, collection `knowledge_base`
   (see `tieukiwi/rag.py`).
-- Ingestion: `python seed.py` walks every `.md` in `skills/` and `kb/`, and indexes each file as a
+- Ingestion: `python scripts/seed/kb.py` walks every `.md` in `skills/` and `kb/`, and indexes each file as a
   document (`id` = filename, metadata `source` + `applies_to`). The three QE rubrics in `skills/`
   (`test-driven-development`, `code-review-and-quality`, `spec-driven-development`) are tagged to
   `TestCase` / `Bug` / `Requirement` respectively.
 - Retrieval: the `search_kb` tool calls `rag.search(query)` (top‑k semantic search).
 
 **Postgres knowledge graph (`nodes`/`edges`):**
-- Populate manually via `tieukiwi.db.add_node` / `add_edge`, or run `python seed_graph.py` for a
+- Populate manually via `tieukiwi.db.add_node` / `add_edge`, or run `python scripts/seed/graph.py` for a
   ready‑made sample (`JIRA-101` with covered/uncovered ACs, a failing test, and an open bug).
 - The agent queries it through graph tools:
 
@@ -373,7 +373,7 @@ tieu-kiwi/
 ├── requirements.txt         # Python dependencies
 ├── .env.example             # Template for .env (copy & fill in)
 ├── seed.py                  # Index skills/ + kb/ into Chroma (RAG)
-├── seed_graph.py            # Insert a sample requirement graph for testing
+├── scripts/seed/graph.py            # Insert a sample requirement graph for testing
 ├── db/
 │   └── schema.sql           # Tables: nodes, edges, kb_rules, promotion_queue, thread_state
 ├── skills/                  # QE rubrics (Markdown) indexed into RAG
@@ -405,7 +405,7 @@ tieu-kiwi/
 | `KeyError: 'ANTHROPIC_API_KEY'` on startup | `ANTHROPIC_API_KEY` isn't set in `.env`. Add it and restart. |
 | `psycopg.OperationalError: connection refused` / could not connect | Postgres isn't running or the URL is wrong. `docker compose up -d`, check `docker compose ps`, and confirm `DATABASE_URL` host/port/creds match `docker-compose.yml`. |
 | `relation "nodes" does not exist` | Schema not applied. Run `psql "$DATABASE_URL" -f db/schema.sql`. |
-| First `search_kb`/`seed.py` is slow or downloads a file | Chroma is fetching the `all-MiniLM-L6-v2` embedding model (~80 MB) once. Ensure network access; subsequent runs use the cache. |
+| First `search_kb`/`scripts/seed/kb.py` is slow or downloads a file | Chroma is fetching the `all-MiniLM-L6-v2` embedding model (~80 MB) once. Ensure network access; subsequent runs use the cache. |
 | Anthropic `RateLimitError` / `429` | You've hit API rate limits. Back off and retry, reduce request frequency, or check your plan/limits in the Anthropic console. |
 | `chromadb ... InvalidArgumentError: name ... 3-512 characters` | Chroma collection names must be ≥3 chars — this repo uses `knowledge_base` (not `kb`). Keep the name in `rag.py` as‑is. |
 | `fetch_jira` returns `{"status": "error", "error": "Jira is not configured…"}` | Set `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` in `.env`. An HTTP 401/403 means bad email/token; 404 means the issue key doesn't exist or isn't visible to that account. |

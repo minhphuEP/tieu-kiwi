@@ -199,17 +199,42 @@ TOOLS = [
   },
 ]
 
-def run_tool(name, args):
+def run_tool(name, args, context=None):
+    """Dispatch a tool call.
+
+    Args:
+      name:    the tool name (must be in TOOLS)
+      args:    dict of tool-specific arguments (matches input_schema)
+      context: dict of ambient context propagated from the agent loop.
+               Keys used here:
+                 project_id  — scope Postgres queries + RAG search by tenant
+                 role        — persona used to filter RAG (QE|PO|BO|DEV)
+               `context` is set by the Slack layer (channel_id -> project_id)
+               before calling agent.ask(). It is NOT part of the LLM-facing
+               input_schema — the LLM cannot spoof it.
+    """
+    ctx = context or {}
+    project_id = ctx.get("project_id")
+    role = ctx.get("role")
+
     if name == "search_kb":
-        return rag.search(args["query"])
+        # Include_global=True means: "give me my project's rules + shared ones".
+        # That's what the agent almost always wants when reviewing artifacts.
+        return rag.search(
+            args["query"],
+            k=args.get("k", 4),
+            project_id=project_id,
+            role=role,
+            include_global=True,
+        )
     if name == "coverage_gap":
-        return db.coverage_gap()
+        return db.coverage_gap(project_id=project_id)
     if name == "go_no_go":
-        return db.go_no_go(args["requirement_ref"])
+        return db.go_no_go(args["requirement_ref"], project_id=project_id)
     if name == "trace":
-        return db.trace(args["requirement_ref"])
+        return db.trace(args["requirement_ref"], project_id=project_id)
     if name == "bug_blast_radius":
-        return db.bug_blast_radius(args["bug_ref"])
+        return db.bug_blast_radius(args["bug_ref"], project_id=project_id)
     if name == "gen_testcase":
         return gen_testcase(args["requirement_ref"])
     if name == "gen_test_plan":

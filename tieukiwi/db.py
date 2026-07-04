@@ -27,6 +27,43 @@ def add_edge(src_id, rel, dst_id, props=None):
             (src_id, rel, dst_id, psycopg.types.json.Json(props or {})),
         )
 
+# --- channel -> project resolution (Layer B glue) --------------------------
+
+def project_for_channel(channel_id):
+    """Return the project_id bound to a Slack channel, or None if unmapped.
+
+    The Slack layer calls this at the entry point of every event handler:
+      proj = db.project_for_channel(event["channel"]) or DEFAULT_PROJECT
+      answer = agent.ask(text, project_id=proj)
+
+    Populated via `channel_project_map` (migration 004). Use `bind_channel()`
+    to insert/update mappings, or edit the table directly.
+    """
+    with conn() as c:
+        row = c.execute(
+            "SELECT project_id FROM channel_project_map WHERE channel_id=%s",
+            (channel_id,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+def bind_channel(channel_id, project_id, team_id=None, note=None):
+    """Upsert a channel -> project binding. Safe to re-run."""
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO channel_project_map (channel_id, project_id, team_id, note, updated_at)
+            VALUES (%s, %s, %s, %s, now())
+            ON CONFLICT (channel_id) DO UPDATE SET
+              project_id = EXCLUDED.project_id,
+              team_id    = COALESCE(EXCLUDED.team_id, channel_project_map.team_id),
+              note       = COALESCE(EXCLUDED.note,    channel_project_map.note),
+              updated_at = now()
+            """,
+            (channel_id, project_id, team_id, note),
+        )
+
+
 def upsert_node_by_ref(type_, ref, props=None):
     # Insert a node, or update its props if one with the same (type, ref) already exists.
     # Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
@@ -53,11 +90,12 @@ def upsert_node_by_ref(type_, ref, props=None):
 HIGH_SEVERITIES = ("critical", "high")
 
 
-def _uncovered_acs(c, requirement_ref=None):
+def _uncovered_acs(c, requirement_ref=None, project_id=None):
     # AcceptanceCriterion not coveredBy any TestCase → coverage gap.
     # Ontology: Requirement -has-> AcceptanceCriterion -coveredBy-> TestCase,
     # so an AC is the src of its 'coveredBy' edge.
-    # When requirement_ref is given, scope to that requirement's ACs.
+    # - requirement_ref: scope to that requirement's ACs.
+    # - project_id: restrict to ACs belonging to that project (prevents cross-tenant leak).
     sql = """
     SELECT ac.id, ac.ref FROM nodes ac
     WHERE ac.type='AcceptanceCriterion'
@@ -67,6 +105,9 @@ def _uncovered_acs(c, requirement_ref=None):
       )
     """
     params = []
+    if project_id is not None:
+        sql += " AND ac.project_id=%s"
+        params.append(project_id)
     if requirement_ref is not None:
         sql += """
       AND EXISTS (
@@ -79,18 +120,32 @@ def _uncovered_acs(c, requirement_ref=None):
     return c.execute(sql, params).fetchall()
 
 
-def coverage_gap():
+def coverage_gap(project_id=None):
+    """List AC nodes without any coveredBy edge.
+
+    Args:
+      project_id: if given, restrict to ACs belonging to that project (multi-tenant
+                  isolation). None (default) = global.
+    """
     with conn() as c:
-        return _uncovered_acs(c)
+        return _uncovered_acs(c, project_id=project_id)
 
 
-def trace(requirement_ref):
-    # Walk Requirement -> AC -> TestCase -> TestRun -> Bug for one requirement.
+def trace(requirement_ref, project_id=None):
+    """Walk Requirement -> AC -> TestCase -> TestRun -> Bug for one requirement.
+
+    Args:
+      requirement_ref: external ref of the requirement to trace.
+      project_id: if given, requirement must belong to that project (prevents
+                  cross-tenant lookups). None (default) = any project.
+    """
     with conn() as c:
-        req = c.execute(
-            "SELECT id, ref FROM nodes WHERE type='Requirement' AND ref=%s",
-            (requirement_ref,),
-        ).fetchone()
+        sql = "SELECT id, ref FROM nodes WHERE type='Requirement' AND ref=%s"
+        params = [requirement_ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"
+            params.append(project_id)
+        req = c.execute(sql, params).fetchone()
         if not req:
             return {"requirement": requirement_ref, "found": False, "acceptance_criteria": []}
         req_id = req[0]
@@ -175,8 +230,9 @@ def trace(requirement_ref):
         }
 
 
-def failing_tests_for(requirement_ref):
+def failing_tests_for(requirement_ref, project_id=None):
     # TestRuns with status='fail' reachable from the requirement.
+    # project_id guards the entry Requirement — prevents cross-tenant lookup.
     sql = """
     SELECT DISTINCT tr.ref, tc.ref
     FROM nodes r
@@ -188,15 +244,20 @@ def failing_tests_for(requirement_ref):
     JOIN nodes tr  ON tr.id=ex.dst_id  AND tr.type='TestRun'
     WHERE r.type='Requirement' AND r.ref=%s
       AND tr.props_json->>'status'='fail'
-    ORDER BY tr.ref
     """
+    params = [requirement_ref]
+    if project_id is not None:
+        sql += " AND r.project_id=%s"
+        params.append(project_id)
+    sql += " ORDER BY tr.ref"
     with conn() as c:
-        return c.execute(sql, (requirement_ref,)).fetchall()
+        return c.execute(sql, params).fetchall()
 
 
-def open_bugs_for(requirement_ref):
+def open_bugs_for(requirement_ref, project_id=None):
     # Open bugs linked to the requirement, either via the test chain
     # (...->TestRun->finds->Bug) or directly via Bug->violates->AC.
+    # project_id guards the entry Requirement.
     sql = """
     SELECT DISTINCT b.ref, b.props_json->>'severity'
     FROM nodes b
@@ -213,6 +274,12 @@ def open_bugs_for(requirement_ref):
           JOIN edges h   ON h.dst_id=ac.id   AND h.rel='has'
           JOIN nodes r   ON r.id=h.src_id    AND r.type='Requirement'
           WHERE f.dst_id=b.id AND f.rel='finds' AND r.ref=%s
+    """
+    params = [requirement_ref]
+    if project_id is not None:
+        sql += " AND r.project_id=%s"
+        params.append(project_id)
+    sql += """
         )
         OR EXISTS (
           SELECT 1
@@ -221,25 +288,46 @@ def open_bugs_for(requirement_ref):
           JOIN edges h  ON h.dst_id=ac.id AND h.rel='has'
           JOIN nodes r  ON r.id=h.src_id  AND r.type='Requirement'
           WHERE v.src_id=b.id AND v.rel='violates' AND r.ref=%s
+    """
+    params.append(requirement_ref)
+    if project_id is not None:
+        sql += " AND r.project_id=%s"
+        params.append(project_id)
+    sql += """
         )
       )
     ORDER BY b.ref
     """
     with conn() as c:
-        return c.execute(sql, (requirement_ref, requirement_ref)).fetchall()
+        return c.execute(sql, params).fetchall()
 
 
-def bug_blast_radius(bug_ref):
-    # How many Requirements/ACs depend on the Component(s) this bug affects.
-    # Ontology: Bug -affects-> Component <-impacts- Requirement -has-> AcceptanceCriterion.
-    # Larger blast radius -> higher priority.
-    sql = """
+def bug_blast_radius(bug_ref, project_id=None):
+    """How many Requirements/ACs depend on the Component(s) this bug affects.
+
+    Ontology: Bug -affects-> Component <-impacts- Requirement -has-> AcceptanceCriterion.
+    Larger blast radius -> higher priority.
+
+    Args:
+      bug_ref: external ref of the Bug to analyze.
+      project_id: guards the entry Bug (multi-tenant isolation). The blast counts
+                  Requirements/ACs across ALL projects — cross-project impact is
+                  the point of the metric.
+    """
+    # `entry_pred` isolates the entry Bug by project (if requested) without
+    # restricting the downstream impact graph, so cross-project blast is still counted.
+    entry_pred = "b.type='Bug' AND b.ref=%s"
+    params = [bug_ref]
+    if project_id is not None:
+        entry_pred += " AND b.project_id=%s"
+        params.append(project_id)
+    sql = f"""
     WITH affected AS (
         SELECT DISTINCT comp.id AS comp_id, comp.ref AS comp_ref
         FROM nodes b
         JOIN edges af   ON af.src_id=b.id AND af.rel='affects'
         JOIN nodes comp ON comp.id=af.dst_id AND comp.type='Component'
-        WHERE b.type='Bug' AND b.ref=%s
+        WHERE {entry_pred}
     )
     SELECT
       (SELECT array_agg(DISTINCT comp_ref) FROM affected) AS components,
@@ -255,7 +343,7 @@ def bug_blast_radius(bug_ref):
          JOIN nodes ac ON ac.id=h.dst_id AND ac.type='AcceptanceCriterion') AS n_acs
     """
     with conn() as c:
-        row = c.execute(sql, (bug_ref,)).fetchone()
+        row = c.execute(sql, params).fetchone()
 
     components = (row[0] if row else None) or []
     n_requirements = (row[1] if row else 0) or 0
@@ -281,12 +369,35 @@ def bug_blast_radius(bug_ref):
     }
 
 
-def go_no_go(requirement_ref):
-    # Combine coverage gaps, failing tests and open bugs into a GO/NO-GO call.
+def go_no_go(requirement_ref, project_id=None):
+    """Combine coverage gaps, failing tests and open bugs into a GO/NO-GO call.
+
+    Args:
+      requirement_ref: external ref of the Requirement.
+      project_id: if given, all sub-queries scope to that project (multi-tenant).
+                  Returns decision='NOT_FOUND' if the requirement doesn't exist
+                  in that project.
+    """
     with conn() as c:
-        gaps = _uncovered_acs(c, requirement_ref)
-    failing = failing_tests_for(requirement_ref)
-    bugs = open_bugs_for(requirement_ref)
+        exists_sql = "SELECT id FROM nodes WHERE type='Requirement' AND ref=%s"
+        exists_params = [requirement_ref]
+        if project_id is not None:
+            exists_sql += " AND project_id=%s"
+            exists_params.append(project_id)
+        if not c.execute(exists_sql, exists_params).fetchone():
+            scope = f" in project '{project_id}'" if project_id else ""
+            return {
+                "requirement": requirement_ref,
+                "decision": "NOT_FOUND",
+                "coverage_gaps": [],
+                "failing_tests": [],
+                "open_bugs": [],
+                "next_actions": [f"Requirement '{requirement_ref}' not found{scope}"],
+            }
+
+        gaps = _uncovered_acs(c, requirement_ref, project_id=project_id)
+    failing = failing_tests_for(requirement_ref, project_id=project_id)
+    bugs = open_bugs_for(requirement_ref, project_id=project_id)
 
     coverage_gaps = [ac_ref for _id, ac_ref in gaps]
     failing_tests = [{"testrun": tr_ref, "testcase": tc_ref} for tr_ref, tc_ref in failing]

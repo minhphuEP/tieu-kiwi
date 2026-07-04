@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>[#CDM-287] [Bug] Fix bug màn add tracking number</title>
+    <meta http-equiv="Content-Type" Content="application/vnd.ms-word; charset=UTF-8">
+        <style type="text/css">
+
+.tableBorder, .grid
+{
+    background-color: #fff;
+    width: 100%;
+    border-collapse: collapse;
+}
+
+.tableBorder td, .grid td
+{
+    vertical-align: top;
+    padding: 2px;
+    border: 1px solid #ccc;
+}
+
+.noPadding
+{
+    padding: 0 !important;
+}
+
+h3 .subText
+{
+    font-size: 60%;
+    font-weight: normal;
+}
+
+.tabLabel
+{
+    font-weight: bold;
+    border: 1px solid #ccc;
+    border-bottom:none;
+    padding: 2px;
+    display: inline;
+}
+
+td.blank
+{
+    padding: 0;
+    margin: 0;
+}
+
+.blank td
+{
+    border: none;
+}
+
+#descriptionArea
+{
+    margin: 0;
+    padding: 2px;
+    border: 1px solid #ccc;
+}
+
+hr
+{
+    border-top:1px solid #aaa;
+}
+
+hr.fullcontent
+{
+  height: 15px;
+  padding: 10px 0;
+  background: #fff url('https://crossian.atlassian.net/images/icons/hr.gif') no-repeat scroll center;
+}
+
+</style>
+
+</head>
+<body>
+
+<table class="tableBorder" cellpadding="0" cellspacing="0" border="0" width="100%">
+    <tr>
+        <td bgcolor="#f0f0f0" width="100%" colspan="2" valign="top">
+                            <b><a id="parent_issue_summary" href="https://crossian.atlassian.net/browse/CDM-198">[2.2] Reviewer_Add Sample preparing &amp; Update Sample shipping</a></b>
+                <span style="font-size: 9px">(<a id="parent_issue_key" href="https://crossian.atlassian.net/browse/CDM-198">CDM-198</a>)</span>
+                <h3 class="formtitle"><img src="https://crossian.atlassian.net/images/icons/link_out_bot.gif" width="16" height="16" />
+                        [CDM-287]&nbsp;<a href="https://crossian.atlassian.net/browse/CDM-287">[Bug] Fix bug màn add tracking number</a>
+            <span class="subText">
+               Created: 24/06/2026 (Wed)                   &nbsp;Updated: 03/07/2026 (Fri)
+
+                                                    &nbsp;Resolved: 02/07/2026 (Thu)
+                            </span>
+            </h3>
+        </td>
+    </tr>
+    <tr>
+        <td width="20%"><b>Status:</b></td>
+        <td width="80%">Done</td>
+    </tr>
+    <tr>
+        <td width="20%"><b>Project:</b></td>
+        <td width="80%"><a href="https://crossian.atlassian.net/secure/BrowseProject.jspa?id=11443">CDM Team</a></td>
+    </tr>
+
+        <tr>
+            <td><b>Components:</b></td>
+            <td>
+                            None
+                </td>
+    </tr>
+    
+
+        <tr>
+            <td><b>Affects versions:</b></td>
+            <td>
+                            None
+                </td>
+    </tr>
+    
+
+        <tr>
+            <td><b>Fix versions:</b></td>
+            <td>
+                            None
+                </td>
+    </tr>
+    
+    
+            <td width="20%"><b>Parent:</b></td>
+        <td width="80%"><a href="https://crossian.atlassian.net/browse/CDM-198">[2.2] Reviewer_Add Sample preparing &amp; Update Sample shipping</a></td>
+    </table>
+
+<br />
+<table class="grid" cellpadding="0" cellspacing="0" border="0" width="100%">
+    <tr>
+        <td bgcolor="#f0f0f0" valign="top" width="20%">
+            <b>Type:</b>
+        </td>
+        <td bgcolor="#ffffff" valign="top"  width="30%" >
+            Subtask
+        </td>
+
+                    <td bgcolor="#f0f0f0">
+                <b>Priority:</b>
+            </td>
+            <td bgcolor="#ffffff" valign="top" nowrap>
+                Medium
+            </td>
+            </tr>
+    <tr>
+                        <td bgcolor="#f0f0f0" valign="top" width="20%">
+                <b>Reporter:</b>
+            </td>
+            <td bgcolor="#ffffff" valign="top"  width="30%" >
+                                        
+                
+        
+            <a class="user-hover" rel="712020:f8156951-4f82-4be4-acf5-c137defc2e06"
+                id="word_reporter_712020:f8156951-4f82-4be4-acf5-c137defc2e06"
+                href="https://crossian.atlassian.net/secure/ViewProfile.jspa?accountId=712020%3Af8156951-4f82-4be4-acf5-c137defc2e06">
+                    Phuong Thu Thi Lai
+                </a>
+
+                            </td>
+        
+                    <td bgcolor="#f0f0f0" width="20%">
+                <b>Assignee:</b>
+            </td>
+            <td bgcolor="#ffffff" valign="top" nowrap  width="30%" >
+                                        
+                
+        
+            <a class="user-hover" rel="712020:d507d582-d41c-4be5-8a12-46896f7f3243"
+                id="word_assignee_712020:d507d582-d41c-4be5-8a12-46896f7f3243"
+                href="https://crossian.atlassian.net/secure/ViewProfile.jspa?accountId=712020%3Ad507d582-d41c-4be5-8a12-46896f7f3243">
+                    Tan Duc Nguyen
+                </a>
+
+                            </td>
+            </tr>
+    	<tr>
+		<td bgcolor="#f0f0f0" width="20%">
+			<b>Resolution:</b>
+		</td>
+		<td bgcolor="#ffffff" valign="top" width="30%" nowrap>
+                            Done
+                    </td>
+                    <td bgcolor="#f0f0f0" width="20%">
+                <b>Votes:</b>
+            </td>
+            <td bgcolor="#ffffff" valign="top" width="30%" nowrap>
+                0
+            </td>
+        
+    </tr>
+    
+        <tr>
+        <td bgcolor="#f0f0f0" width="20%">
+            <b>Labels:</b>
+        </td>
+        <td id="labels-136856-value" class="value" bgcolor="#ffffff" valign="top" colspan="3" nowrap>
+                            None
+                    </td>
+    </tr>
+    
+    	<tr>
+        		<td bgcolor="#f0f0f0" width="20%"><b>Remaining Estimate:</b></td>
+        <td bgcolor="#ffffff" valign="top" nowrap width="80%" colspan="3">
+                            Not Specified
+            		</td>
+    </tr>
+    <tr>
+                <td bgcolor="#f0f0f0" width="20%"><b>Time Spent:</b></td>
+		<td bgcolor="#ffffff" valign="top" nowrap width="80%" colspan="3">
+                            Not Specified
+            		</td>
+	</tr>
+    <tr>
+                <td bgcolor="#f0f0f0" width="20%"><b>Original estimate:</b></td>
+		<td bgcolor="#ffffff" valign="top" nowrap width="80%" colspan="3">
+                            Not Specified
+            		</td>
+    </tr>
+    
+    </table>
+
+
+
+    <br />
+
+    	<table class="grid" cellpadding="0" cellspacing="0" border="0" width="100%">
+            
+
+        
+    
+
+
+    
+                        <tr>
+                <td bgcolor="#f0f0f0" width="20%" valign="top"><b>Sprint:</b></td>
+                <td id="customfield_10020-136856-value" class="value" bgcolor="#ffffff" width="80%">26W7.1</td>
+            </tr>
+                                <tr>
+                <td bgcolor="#f0f0f0" width="20%" valign="top"><b>Story point estimate:</b></td>
+                <td id="customfield_10016-136856-value" class="value" bgcolor="#ffffff" width="80%">    0.5
+</td>
+            </tr>
+                                <tr>
+                <td bgcolor="#f0f0f0" width="20%" valign="top"><b>Rank:</b></td>
+                <td id="customfield_10019-136856-value" class="value" bgcolor="#ffffff" width="80%">      0|i0cmac:
+  </td>
+            </tr>
+            </table>
+
+    <br/>
+
+    <table cellpadding="2" cellspacing="0" border="0" width="100%" align="center">
+    <tr>
+        <td bgcolor="#bbbbbb" width="1%" nowrap align="center">
+            &nbsp;<font color="#ffffff"><b>Description</b></font>&nbsp;
+        </td>
+        <td>&nbsp;</td>
+    </tr>
+    </table>
+
+    <table cellpadding="0" cellspacing="0" border="0" width="100%">
+    <tr>
+        <td id="descriptionArea">
+            <div class='table-wrap'>
+<table class='confluenceTable'><tbody>
+<tr>
+<th class='confluenceTh'><b>Bug(Required)</b></th>
+<th class='confluenceTh'><b>Step(Required)</b></th>
+<th class='confluenceTh'><b>Actual(Required)</b></th>
+<th class='confluenceTh'><b>Expected(Required)</b></th>
+<th class='confluenceTh'><b>Root Cause(optional)</b></th>
+<th class='confluenceTh'><b>Find by(Required)</b></th>
+</tr>
+<tr>
+<td class='confluenceTd'>Không add tracking number với offer</td>
+<td class='confluenceTd'><ol>
+	<li>Tạo script với sản phẩm Product name1e2eaca4-76c9-4ad7-94c2-cf209e604380, product variants không chọn</li>
+	<li>Assign offer cho user</li>
+	<li>Creator request sample</li>
+	<li>Reviewer add tracking number</li>
+</ol>
+</td>
+<td class='confluenceTd'><a href="https://samx-reviewer.selless.io/offers/60" title="smart-link" class="external-link" rel="nofollow noreferrer">https://samx-reviewer.selless.io/offers/60</a> 
+<ol>
+	<li>Không add được tracking number do vẫn hiển thị variant</li>
+</ol>
+</td>
+<td class='confluenceTd'><ol>
+	<li>Bỏ variants trong popup add tracking khi không chọn script</li>
+</ol>
+</td>
+<td class='confluenceTd'>ở step tạo script → chọn variants sau đó clear all sẽ bị lỗi khi add tracking number cho offer</td>
+<td class='confluenceTd'>Testcase</td>
+</tr>
+<tr>
+<td class='confluenceTd'>Sai timeline khi reviewer reject footage</td>
+<td class='confluenceTd'><ol>
+	<li>Creator upload footage</li>
+	<li>Reviewer reject</li>
+</ol>
+</td>
+<td class='confluenceTd'><ol>
+	<li>Timeline hiển thị đến reject</li>
+</ol>
+</td>
+<td class='confluenceTd'><ol>
+	<li>Timeline dừng và bôi đỏ ở footage</li>
+</ol>
+</td>
+<td class='confluenceTd'>&nbsp;</td>
+<td class='confluenceTd'>Missing</td>
+</tr>
+</tbody></table>
+</div>
+
+            <br/>
+        </td>
+    </tr>
+    </table>
+
+Generated at Fri Jul 03 00:32:54 UTC 2026 by Phuong Thu Thi Lai using Jira 1001.0.0-SNAPSHOT#100292-rev:f152b838bb945118c071b297741ecc5e36093b62.
+
+</body>
+</html>

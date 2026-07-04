@@ -4,3 +4,7 @@ psycopg[binary]
 python-dotenv
 httpx
 slack_bolt
+pandas
+openpyxl
+pypdf
+python-docx

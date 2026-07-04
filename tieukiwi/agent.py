@@ -5,7 +5,21 @@ from .tools import TOOLS, run_tool
 
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-def ask(user_msg, system="You are Tieu Kiwi, a QE support agent.", model=None):
+
+def ask(user_msg, system="You are Tieu Kiwi, a QE support agent.",
+        project_id=None, role=None, model = None):
+    """Drive one tool-use conversation to completion and return the final text.
+
+    Args:
+      user_msg:   the user's question
+      system:     system prompt
+      project_id: multi-tenant scope. When set, every tool call is auto-scoped
+                  to this project by run_tool. Callers should set this via the
+                  Slack layer (channel_id -> project_id).
+      role:       persona for RAG filtering (e.g. 'QE'). Passed to search_kb.
+    """
+    context = {"project_id": project_id, "role": role}
+    messages = [{"role": "user", "content": user_msg}]
     if model is None:
         model = config.model_for("agent")
     messages = [{"role": "user", "content": user_msg}]
@@ -21,7 +35,7 @@ def ask(user_msg, system="You are Tieu Kiwi, a QE support agent.", model=None):
         results = []
         for block in resp.content:
             if block.type == "tool_use":
-                out = run_tool(block.name, block.input)
+                out = run_tool(block.name, block.input, context=context)
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
