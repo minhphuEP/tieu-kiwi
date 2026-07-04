@@ -143,10 +143,34 @@ def fetch_jira(issue_key):
 TOOLS = [
   {
     "name": "search_kb",
-    "description": "Find relevant rules/glossary/rubrics in the KB.",
+    "description": (
+        "Find relevant rules/glossary/rubrics in the KB. Retrieves across all "
+        "personas by default; pass `role` only when the user explicitly asks for "
+        "docs owned by a specific persona."
+    ),
     "input_schema": {
       "type": "object",
-      "properties": {"query": {"type": "string"}},
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "Natural-language question (Vietnamese or English).",
+        },
+        "role": {
+          "type": "string",
+          "enum": ["QE", "PO", "BO", "DEV"],
+          "description": (
+            "Optional persona filter. Set ONLY when the user asks for docs OWNED BY "
+            "a persona (e.g. 'QE templates', 'PO PRD template'). Do NOT set based "
+            "on the user's own role — a QE asking for context to write test cases "
+            "still needs domain and spec docs from other personas, so leave omitted. "
+            "Rule of thumb: 'QE templates' → role=QE; 'help me write tests' → omit."
+          ),
+        },
+        "k": {
+          "type": "integer",
+          "description": "Max results to return (default 4).",
+        },
+      },
       "required": ["query"],
     },
   },
@@ -242,23 +266,23 @@ def run_tool(name, args, context=None):
       context: dict of ambient context propagated from the agent loop.
                Keys used here:
                  project_id  — scope Postgres queries + RAG search by tenant
-                 role        — persona used to filter RAG (QE|PO|BO|DEV)
                `context` is set by the Slack layer (channel_id -> project_id)
                before calling agent.ask(). It is NOT part of the LLM-facing
                input_schema — the LLM cannot spoof it.
     """
     ctx = context or {}
     project_id = ctx.get("project_id")
-    role = ctx.get("role")
 
     if name == "search_kb":
-        # Include_global=True means: "give me my project's rules + shared ones".
-        # That's what the agent almost always wants when reviewing artifacts.
+        # `role` is an opt-in filter set by the LLM via args, NOT auto-injected
+        # from the caller's persona. A QE writing tests still needs BO domain
+        # docs and PO PRDs, so filtering by caller role would cripple retrieval.
+        # include_global=True gives project docs + shared _global docs together.
         return rag.search(
             args["query"],
             k=args.get("k", 4),
             project_id=project_id,
-            role=role,
+            role=args.get("role"),
             include_global=True,
         )
     if name == "coverage_gap":
