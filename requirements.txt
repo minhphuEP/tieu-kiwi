@@ -1,5 +1,6 @@
 anthropic
 chromadb
+voyageai
 psycopg[binary]
 python-dotenv
 httpx
