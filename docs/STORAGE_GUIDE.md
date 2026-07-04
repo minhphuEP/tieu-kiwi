@@ -26,7 +26,11 @@ Xem [`KB_GUIDE.md`](KB_GUIDE.md#concept) nếu vẫn confusing.
 |---|---|---|
 | Requirement mới (BRD từ Confluence) | `data_ingestion/requirements/<file>.md` | `scripts/ingest/requirements.py` |
 | Testcase legacy bank (Excel/CSV) | `data_ingestion/testcases/<file>.xlsx` | `scripts/ingest/testcases.py` |
-| Bug export (Jira JSON/Word) | `data_ingestion/bugs/<file>.json` | `scripts/ingest/bugs.py` |
+| Bug export (Jira JSON/Word) | `data_ingestion/bugs/<file>.json` | `scripts/ingest/bugs.py` (rồi `db.classify_bug()` phân loại) |
+| Slack feedback (per artifact) | Postgres `nodes` type=Feedback + edge `about` | `db.add_node("Feedback", ...)` (Layer B) |
+| Thread review state (bot memory) | Postgres `thread_state` | `memory.save_thread_state()` |
+| Candidate rule chờ duyệt | Postgres `promotion_queue` | Direct SQL / Layer C tool |
+| Lesson từ bug leaked (improvement) | Chroma `kb/<PROJ>/lessons/<bug>.md` | `scripts/seed/kb.py` |
 | Rule QE (VD "testcase login phải cover 4 case") | `kb/_global/QE/rules-*.md` | `scripts/seed/kb.py` |
 | Glossary dự án (VD định nghĩa OTP) | `kb/<PROJECT>/glossary.md` | `scripts/seed/kb.py` |
 | Template (cách viết testcase chuẩn) | `kb/_global/QE/templates/*.md` | `scripts/seed/kb.py` |
@@ -228,6 +232,199 @@ docker exec tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi -c \
    WHERE ref='TC-CDM-XXX';"
 ```
 
+### 4.7 Bug classification — improvement loop
+
+Sau khi ingest bug, gọi `db.classify_bug(bug_ref)` (hoặc agent tool `classify_bug`)
+để phân loại bug và route vào đúng nhánh improvement:
+
+```python
+from tieukiwi import db
+r = db.classify_bug("CDM-287", project_id="CDM")
+# r['category'] = "caught_by_test" | "leaked_tc_missing" |
+#                 "leaked_tc_not_run" | "leaked_tc_ran_missed" | "leaked_no_ac_link"
+# r['improve']  = None | "gen_testcase" | "impact_analysis" | "execution_quality" | "manual_review"
+```
+
+**5 categories** (dựa trên **cấu trúc graph**, không phải heuristic):
+
+| Category | Trigger | Improve pipeline | Curator action |
+|---|---|---|---|
+| `caught_by_test` | Bug có incoming `finds` từ TestRun | *(none — process worked)* | – |
+| `leaked_tc_missing` | Bug `violates` AC, nhưng AC không có `coveredBy` | **`gen_testcase`** | Viết lesson vào `kb/<PROJ>/lessons/<bug>.md` để agent gen lần sau cover được |
+| `leaked_tc_not_run` | AC có TC nhưng TC không có TestRun nào | **`impact_analysis`** | Đánh dấu TC/component là critical → future impact analysis prioritise |
+| `leaked_tc_ran_missed` | AC có TC, TC có TestRun, mà bug vẫn lọt | **`execution_quality`** | Review TC assertions/steps — có thể quá yếu. Viết lesson tăng độ sâu test |
+| `leaked_no_ac_link` | Bug không có `violates` edge nào | *(manual)* | Manual: link bug tới đúng AC trước, rồi classify lại |
+
+**Workflow cho từng category** (curator viết lesson):
+
+```bash
+# Category: leaked_tc_missing — agent gen sót
+cat > kb/CDM/lessons/CDM-287-gen-gap.md <<'EOF'
+# Lesson: OTP flow needs to cover network delay
+
+## Bug: CDM-287
+Không add tracking number được khi variants=[] sau khi user chọn rồi clear.
+
+## What was missing
+Agent gen testcase cho "add tracking" chỉ cover happy path,
+không cover edge case: user chọn variants rồi clear all → state ambiguous.
+
+## What to test next time
+- Sau khi clear all variants → verify form state reset đúng.
+- Track "user-toggled" state riêng với "auto-cleared" state.
+
+## Related
+- AC: (link tới AC bị violate)
+- Component: (link tới COMP-XXX)
+EOF
+python scripts/seed/kb.py
+```
+
+```bash
+# Category: leaked_tc_not_run — impact analysis miss
+cat > kb/CDM/lessons/CDM-999-impact-priority.md <<'EOF'
+# Lesson: Cross-project OTP flow must always run in critical path
+
+## Bug: CDM-999
+Testcase TC-CDM-XXX exists nhưng chưa được execute trong sprint golive.
+
+## What went wrong
+Impact analysis không mark testcase này là critical dù nó cover
+integration cross-project (auth ↔ notification-service).
+
+## Rule for future
+Bất kỳ testcase nào cover:
+- Cross-project component
+- Financial flow
+- Auth flow
+→ ALWAYS execute trong critical path, không skip vì time pressure.
+EOF
+python scripts/seed/kb.py
+```
+
+```bash
+# Category: leaked_tc_ran_missed — testcase yếu
+# Update testcase _meta để đánh dấu cần strengthen
+docker exec tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi -c \
+  "UPDATE nodes SET props_json = jsonb_set(
+     props_json, '{_meta,quality_flag}', '\"weak_assertions\"'
+   ) WHERE ref='TC-XXX';"
+# Kèm lesson chung về assertion quality
+cat > kb/_global/QE/lessons/assertion-depth.md <<'EOF'
+# Lesson: Assertion depth in flows with side effects
+...
+EOF
+python scripts/seed/kb.py
+```
+
+**Batch classify tất cả bug đã ingest**:
+
+```bash
+python <<'PY'
+from tieukiwi import db
+with db.conn() as c:
+    rows = c.execute(
+        "SELECT ref FROM nodes WHERE type='Bug' AND project_id='CDM'"
+    ).fetchall()
+for (ref,) in rows:
+    r = db.classify_bug(ref, project_id='CDM')
+    print(f"{ref:14s} → {r['category']:22s} improve={r['improve']}")
+PY
+```
+
+Output cho biết mỗi bug nên đóng góp vào pipeline nào để improvement loop chạy có mục tiêu.
+
+### 4.8 Slack feedback storage
+
+Feedback từ Slack thread (user reply, curator decision, bot's hidden reasoning)
+lưu ở **3 nơi khác nhau**, tùy nature và persistence:
+
+| Nature | Đích | Bảng / Node | Đọc/ghi bằng |
+|---|---|---|---|
+| **Thread state** — tạm thời, per-review | Postgres | `thread_state (channel_id, thread_ts, state_json)` | `tieukiwi.memory.get_thread_state()` / `save_thread_state()` |
+| **Feedback record** — cụ thể về 1 artifact, cần trace lâu dài | Postgres | `nodes` type=`Feedback` + edge `about` → target | `db.add_node("Feedback", ...)` + `db.add_edge(fb, "about", target)` |
+| **Candidate rule** — feedback đủ mạnh để thành rule chung | Postgres | `promotion_queue` (candidate, source, status) | Direct SQL / promotion tool (Layer C, chưa build) |
+| **Rule đã curator duyệt** | Chroma | `kb/<PROJ>/rules-*.md` hoặc `kb/_global/QE/rules-*.md` | `scripts/seed/kb.py` |
+
+**Concrete flow — 1 feedback lifecycle**:
+
+```
+1. Slack thread: bot post review AC-101-3 → user reply "Nên nói 3 lần LIÊN TIẾP không phải tích luỹ"
+      │
+      ↓
+2. Layer B (Slack handler):
+   thread_state {"reviews": [...], "last_user_reply": "..."} → memory.save_thread_state(...)
+      │
+      ↓  (khi user_reply đủ có ý nghĩa)
+3. Tạo Feedback node:
+   fb = db.add_node("Feedback", ref="FB-<uuid>", props={
+       "content": "AC-101-3 nên nói rõ 3 lần LIÊN TIẾP",
+       "created_by": "U_slack_id",
+       "channel_id": "C_xxx", "thread_ts": "17...",
+   })
+   db.add_edge(fb, "about", ac_101_3_id)
+      │
+      ↓  (curator thấy feedback có giá trị)
+4. Push vào promotion_queue:
+   INSERT INTO promotion_queue (candidate, source, status)
+   VALUES ('AC phải phân biệt LIÊN TIẾP vs TÍCH LŨY khi mô tả điều kiện',
+           '{"from_feedback": "FB-xxx", "from_thread": "C_xxx/17..."}'::jsonb,
+           'pending');
+      │
+      ↓  (curator duyệt qua Slack button — Layer C, chưa build)
+5. Ghi vào KB:
+   cat > kb/_global/BA/rules-ac-writing.md <<EOF
+   ## Rule: "Consecutive" vs "cumulative" in ACs
+   Bất kỳ AC nào nói "sau N lần X" phải phân biệt rõ:
+   - Consecutive (liên tiếp, reset khi có success ở giữa)
+   - Cumulative (tích luỹ, không reset)
+   Nguồn: FB-xxx (từ CDM channel review 2026-07-03).
+   EOF
+   python scripts/seed/kb.py
+```
+
+**Khi nào lưu vào đâu**:
+
+- **Ephemeral (thread_state)**: state review của bot, ai đã accept/reject, timestamp
+  — dùng để bot resume conversation. TTL: có thể xoá sau 30-90 ngày.
+- **Feedback node**: 1 nhận xét cụ thể → cần trace lâu dài (VD "AC-101-3 unclear per user X on 2026-07-03"). Giữ vĩnh viễn (audit).
+- **promotion_queue**: candidate rule chờ curator. Xoá khi approve (đã promote vào KB) hoặc reject.
+- **KB rule (Chroma)**: rule đã active, applies to future artifacts. Giữ vĩnh viễn cho tới khi bị demote.
+
+**Manual write khi thấy feedback quan trọng** (Slack bot chưa build):
+
+```python
+from tieukiwi import db
+
+# Ghi 1 Feedback node
+fb_id = db.add_node("Feedback",
+    ref="FB-2026-07-03-001",
+    props={
+        "content": "AC-101-3 unclear about consecutive vs cumulative fails",
+        "created_by": "U03_QE_CUONG",
+        "channel_id": "C_CDM_REVIEW",
+        "thread_ts": "1720000000.123456",
+        "status": "pending",
+    })
+
+# Link về artifact bị feedback
+with db.conn() as c:
+    ac_id = c.execute("SELECT id FROM nodes WHERE ref='AC-101-3'").fetchone()[0]
+db.add_edge(fb_id, "about", ac_id)
+
+# Nếu feedback đáng promote → push vào queue
+with db.conn() as c:
+    c.execute(
+        """INSERT INTO promotion_queue (candidate, source)
+           VALUES (%s, %s::jsonb)""",
+        ("AC phải phân biệt consecutive vs cumulative",
+         '{"from_feedback": "FB-2026-07-03-001"}'),
+    )
+```
+
+Xem `routing.resolve_owner_slack()` để biết agent sẽ ping ai khi có gap ở artifact
+này (Feedback node hop qua `about` edge để lookup owner của entity đích).
+
 ## 5. Verify sau khi ingest
 
 Câu SQL / Python cheatsheet:
@@ -252,6 +449,9 @@ python -c "from tieukiwi import db; print(db.go_no_go('REQ-XXX', project_id='CDM
 
 # Bug blast radius
 python -c "from tieukiwi import db; print(db.bug_blast_radius('BUG-XXX', project_id='CDM'))"
+
+# Classify bug — improvement loop (caught_by_test | leaked_tc_missing | leaked_tc_not_run | leaked_tc_ran_missed)
+python -c "from tieukiwi import db; import json; print(json.dumps(db.classify_bug('BUG-XXX', project_id='CDM'), indent=2))"
 
 # KB semantic search
 python -c "from tieukiwi.rag import search; \
