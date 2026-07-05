@@ -148,7 +148,7 @@ def generate_draft(requirement_ref, project_id=None, llm_fn=None):
             "FULL updated list."
         )
 
-    raw = llm_fn(prompt, system=_SYSTEM_PROMPT)
+    raw = llm_fn(prompt, system=_SYSTEM_PROMPT, max_tokens=8192)
     testcases = _validate_testcases(raw["testcases"])
     gaps = _ac_gap_refs(prd, testcases)
     if gaps:
@@ -179,7 +179,7 @@ def refine_draft(state, comment, llm_fn=None):
             f"Reviewer comment:\n{comment}\n\n"
             "Apply the reviewer's comment and return the FULL updated testcase list."
         )
-        raw = llm_fn(prompt, system=_SYSTEM_PROMPT)
+        raw = llm_fn(prompt, system=_SYSTEM_PROMPT, max_tokens=8192)
         testcases = _validate_testcases(raw["testcases"])
         summary = raw.get("summary", "")
     return {

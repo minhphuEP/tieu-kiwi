@@ -46,7 +46,7 @@ try:
     with db.conn() as c:
         c.execute("UPDATE nodes SET project_id=%s WHERE id IN (%s, %s)", (PROJECT, req_id, ac_id))
 
-    def stub_llm_generate(prompt, system=None):
+    def stub_llm_generate(prompt, system=None, **kwargs):
         return {
             "testcases": [{
                 "ref": TC_REF,
@@ -76,7 +76,7 @@ try:
 
     captured_prompts = []
 
-    def stub_llm_branch_b(prompt, system=None):
+    def stub_llm_branch_b(prompt, system=None, **kwargs):
         captured_prompts.append(prompt)
         return {
             "testcases": [
@@ -112,7 +112,7 @@ try:
     assert "FULL updated list" in captured_prompts[0]
     assert {tc["ref"] for tc in draft_b["testcases"]} == {TC_REF, "TC-ZTMP-GENTEST-002"}
 
-    def stub_llm_refine(prompt, system=None):
+    def stub_llm_refine(prompt, system=None, **kwargs):
         return {
             "testcases": [{
                 "ref": TC_REF,
@@ -130,7 +130,7 @@ try:
     assert refined["version"] == 2
     assert refined["testcases"][0]["priority"] == "High"
 
-    def stub_llm_should_not_be_called(prompt, system=None):
+    def stub_llm_should_not_be_called(prompt, system=None, **kwargs):
         raise AssertionError("LLM should not be called for a full-replacement comment")
 
     replacement_comment = json.dumps(refined["testcases"])
