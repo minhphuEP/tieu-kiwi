@@ -29,7 +29,7 @@ tieukiwi/testcase_gen.py :: generate_draft(ref, project_id)
   │  fetch template + rubric (rag.search over kb/ + skills/)
   │  call LLM → draft TestCase list (JSON)
   ▼
-thread_state (channel_id, thread_ts) = {ref, version, testcases, history[]}
+thread_state (channel_id, thread_ts) = {ref, version, testcases, draft_message_ts}
   ▼
 Slack post: rendered draft + [Approve] [Refine] buttons
   │
@@ -122,15 +122,21 @@ already documented in `kb/_global/QE/templates/testcase_template.md`.
 
 ### 3. `tieukiwi/testcase_export.py` (new module)
 
-The write-side inverse of `scripts/ingest/testcases.py`. `export_excel(testcases: list[dict]) -> bytes`:
+Mirrors the column conventions `scripts/ingest/testcases.py` reads, but is not a
+strict round-trip inverse — re-ingesting an exported data-driven sheet is not
+currently supported by that script's parser. `export_excel(testcases: list[dict]) -> bytes`:
 - Builds one `Normal_TestCases` sheet for every draft with empty `data_variants`,
   one row per step (title/priority/precondition only on the first row of each TC,
   matching the read-side convention already documented).
-- Builds one sheet per TC with non-empty `data_variants`, named after `ref`,
-  following the Section A (steps) / separator / Section C (data table) layout.
+- Builds one sheet per TC with non-empty `data_variants`, named after `ref`
+  (sanitized: invalid Excel characters stripped, truncated to 31 chars,
+  de-duplicated with a numeric suffix on collision), following the Section A
+  (steps) / separator / Section C (data table) layout.
+- Raises `ValueError` on an empty `testcases` list rather than producing an
+  invalid workbook.
 - Returns the workbook as bytes (no temp file) for direct upload to Slack.
 
-### 4. `skills/gen-testcase/SKILL.md` (new)
+### 4. `skills/gen-testcase.md` (new)
 
 Rubric for the LLM prompt: Title format (`[TC_ID] verb-first summary`), allowed
 Priority values, Precondition/Steps/Expected conventions — mirrors the "Conventions
@@ -162,14 +168,23 @@ Slack interactive flow).
 - `@app.view("tc_refine_submit")` — reads the textarea, calls
   `testcase_gen.refine_draft`, updates `thread_state`, posts the new draft version
   + buttons (loop continues).
-- `slack_format.render_testcase_draft(draft)` — renders the draft as Block Kit
-  (AC / TestCase / Priority table + condensed steps), following the existing
-  `render_golive`-style composition pattern.
+- `slack_format.render_testcase_draft(draft)` — renders the draft as a Slack
+  mrkdwn bullet list (one line per testcase: ref, AC refs, priority, title),
+  built directly rather than via `to_slack()` — see the function's docstring:
+  `to_slack`'s AC-line parser (`_parse_ac_lines`) hijacks any line combining an
+  AC-like ref with a common word like "fail"/"không có" and silently rewrites
+  it as a fabricated go-live coverage report, so a pipe-table or `to_slack`-
+  routed render is unsafe for this content.
+- Each new draft version is posted as a NEW Slack message; the previous draft
+  message has its buttons stripped (`chat_update`, best-effort) and is marked
+  "Superseded by vN". Both `tc_approve` and `tc_refine` clicks are rejected
+  with a warning if they come from a superseded message
+  (`_is_stale_draft_click`, comparing against `state["draft_message_ts"]`).
 
 ## State management
 
 `thread_state` table (already exists, migration 002) keyed by `(channel_id,
-thread_ts)`. Blob shape:
+thread_ts)`. Blob shape (actual, as implemented):
 
 ```json
 {
@@ -178,24 +193,43 @@ thread_ts)`. Blob shape:
   "project_id": "CDM_TEAM",
   "version": 2,
   "testcases": [ /* draft schema array, current version */ ],
-  "history": [ {"version": 1, "comment": null}, {"version": 2, "comment": "..."} ]
+  "summary": "what changed in this version and why",
+  "draft_message_ts": "1720000000.123456"
 }
 ```
 
-Read via `memory.get_thread_state`, written via `memory.save_thread_state` — no
-schema changes needed.
+No `history` array — only the current version is kept; superseded messages are
+marked in-place in Slack instead. Read via `memory.get_thread_state`, written
+via `memory.save_thread_state` — no schema changes needed.
 
 ## Error handling
 
-- Requirement not found → reply with an error, do not create thread_state.
-- LLM returns invalid JSON → retry once with a corrective prompt; on second
-  failure, reply with an error instead of crashing the handler.
-- Excel export fails (missing/malformed field) → the TestCase nodes are already
-  saved (approval already happened); report the export error in-thread without
-  rolling back the DB write.
+- Requirement not found → `generate_draft` raises `ValueError`; the plain-chat
+  tool path (`tools.gen_testcase`) catches `(ValueError, KeyError)` and returns
+  a structured `{"status": "error", ...}` dict; the Slack path
+  (`_do_gen_testcase`) catches the same and replies with an error message. No
+  thread_state is created on failure.
+- LLM returns invalid/incomplete JSON (e.g. truncated output) → propagates as a
+  `ValueError`/`json.JSONDecodeError`, handled the same way as above — no
+  automatic retry. `max_tokens` scales with the number of testcases being
+  echoed back (`_max_tokens_for`, base 4096 + 400/testcase, capped at 16000) to
+  avoid the truncation failure mode in the first place.
+- Excel export fails (missing/malformed field, or empty testcase list) → the
+  TestCase nodes are already saved (approval already happened); report the
+  export error in-thread without rolling back the DB write.
+- A click on a superseded draft message (an older Refine/Approve button after a
+  newer version was posted) is rejected with a warning rather than acting on
+  stale state (`_is_stale_draft_click`).
 
 ## Out of scope for this iteration
 
 - Replying in-thread as a comment mechanism (Modal was chosen instead).
-- Concurrent-approval conflict handling (last-write-wins is acceptable for now).
+- Concurrent-approval conflict handling (last-write-wins is acceptable for now;
+  this includes a narrow TOCTOU window where a Refine modal submission can land
+  after a different newer draft was already posted — the submit itself does
+  not re-check staleness, only the initial button clicks do).
 - Automatically re-running `go_no_go` after approval.
+- True atomicity against near-simultaneous double-clicks on Approve (buttons
+  are removed after the DB save succeeds, which closes the common case, but
+  two clicks arriving before the first `chat_update` completes could still
+  both reach the export/upload step).
