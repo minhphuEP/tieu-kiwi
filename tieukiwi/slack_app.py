@@ -14,7 +14,7 @@ ANTHROPIC_API_KEY for the agent). Importing this module does NOT require the tok
 import json
 import re
 
-from . import agent, config, db, routing, slack_format
+from . import agent, config, db, memory, routing, slack_format, testcase_export, testcase_gen
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
@@ -31,6 +31,18 @@ _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
 def _golive_intent(text):
     # Return the requirement ref if this looks like a go-live question, else None.
     if not text or not _GOLIVE_RE.search(text):
+        return None
+    m = _REQ_RE.search(text)
+    return m.group(1).upper() if m else None
+
+
+# Test-case generation intent, e.g. "gen test case cho CDM-268", "tạo test case CDM-268".
+_GEN_TC_RE = re.compile(r"gen(?:erate)?\s*test\s*case|t(ạ|a)o\s*test\s*case", re.I)
+
+
+def _gen_testcase_intent(text):
+    # Return the requirement ref if this looks like a "generate test cases" request, else None.
+    if not text or not _GEN_TC_RE.search(text):
         return None
     m = _REQ_RE.search(text)
     return m.group(1).upper() if m else None
@@ -229,6 +241,43 @@ def _golive_approval_blocks(requirement_ref, mention):
     ]
 
 
+# ---------------------------------------------------------------- Test-case generation
+
+def _testcase_draft_blocks(draft):
+    text = slack_format.render_testcase_draft(draft)
+    return [
+        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+        {
+            "type": "actions",
+            "block_id": f"tc_{draft['requirement_ref']}_{draft['version']}",
+            "elements": [
+                {"type": "button", "action_id": "tc_approve", "style": "primary",
+                 "text": {"type": "plain_text", "text": "Approve test cases"},
+                 "value": draft["requirement_ref"]},
+                {"type": "button", "action_id": "tc_refine",
+                 "text": {"type": "plain_text", "text": "Refine test cases"},
+                 "value": draft["requirement_ref"]},
+            ],
+        },
+    ]
+
+
+def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
+    project_id = _project_for_channel(channel_id, logger)
+    try:
+        draft = testcase_gen.generate_draft(requirement_ref, project_id=project_id)
+    except Exception as e:
+        if logger is not None:
+            logger.exception("generate_draft failed")
+        say(text=slack_format.to_slack(f":warning: Error: {e}"))
+        return
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    posted = say(blocks=_testcase_draft_blocks(draft),
+                 text=f"Draft test cases for {requirement_ref}", **kwargs)
+    anchor_ts = thread_ts or posted["ts"]
+    memory.save_thread_state(channel_id, anchor_ts, {"flow": "gen_testcase", **draft})
+
+
 def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     # Run go_no_go and post the analysis; add approve/reject buttons only on GO.
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
@@ -292,6 +341,12 @@ def build_app():
         ref = _golive_intent(text)
         if ref:
             _do_golive(say, ref, logger, channel_id=command.get("channel_id"))
+            return
+
+        # Generate-testcase request -> draft + Approve/Refine buttons.
+        tc_ref = _gen_testcase_intent(text)
+        if tc_ref:
+            _do_gen_testcase(say, tc_ref, logger, channel_id=command.get("channel_id"))
             return
 
         # 3) Otherwise: call the Layer A agent (shared helper) and post the result.
@@ -421,6 +476,77 @@ def build_app():
             slack_format.to_slack(f":x: Release rejected for *{ref}* by <@{user}>"),
         )
 
+    @app.action("tc_approve")
+    def handle_tc_approve(ack, body, client, logger):
+        ack()
+        channel_id = body["channel"]["id"]
+        thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
+        state = memory.get_thread_state(channel_id, thread_ts)
+        if not state:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread.")
+            return
+        user = body["user"]["id"]
+        try:
+            testcase_gen.finalize_and_save(state, approved_by=user)
+            xlsx_bytes = testcase_export.export_excel(state["testcases"])
+            client.files_upload_v2(
+                channel=channel_id, thread_ts=thread_ts,
+                filename=f"{state['requirement_ref']}_testcases.xlsx",
+                content=xlsx_bytes,
+                initial_comment=f":white_check_mark: Approved by <@{user}> "
+                                 f"(v{state['version']}) — {len(state['testcases'])} testcase(s) saved.",
+            )
+        except Exception as e:
+            logger.exception("finalize_and_save/export failed")
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=slack_format.to_slack(f":warning: Error: {e}"))
+
+    @app.action("tc_refine")
+    def handle_tc_refine(ack, body, client, logger):
+        ack()
+        channel_id = body["channel"]["id"]
+        thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "tc_refine_submit",
+                "private_metadata": json.dumps({"channel_id": channel_id, "thread_ts": thread_ts}),
+                "title": {"type": "plain_text", "text": "Refine test cases"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "blocks": [{
+                    "type": "input",
+                    "block_id": "comment_block",
+                    "label": {"type": "plain_text", "text": "Comment (or paste the full testcase list)"},
+                    "element": {"type": "plain_text_input", "action_id": "comment_input", "multiline": True},
+                }],
+            },
+        )
+
+    @app.view("tc_refine_submit")
+    def handle_tc_refine_submit(ack, body, client, view, logger):
+        ack()
+        meta = json.loads(view["private_metadata"])
+        channel_id, thread_ts = meta["channel_id"], meta["thread_ts"]
+        comment = view["state"]["values"]["comment_block"]["comment_input"]["value"]
+        state = memory.get_thread_state(channel_id, thread_ts)
+        if not state:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread.")
+            return
+        try:
+            refined = testcase_gen.refine_draft(state, comment)
+        except Exception as e:
+            logger.exception("refine_draft failed")
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=slack_format.to_slack(f":warning: Error: {e}"))
+            return
+        memory.save_thread_state(channel_id, thread_ts, {"flow": "gen_testcase", **refined})
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                 blocks=_testcase_draft_blocks(refined),
+                                 text=f"Draft test cases for {refined['requirement_ref']} (v{refined['version']})")
+
     @app.event("app_mention")
     def handle_app_mention(event, body, say, logger):
         # Ignore bot authors / bot_message so the bot never replies to itself or other bots.
@@ -455,6 +581,12 @@ def build_app():
         ref = _golive_intent(clean_text)
         if ref:
             _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
+            return
+
+        # Generate-testcase request -> draft + Approve/Refine buttons.
+        tc_ref = _gen_testcase_intent(clean_text)
+        if tc_ref:
+            _do_gen_testcase(say, tc_ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
             return
 
         answer = handle_question(clean_text, logger)
