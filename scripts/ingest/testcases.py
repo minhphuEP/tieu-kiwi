@@ -60,7 +60,7 @@ HEADER_ALIASES = {
     "expected_result":      "expected",
 }
 
-TEST_ID_RE = re.compile(r"\[([A-Z][A-Z0-9_\-]+)\]")
+TEST_ID_RE = re.compile(r"\[([A-Za-z][A-Za-z0-9_\-]+)\]")
 
 
 def _map_headers(header_row):
