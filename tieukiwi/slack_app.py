@@ -275,7 +275,17 @@ def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_
     posted = say(blocks=_testcase_draft_blocks(draft),
                  text=f"Draft test cases for {requirement_ref}", **kwargs)
     anchor_ts = thread_ts or posted["ts"]
-    memory.save_thread_state(channel_id, anchor_ts, {"flow": "gen_testcase", **draft})
+    memory.save_thread_state(channel_id, anchor_ts,
+                              {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **draft})
+
+
+def _is_stale_draft_click(body, state):
+    # True if this button/modal-trigger click came from a draft message that has
+    # since been superseded by a newer refine round (state["draft_message_ts"]
+    # points at the CURRENT live message; an older message's buttons are stale).
+    clicked_ts = body["message"]["ts"]
+    current_ts = state.get("draft_message_ts")
+    return current_ts is not None and clicked_ts != current_ts
 
 
 def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
@@ -486,6 +496,13 @@ def build_app():
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
                                      text=":warning: No draft found for this thread.")
             return
+        if _is_stale_draft_click(body, state):
+            client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts,
+                text=":warning: This draft has been superseded by a newer version — "
+                     "please use the buttons on the latest draft message in this thread.",
+            )
+            return
         user = body["user"]["id"]
         try:
             testcase_gen.finalize_and_save(state, approved_by=user)
@@ -529,6 +546,18 @@ def build_app():
         ack()
         channel_id = body["channel"]["id"]
         thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
+        state = memory.get_thread_state(channel_id, thread_ts)
+        if not state:
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread.")
+            return
+        if _is_stale_draft_click(body, state):
+            client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts,
+                text=":warning: This draft has been superseded by a newer version — "
+                     "please use the buttons on the latest draft message in this thread.",
+            )
+            return
         client.views_open(
             trigger_id=body["trigger_id"],
             view={
@@ -564,10 +593,24 @@ def build_app():
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
                                      text=slack_format.to_slack(f":warning: Error: {e}"))
             return
-        memory.save_thread_state(channel_id, thread_ts, {"flow": "gen_testcase", **refined})
-        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                 blocks=_testcase_draft_blocks(refined),
-                                 text=f"Draft test cases for {refined['requirement_ref']} (v{refined['version']})")
+        try:
+            old_ts = state.get("draft_message_ts")
+            if old_ts:
+                client.chat_update(
+                    channel=channel_id, ts=old_ts,
+                    blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                             "text": f":arrows_counterclockwise: Superseded by v{refined['version']} below."}}],
+                    text=f"Superseded by v{refined['version']}",
+                )
+        except Exception:
+            logger.exception("removing stale draft buttons failed")
+        posted = client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts,
+            blocks=_testcase_draft_blocks(refined),
+            text=f"Draft test cases for {refined['requirement_ref']} (v{refined['version']})",
+        )
+        memory.save_thread_state(channel_id, thread_ts,
+                                  {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **refined})
 
     @app.event("app_mention")
     def handle_app_mention(event, body, say, logger):
