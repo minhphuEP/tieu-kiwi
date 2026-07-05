@@ -66,9 +66,15 @@ def _validate_testcases(raw):
         raise ValueError("testcases must be a list")
     normalized = []
     for i, tc in enumerate(raw):
+        if not isinstance(tc, dict):
+            raise ValueError(f"testcase[{i}] must be an object, got {type(tc).__name__}")
         missing = [k for k in _REQUIRED_TC_KEYS if k not in tc]
         if missing:
             raise ValueError(f"testcase[{i}] missing required keys: {missing}")
+        if not isinstance(tc["ac_refs"], list):
+            raise ValueError(f"testcase[{i}].ac_refs must be a list, got {type(tc['ac_refs']).__name__}")
+        if not isinstance(tc["steps"], list):
+            raise ValueError(f"testcase[{i}].steps must be a list, got {type(tc['steps']).__name__}")
         normalized.append({
             "ref": tc["ref"],
             "ac_refs": list(tc["ac_refs"]),
@@ -120,6 +126,16 @@ def _selftest():
     }])
     assert _looks_like_full_replacement(full) is not None
     assert _looks_like_full_replacement("please add a negative case") is None
+
+    try:
+        _validate_testcases([{"ref": "TC-1", "ac_refs": "AC-1", "title": "t",
+                               "priority": "High", "steps": []}])
+        raise AssertionError("expected ValueError for non-list ac_refs")
+    except ValueError:
+        pass
+
+    assert _looks_like_full_replacement(json.dumps([1, 2, 3])) is None
+    assert _looks_like_full_replacement("[]") is None
     return "ok"
 
 
