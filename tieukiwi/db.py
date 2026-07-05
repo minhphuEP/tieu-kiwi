@@ -668,3 +668,206 @@ def go_no_go(requirement_ref, project_id=None):
         "open_bugs": open_bugs,
         "next_actions": next_actions,
     }
+
+
+# --- bug classification (improvement loop) --------------------------------
+
+def classify_bug(bug_ref, project_id=None):
+    """Classify how a bug was detected, to route it into the improvement loop.
+
+    Categories (pure graph structure, no heuristics on props_json):
+      caught_by_test         Bug has an incoming `finds` edge from a TestRun.
+                             OK — QE process worked; no improvement action.
+      leaked_impact_missed   Bug `affects` a Component that the parent Requirement
+                             did NOT declare `impacts` on. Impact analysis failed
+                             to identify this component as at-risk. → improve
+                             impact analysis pipeline (component identification).
+      leaked_tc_missing      Bug violates AC(s), but AC has no `coveredBy` edge
+                             to any TestCase. → improve `gen_testcase`.
+      leaked_tc_not_run      Bug violates AC(s) that ARE covered by TestCases,
+                             but none of those TestCases have any TestRun.
+                             → improve impact analysis / test prioritisation.
+      leaked_tc_ran_missed   Bug violates AC(s) with TestCases that DID run
+                             (there's ≥1 TestRun), yet the bug still leaked.
+                             → improve execution quality / assertions.
+      leaked_no_ac_link      Bug has no `violates` edge to any AC. Can't classify
+                             automatically — needs a human to link to an AC first.
+
+    Priority: caught_by_test > leaked_impact_missed > (violates-based cases) >
+    leaked_no_ac_link. Impact-missed sits BEFORE violates checks because a bug
+    in an unforeseen component is a distinct root cause even if a human later
+    added an AC link post-hoc — the analysis was still incomplete.
+
+    Requires bug node's `props.jira_parent_ref` to identify the Requirement
+    under test (for impact-missed detection). Falls through to violates-based
+    checks if jira_parent_ref is absent.
+
+    Args:
+      bug_ref: external ref of the Bug (e.g. 'CDM-287').
+      project_id: multi-tenant guard. Bug must belong to this project.
+
+    Returns dict with:
+      category, improve, reasoning, violated_acs, related_testcases, related_testruns
+    """
+    with conn() as c:
+        # 1. Bug exists + project match
+        sql = "SELECT id FROM nodes WHERE type='Bug' AND ref=%s"
+        params = [bug_ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"
+            params.append(project_id)
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            scope = f" in project '{project_id}'" if project_id else ""
+            return {
+                "category": "not_found",
+                "improve": None,
+                "reasoning": f"Bug '{bug_ref}' not found{scope}",
+                "violated_acs": [],
+                "related_testcases": [],
+                "related_testruns": [],
+            }
+        bug_id = row[0]
+
+        # 2. Caught by a TestRun?  (incoming `finds` edge)
+        finds_row = c.execute(
+            """
+            SELECT tr.ref FROM edges f
+            JOIN nodes tr ON tr.id = f.src_id AND tr.type='TestRun'
+            WHERE f.dst_id=%s AND f.rel='finds'
+            LIMIT 1
+            """,
+            (bug_id,),
+        ).fetchone()
+        if finds_row:
+            return {
+                "category": "caught_by_test",
+                "improve": None,
+                "reasoning": f"Detected by TestRun {finds_row[0]} — process worked.",
+                "violated_acs": [],
+                "related_testcases": [],
+                "related_testruns": [finds_row[0]],
+            }
+
+        # 3. Leaked in an unforeseen component?
+        # Bug `affects` a Component the parent Requirement did NOT declare `impacts`
+        # on. This is a distinct failure of the impact-analysis pipeline (component
+        # identification), separate from "we knew this feature but had no TC".
+        parent_ref_row = c.execute(
+            "SELECT props_json->>'jira_parent_ref' FROM nodes WHERE id=%s",
+            (bug_id,),
+        ).fetchone()
+        parent_ref = parent_ref_row[0] if parent_ref_row else None
+        if parent_ref:
+            unforeseen = c.execute(
+                """
+                SELECT comp.ref FROM edges af
+                JOIN nodes comp ON comp.id = af.dst_id AND comp.type='Component'
+                WHERE af.src_id=%s AND af.rel='affects'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM edges im
+                    JOIN nodes r ON r.id = im.src_id
+                                AND r.type='Requirement' AND r.ref=%s
+                    WHERE im.dst_id = comp.id AND im.rel='impacts'
+                  )
+                ORDER BY comp.ref
+                """,
+                (bug_id, parent_ref),
+            ).fetchall()
+            if unforeseen:
+                unforeseen_refs = [r[0] for r in unforeseen]
+                return {
+                    "category": "leaked_impact_missed",
+                    "improve": "impact_analysis",
+                    "reasoning": (
+                        f"Bug affects Component(s) {unforeseen_refs} but Requirement "
+                        f"'{parent_ref}' didn't declare `impacts` on them. Impact "
+                        f"analysis missed identifying these components as at-risk."
+                    ),
+                    "violated_acs": [],
+                    "related_testcases": [],
+                    "related_testruns": [],
+                    "unforeseen_components": unforeseen_refs,
+                }
+
+        # 4. Leaked. Find violated ACs.
+        violated = c.execute(
+            """
+            SELECT ac.id, ac.ref FROM edges v
+            JOIN nodes ac ON ac.id = v.dst_id AND ac.type='AcceptanceCriterion'
+            WHERE v.src_id=%s AND v.rel='violates'
+            ORDER BY ac.ref
+            """,
+            (bug_id,),
+        ).fetchall()
+        if not violated:
+            return {
+                "category": "leaked_no_ac_link",
+                "improve": "manual_review",
+                "reasoning": "Bug has no `violates` edge to any AC. Link it to an AC "
+                             "to enable automatic classification.",
+                "violated_acs": [],
+                "related_testcases": [],
+                "related_testruns": [],
+            }
+
+        violated_ac_refs = [ref for _, ref in violated]
+        violated_ac_ids = tuple(ac_id for ac_id, _ in violated)
+
+        # 4. TestCases covering those ACs
+        tc_rows = c.execute(
+            """
+            SELECT DISTINCT tc.id, tc.ref FROM edges cov
+            JOIN nodes tc ON tc.id = cov.dst_id AND tc.type='TestCase'
+            WHERE cov.src_id = ANY(%s) AND cov.rel='coveredBy'
+            ORDER BY tc.ref
+            """,
+            (list(violated_ac_ids),),
+        ).fetchall()
+        tc_refs = [ref for _, ref in tc_rows]
+        tc_ids = [tc_id for tc_id, _ in tc_rows]
+
+        if not tc_refs:
+            return {
+                "category": "leaked_tc_missing",
+                "improve": "gen_testcase",
+                "reasoning": (f"AC(s) {violated_ac_refs} have no covering TestCase. "
+                              f"Agent gen didn't cover this scenario — write a lesson."),
+                "violated_acs": violated_ac_refs,
+                "related_testcases": [],
+                "related_testruns": [],
+            }
+
+        # 5. TestRuns for those TestCases
+        run_rows = c.execute(
+            """
+            SELECT DISTINCT tr.ref, tr.props_json->>'status' AS status
+            FROM edges ex
+            JOIN nodes tr ON tr.id = ex.dst_id AND tr.type='TestRun'
+            WHERE ex.src_id = ANY(%s) AND ex.rel='executedBy'
+            ORDER BY tr.ref
+            """,
+            (tc_ids,),
+        ).fetchall()
+
+        if not run_rows:
+            return {
+                "category": "leaked_tc_not_run",
+                "improve": "impact_analysis",
+                "reasoning": (f"TestCase(s) {tc_refs} exist for AC(s) {violated_ac_refs} "
+                              f"but were never executed. Impact analysis missed prioritising them."),
+                "violated_acs": violated_ac_refs,
+                "related_testcases": tc_refs,
+                "related_testruns": [],
+            }
+
+        run_refs = [r for r, _ in run_rows]
+        return {
+            "category": "leaked_tc_ran_missed",
+            "improve": "execution_quality",
+            "reasoning": (f"TestCase(s) {tc_refs} ran (runs {run_refs}) yet bug leaked. "
+                          f"Execution / assertion quality missed it — review testcase depth."),
+            "violated_acs": violated_ac_refs,
+            "related_testcases": tc_refs,
+            "related_testruns": run_refs,
+        }

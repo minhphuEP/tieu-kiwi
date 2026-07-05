@@ -14,6 +14,10 @@ env/
 # Vector store / local data
 chroma_db/
 
+# KB binary source docs — per-machine (drop your Confluence exports here).
+# .md stays tracked so team convention docs (glossary, templates) live in git.
+
+
 # Node (if any tooling is added later)
 node_modules/
 dist/
