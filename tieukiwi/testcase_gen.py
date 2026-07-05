@@ -54,6 +54,10 @@ _RUBRIC_FALLBACK = (
 
 _REQUIRED_TC_KEYS = ("ref", "ac_refs", "title", "priority", "steps")
 
+_LLM_MAX_TOKENS_BASE = 4096
+_LLM_MAX_TOKENS_PER_TESTCASE = 400
+_LLM_MAX_TOKENS_CEILING = 16000
+
 
 def _ac_gap_refs(prd, existing_testcases):
     """AC refs from `prd['acs']` not covered by any testcase's ac_refs."""
@@ -102,6 +106,17 @@ def _looks_like_full_replacement(comment):
         return None
 
 
+def _max_tokens_for(existing_count):
+    """Scale the LLM output budget with how many testcases it must echo back
+    (Branch B's 'return the FULL updated list' prompt) — a flat ceiling
+    reproduces the truncation bug this was designed to fix once the existing
+    testcase backlog grows past what the base budget covers."""
+    return min(
+        _LLM_MAX_TOKENS_BASE + existing_count * _LLM_MAX_TOKENS_PER_TESTCASE,
+        _LLM_MAX_TOKENS_CEILING,
+    )
+
+
 def _fetch_kb_context(project_id=None):
     template_hits = rag.search("test case template format", k=1, project_id=project_id,
                                 doc_type="template", include_global=True)
@@ -148,7 +163,7 @@ def generate_draft(requirement_ref, project_id=None, llm_fn=None):
             "FULL updated list."
         )
 
-    raw = llm_fn(prompt, system=_SYSTEM_PROMPT, max_tokens=8192)
+    raw = llm_fn(prompt, system=_SYSTEM_PROMPT, max_tokens=_max_tokens_for(len(existing)))
     testcases = _validate_testcases(raw["testcases"])
     gaps = _ac_gap_refs(prd, testcases)
     if gaps:
@@ -179,7 +194,7 @@ def refine_draft(state, comment, llm_fn=None):
             f"Reviewer comment:\n{comment}\n\n"
             "Apply the reviewer's comment and return the FULL updated testcase list."
         )
-        raw = llm_fn(prompt, system=_SYSTEM_PROMPT, max_tokens=8192)
+        raw = llm_fn(prompt, system=_SYSTEM_PROMPT, max_tokens=_max_tokens_for(len(state["testcases"])))
         testcases = _validate_testcases(raw["testcases"])
         summary = raw.get("summary", "")
     return {
@@ -232,6 +247,10 @@ def _selftest():
 
     assert _looks_like_full_replacement(json.dumps([1, 2, 3])) is None
     assert _looks_like_full_replacement("[]") is None
+
+    assert _max_tokens_for(0) == _LLM_MAX_TOKENS_BASE
+    assert _max_tokens_for(10) == _LLM_MAX_TOKENS_BASE + 10 * _LLM_MAX_TOKENS_PER_TESTCASE
+    assert _max_tokens_for(1000) == _LLM_MAX_TOKENS_CEILING
     return "ok"
 
 
