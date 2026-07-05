@@ -57,3 +57,7 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+
+# Slack user id of the Delivery Manager who signs off go-live releases.
+# Unset -> the curator block shows a plain "@Delivery Manager" label + a note.
+DELIVERY_MANAGER_SLACK_ID = os.getenv("DELIVERY_MANAGER_SLACK_ID")
