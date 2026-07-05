@@ -34,7 +34,50 @@ SEED_USERS = [
 ]
 
 
+def upsert_user(slack_id, display_name, role, project_id=None, jira_account_id=None, email=None):
+    """Insert or update ONE user, keyed by slack_id. Handy for adding yourself to a role
+    while testing — re-running with a different role flips it (unlike the bulk seed which
+    is DO NOTHING). Parameterized SQL.
+
+    Example (add yourself as delivery_manager, global):
+        python scripts/seed/users.py --add U0BEZ40TFAM delivery_manager
+        python scripts/seed/users.py --add U0BEZ40TFAM qe_lead PROJ_AUTH "Me (QE Lead)"
+    """
+    with db.conn() as c:
+        c.execute(
+            """
+            INSERT INTO users (slack_id, jira_account_id, email, display_name, role, project_id)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (slack_id) DO UPDATE SET
+              display_name    = EXCLUDED.display_name,
+              role            = EXCLUDED.role,
+              project_id      = EXCLUDED.project_id,
+              jira_account_id = COALESCE(EXCLUDED.jira_account_id, users.jira_account_id),
+              email           = COALESCE(EXCLUDED.email, users.email)
+            """,
+            (slack_id, jira_account_id, email, display_name, role, project_id),
+        )
+    return slack_id
+
+
 def main():
+    import argparse
+    p = argparse.ArgumentParser(description="Seed / add users for ask-routing.")
+    p.add_argument(
+        "--add", nargs="+", metavar="ARG",
+        help="Upsert one user: --add <slack_id> <role> [project_id] [display_name]",
+    )
+    args = p.parse_args()
+
+    if args.add:
+        slack_id = args.add[0]
+        role = args.add[1]
+        project = args.add[2] if len(args.add) > 2 else None
+        name = args.add[3] if len(args.add) > 3 else slack_id
+        upsert_user(slack_id, name, role, project)
+        print(f"[ok] upserted {slack_id} as role='{role}' project={project}")
+        return
+
     with db.conn() as c:
         for slack_id, name, role, project, jira, email in SEED_USERS:
             c.execute(

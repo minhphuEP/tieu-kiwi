@@ -39,6 +39,68 @@ ROLE_MAP = {
 }
 
 
+# Layer C: a candidate rule's applies_to (rule domain) -> approver role label.
+# TestCase-ish rules are approved by the QE lead; business/spec rules by the PO.
+APPROVER_ROLE = {
+    "TestCase":            "QE_lead",
+    "TestPlan":            "QE_lead",
+    "TestRun":             "QE_lead",
+    "Bug":                 "QE_lead",
+    "AcceptanceCriterion": "PO",
+    "Requirement":         "PO",
+    "UserStory":           "PO",
+    "business":            "PO",
+}
+
+DEFAULT_APPROVER = "QE_lead"
+
+
+def approver_for(applies_to):
+    """Return the approver role label for a candidate rule's applies_to domain.
+
+    Demo scope: returns a role LABEL (e.g. "QE_lead") shown as a hint in the curator
+    message. TODO: resolve role label -> real Slack user id (config dict / users table)
+    for an actual @mention.
+    """
+    return APPROVER_ROLE.get(applies_to, DEFAULT_APPROVER)
+
+
+# --- Role resolution for real @mentions (used with db.resolve_role_slack_id) ------
+# Lowercase role tokens; db.resolve_role_slack_id matches them case-insensitively
+# against the canonical upper-snake values in users.role.
+
+# Decision type -> approver role.
+DECISION_ROLE = {
+    "go_live":     "delivery_manager",
+    "testcase":    "qe_lead",
+    "curator":     "qe_lead",
+    "business":    "po",
+    "requirement": "po",
+}
+
+# Candidate-rule domain (applies_to) -> approver role.
+_APPLIES_ROLE = {
+    "TestCase":            "qe_lead",
+    "TestPlan":            "qe_lead",
+    "TestRun":             "qe_lead",
+    "Bug":                 "qe_lead",
+    "AcceptanceCriterion": "po",
+    "Requirement":         "po",
+    "UserStory":           "po",
+    "business":            "po",
+}
+
+
+def approver_role_for(decision_type):
+    """Map a decision type to its approver role token (e.g. 'go_live' -> 'delivery_manager')."""
+    return DECISION_ROLE.get(decision_type, "qe_lead")
+
+
+def curator_role_for(applies_to):
+    """Map a candidate rule's applies_to domain to its approver role ('qe_lead' | 'po')."""
+    return _APPLIES_ROLE.get(applies_to, "qe_lead")
+
+
 def owner_for(entity_type):
     """Legacy: return the class-level role name for a given entity type."""
     return ENTITY_OWNER.get(entity_type, DEFAULT_OWNER)

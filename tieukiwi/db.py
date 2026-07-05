@@ -64,6 +64,32 @@ def bind_channel(channel_id, project_id, team_id=None, note=None):
         )
 
 
+def resolve_role_slack_id(role, project_id=None):
+    """Resolve a role name to a Slack user id via the users table.
+
+    Project-scoped match first (when project_id is given), then any user with that role.
+    Role matching is case-insensitive, so lowercase tokens (e.g. 'qe_lead') match the
+    canonical upper-snake values stored in users.role ('QE_LEAD'). Returns None if no
+    user with that role has a slack_id. Parameterized SQL.
+    """
+    with conn() as c:
+        if project_id is not None:
+            row = c.execute(
+                "SELECT slack_id FROM users "
+                "WHERE lower(role)=lower(%s) AND project_id=%s AND slack_id IS NOT NULL "
+                "LIMIT 1",
+                (role, project_id),
+            ).fetchone()
+            if row:
+                return row[0]
+        row = c.execute(
+            "SELECT slack_id FROM users "
+            "WHERE lower(role)=lower(%s) AND slack_id IS NOT NULL LIMIT 1",
+            (role,),
+        ).fetchone()
+        return row[0] if row else None
+
+
 def upsert_node_by_ref(type_, ref, props=None):
     # Insert a node, or update its props if one with the same (type, ref) already exists.
     # Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
@@ -85,6 +111,226 @@ def upsert_node_by_ref(type_, ref, props=None):
             (type_, ref, psycopg.types.json.Json(props)),
         ).fetchone()
         return row[0]
+
+
+def get_node_props(ref, type_=None):
+    """Return props_json (dict) for the node with this ref (optionally by type), or {}."""
+    sql = "SELECT props_json FROM nodes WHERE ref=%s"
+    params = [ref]
+    if type_ is not None:
+        sql += " AND type=%s"
+        params.append(type_)
+    sql += " ORDER BY id LIMIT 1"
+    with conn() as c:
+        row = c.execute(sql, params).fetchone()
+    return (row[0] if row and row[0] else {}) or {}
+
+
+def node_id_for(ref, type_=None):
+    """Return the id of the node with this ref (optionally filtered by type), or None."""
+    sql = "SELECT id FROM nodes WHERE ref=%s"
+    params = [ref]
+    if type_ is not None:
+        sql += " AND type=%s"
+        params.append(type_)
+    sql += " ORDER BY id LIMIT 1"
+    with conn() as c:
+        row = c.execute(sql, params).fetchone()
+        return row[0] if row else None
+
+
+def ensure_edge(src_id, rel, dst_id, props=None):
+    """Insert an edge only if an identical (src, rel, dst) edge doesn't already exist.
+    Returns the edge id. Idempotent."""
+    with conn() as c:
+        row = c.execute(
+            "SELECT id FROM edges WHERE src_id=%s AND rel=%s AND dst_id=%s",
+            (src_id, rel, dst_id),
+        ).fetchone()
+        if row:
+            return row[0]
+        row = c.execute(
+            "INSERT INTO edges(src_id, rel, dst_id, props_json) VALUES (%s,%s,%s,%s) RETURNING id",
+            (src_id, rel, dst_id, psycopg.types.json.Json(props or {})),
+        ).fetchone()
+        return row[0]
+
+
+def update_node_props(ref, key, value, type_=None):
+    """Set props_json[key] = value on the node(s) with this ref (optionally by type).
+    Leaves other props intact. Returns number of rows updated."""
+    sql = (
+        "UPDATE nodes SET props_json = jsonb_set(COALESCE(props_json,'{}'::jsonb), "
+        "%s::text[], %s::jsonb, true) WHERE ref=%s"
+    )
+    params = [[key], psycopg.types.json.Json(value), ref]
+    if type_ is not None:
+        sql += " AND type=%s"
+        params.append(type_)
+    with conn() as c:
+        return c.execute(sql, params).rowcount
+
+
+def delete_node_by_ref(ref, type_=None):
+    """Delete a node (and all edges touching it) by ref. Idempotent — returns True if
+    a node was removed, False if none existed."""
+    nid = node_id_for(ref, type_)
+    if nid is None:
+        return False
+    with conn() as c:
+        c.execute("DELETE FROM edges WHERE src_id=%s OR dst_id=%s", (nid, nid))
+        c.execute("DELETE FROM nodes WHERE id=%s", (nid,))
+    return True
+
+
+# --- Layer C: KB promotion / curator flow -----------------------------------
+
+def add_candidate_rule(rule, scope, applies_to, evidence=None):
+    """Insert a candidate rule into promotion_queue (status 'pending'). Returns its id."""
+    with conn() as c:
+        row = c.execute(
+            """
+            INSERT INTO promotion_queue (candidate_rule, scope, applies_to, evidence, status)
+            VALUES (%s, %s, %s, %s, 'pending')
+            RETURNING id
+            """,
+            (rule, scope, applies_to, psycopg.types.json.Json(evidence or {})),
+        ).fetchone()
+        return row[0]
+
+
+def get_candidate(candidate_id):
+    """Return a promotion_queue row as a dict, or None if it doesn't exist."""
+    with conn() as c:
+        cur = c.execute(
+            """
+            SELECT id, candidate_rule, scope, applies_to, evidence, status
+            FROM promotion_queue WHERE id=%s
+            """,
+            (candidate_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip([d.name for d in cur.description], row))
+
+
+def update_candidate_rule(candidate_id, new_text):
+    """Update a candidate's rule text (used by the curator 'Edit' flow)."""
+    with conn() as c:
+        c.execute(
+            "UPDATE promotion_queue SET candidate_rule=%s WHERE id=%s",
+            (new_text, candidate_id),
+        )
+
+
+def _index_rule_to_chroma(kb_rule_id, rule, scope, applies_to, approver):
+    """Best-effort: index an approved rule into Chroma so search_kb can retrieve it.
+
+    Idempotent — upsert keyed by 'kbrule-<id>', so re-approving/backfilling the same
+    rule overwrites rather than duplicating. A Chroma failure must NOT undo the DB
+    write; kb_rules stays the system-of-record and backfill_kb_rules_to_chroma() can
+    repair the index later. Chroma metadata values must be scalars (no None).
+    """
+    try:
+        from . import rag
+        rag.index_docs([(
+            f"kbrule-{kb_rule_id}",
+            rule or "",
+            {
+                "type": "rule",
+                "source": "curator",
+                "applies_to": applies_to or "",
+                "scope": scope or "",
+                "kb_rule_id": kb_rule_id,
+                "approved_by": approver or "",
+            },
+        )])
+        return True
+    except Exception:
+        return False
+
+
+def approve_candidate(candidate_id, approver):
+    """Promote a pending candidate into kb_rules (status 'active') with provenance,
+    then mark the queue row 'approved'. Also index the rule into Chroma so search_kb
+    can retrieve it. Returns the new kb_rules id, or None if the candidate does not exist."""
+    with conn() as c:
+        cand = c.execute(
+            "SELECT candidate_rule, scope, applies_to, evidence FROM promotion_queue WHERE id=%s",
+            (candidate_id,),
+        ).fetchone()
+        if not cand:
+            return None
+        rule, scope, applies_to, evidence = cand
+        provenance = {
+            "source_candidate": candidate_id,
+            "approved_by": approver,
+            "evidence": evidence or {},
+        }
+        row = c.execute(
+            """
+            INSERT INTO kb_rules (rule, scope, applies_to, status, provenance)
+            VALUES (%s, %s, %s, 'active', %s)
+            RETURNING id
+            """,
+            (rule, scope, applies_to, psycopg.types.json.Json(provenance)),
+        ).fetchone()
+        c.execute(
+            "UPDATE promotion_queue SET status='approved' WHERE id=%s",
+            (candidate_id,),
+        )
+        kb_rule_id = row[0]
+
+    # DB is committed at this point; also make the rule retrievable via Chroma.
+    _index_rule_to_chroma(kb_rule_id, rule, scope, applies_to, approver)
+    return kb_rule_id
+
+
+def backfill_kb_rules_to_chroma():
+    """Index all active kb_rules rows into Chroma (idempotent). Use once to make
+    already-approved rules retrievable. Returns the number of rules indexed."""
+    with conn() as c:
+        rows = c.execute(
+            "SELECT id, rule, scope, applies_to, provenance FROM kb_rules "
+            "WHERE status='active' ORDER BY id"
+        ).fetchall()
+    count = 0
+    for kb_id, rule, scope, applies_to, provenance in rows:
+        approver = provenance.get("approved_by", "") if isinstance(provenance, dict) else ""
+        if _index_rule_to_chroma(kb_id, rule, scope, applies_to, approver):
+            count += 1
+    return count
+
+
+def reject_candidate(candidate_id, approver):
+    """Mark a candidate 'rejected'. Does NOT write kb_rules. Returns True if a row changed."""
+    with conn() as c:
+        cur = c.execute(
+            "UPDATE promotion_queue SET status='rejected' WHERE id=%s",
+            (candidate_id,),
+        )
+        return cur.rowcount > 0
+
+
+def record_golive_decision(requirement_ref, decision, approver, reason=None):
+    """Record a human go-live sign-off (decision 'approved'/'rejected'). Returns the new id."""
+    provenance = {
+        "requirement": requirement_ref,
+        "decision": decision,
+        "approved_by": approver,
+    }
+    with conn() as c:
+        row = c.execute(
+            """
+            INSERT INTO go_live_decisions (requirement_ref, decision, approved_by, reason, provenance)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (requirement_ref, decision, approver, reason, psycopg.types.json.Json(provenance)),
+        ).fetchone()
+        return row[0]
+
 
 # Bug severities that block a go-live decision.
 HIGH_SEVERITIES = ("critical", "high")

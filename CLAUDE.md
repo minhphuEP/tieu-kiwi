@@ -107,7 +107,7 @@ Graph tools the agent uses:
 ## Tech stack
 
 - **LLM:** Anthropic Python SDK (`anthropic`), model `claude-sonnet-4-6` / Opus. Embeddings for RAG.
-- **Vector store:** Chroma (PersistentClient, path `./chroma_db`), collection `"kb"`.
+- **Vector store:** Chroma (PersistentClient, path `./chroma_db`), collection `"knowledge_base"`.
 - **DB:** Postgres (nodes/edges/kb_rules/promotion_queue/thread_state). Docker locally during dev.
 - **Slack:** `slack_bolt` (Socket Mode). Scopes: app_mentions:read, chat:write, commands,
   channels:history, groups:history, im:history, files:read, users:read.
