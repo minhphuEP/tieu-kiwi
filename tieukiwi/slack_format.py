@@ -675,5 +675,48 @@ def _golive_selftest():
     return render_golive(report_go, res_go), render_golive(report_nogo, res_nogo)
 
 
+def render_testcase_draft(draft):
+    """Render a testcase_gen draft dict as Slack mrkdwn text (AC/TC/Priority table
+    + condensed steps), for posting alongside Approve/Refine buttons.
+
+    Note: deliberately avoids markdown pipe-table syntax (`| ... |`). `to_slack`
+    routes any table with an "AC"-looking column through the golive coverage-report
+    parser (`_parse` / `_coverage_from_table`), which would silently discard this
+    draft's own structure and re-render it as an AC-coverage report instead. A
+    bullet list sidesteps that trigger while still passing through `to_slack`
+    cleanly via its plain-text fallback.
+    """
+    lines = [
+        f"*Draft test cases — {draft['requirement_ref']} (v{draft['version']})*",
+        "",
+    ]
+    if draft.get("summary"):
+        lines.append(f"> {draft['summary']}")
+        lines.append("")
+    for tc in draft["testcases"]:
+        ac_list = ", ".join(tc["ac_refs"])
+        lines.append(f"• *{tc['ref']}* — AC: {ac_list} · Priority: {tc['priority']} — {tc['title']}")
+    return to_slack("\n".join(lines))
+
+
+def _testcase_draft_selftest():
+    draft = {
+        "requirement_ref": "CDM-268",
+        "version": 2,
+        "summary": "Added AC-4 coverage per reviewer comment.",
+        "testcases": [
+            {"ref": "TC-1", "ac_refs": ["AC-1"], "priority": "High", "title": "[TC-1] Happy path"},
+            {"ref": "TC-2", "ac_refs": ["AC-4"], "priority": "Medium", "title": "[TC-2] Archive block"},
+        ],
+    }
+    out = render_testcase_draft(draft)
+    assert "CDM-268" in out and "v2" in out, out
+    assert "TC-1" in out and "TC-2" in out, out
+    assert "Archive block" in out, out
+    return out
+
+
 if __name__ == "__main__":
     print(_selftest())
+    print()
+    print(_testcase_draft_selftest())
