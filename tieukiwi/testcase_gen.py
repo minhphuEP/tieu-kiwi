@@ -105,8 +105,12 @@ def _looks_like_full_replacement(comment):
 def _fetch_kb_context(project_id=None):
     template_hits = rag.search("test case template format", k=1, project_id=project_id,
                                 doc_type="template", include_global=True)
+    # Rubrics live under skills/ (e.g. skills/gen-testcase.md), which never carries a
+    # `role` field in Chroma metadata (scripts/seed/kb.py only assigns `role` to docs
+    # under kb/<project>/<ROLE>/..., not skills/) — a role filter here would always
+    # exclude them and silently fall back to the constant.
     rubric_hits = rag.search("test case writing rubric conventions", k=1,
-                              project_id=project_id, role="QE", include_global=True)
+                              project_id=project_id, include_global=True)
     template = template_hits[0][1] if template_hits else _TEMPLATE_FALLBACK
     rubric = rubric_hits[0][1] if rubric_hits else _RUBRIC_FALLBACK
     return f"# Test case template\n{template}\n\n# Test case rubric\n{rubric}"
