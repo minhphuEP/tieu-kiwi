@@ -958,3 +958,68 @@ def testcases_for_requirement(ref, project_id=None):
             }
         by_ref[tc_ref]["ac_refs"].append(ac_ref)
     return list(by_ref.values())
+
+
+def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
+    """Upsert draft-schema testcases (tieukiwi/testcase_gen.py) as verified
+    TestCase nodes, and ensure a coveredBy edge from each of their ac_refs.
+
+    Args:
+      requirement_ref: the Requirement these testcases belong to (context only;
+                        edges are created from each testcase's own ac_refs).
+      testcases: list of draft-schema dicts.
+      approved_by: identifier (Slack user id) of the human approver.
+      project_id: scope for resolving ac_refs to node ids and for the upsert
+                  key (project_id, ref).
+
+    Returns:
+      list of TestCase node ids, in the same order as `testcases`.
+    """
+    node_ids = []
+    with conn() as c:
+        for tc in testcases:
+            props = {
+                "title": tc["title"],
+                "priority": tc["priority"],
+                "precondition": tc.get("precondition", ""),
+                "steps": tc["steps"],
+                "data_variants": tc.get("data_variants") or [],
+                "_meta": {
+                    "extraction_source": "llm:gen_testcase",
+                    "confidence": 0.9,
+                    "review_status": "verified",
+                    "approved_by": approved_by,
+                },
+            }
+            row = c.execute(
+                """
+                INSERT INTO nodes (type, ref, project_id, props_json)
+                VALUES ('TestCase', %s, %s, %s)
+                ON CONFLICT (project_id, ref) WHERE ref IS NOT NULL DO UPDATE
+                  SET props_json = nodes.props_json || EXCLUDED.props_json
+                RETURNING id
+                """,
+                (tc["ref"], project_id, psycopg.types.json.Json(props)),
+            ).fetchone()
+            tc_id = row[0]
+            node_ids.append(tc_id)
+            for ac_ref in tc.get("ac_refs", []):
+                ac_sql = "SELECT id FROM nodes WHERE type='AcceptanceCriterion' AND ref=%s"
+                ac_params = [ac_ref]
+                if project_id is not None:
+                    ac_sql += " AND project_id=%s"
+                    ac_params.append(project_id)
+                ac_row = c.execute(ac_sql, ac_params).fetchone()
+                if not ac_row:
+                    continue
+                ac_id = ac_row[0]
+                exists = c.execute(
+                    "SELECT id FROM edges WHERE src_id=%s AND rel='coveredBy' AND dst_id=%s",
+                    (ac_id, tc_id),
+                ).fetchone()
+                if not exists:
+                    c.execute(
+                        "INSERT INTO edges(src_id, rel, dst_id, props_json) VALUES (%s,'coveredBy',%s,%s)",
+                        (ac_id, tc_id, psycopg.types.json.Json({})),
+                    )
+    return node_ids
