@@ -1,6 +1,8 @@
 """Write TestCase drafts to an Excel workbook following the Testomat.io import
-format documented in kb/_global/QE/templates/testcase_template.md — the write
-side inverse of scripts/ingest/testcases.py.
+format documented in kb/_global/QE/templates/testcase_template.md. Mirrors the
+column conventions scripts/ingest/testcases.py reads, but is not a strict
+round-trip inverse — re-ingesting an exported data-driven sheet is not
+currently supported by that script's parser.
 
 Interface:
   export_excel(testcases) -> bytes   # .xlsx workbook, ready to upload
@@ -21,10 +23,26 @@ _NORMAL_SHEET = "Normal_TestCases"
 _NORMAL_HEADERS = ["Title", "Priority", "Pre-condition", "Step_Description",
                    "Test_Data", "Step_ExpectedResult"]
 _DATA_SEP_TEXT = "DATA TABLE  ▼  one row = one set of test data"
+_INVALID_SHEET_CHARS = set('/\\?*[]:')
+
+
+def _safe_sheet_name(ref, existing_names):
+    name = "".join("_" if ch in _INVALID_SHEET_CHARS else ch for ch in ref)[:31]
+    if name not in existing_names:
+        return name
+    # De-duplicate by truncating further to make room for a numeric suffix.
+    for i in range(2, 1000):
+        suffix = f"_{i}"
+        candidate = (name[: 31 - len(suffix)] + suffix)
+        if candidate not in existing_names:
+            return candidate
+    raise ValueError(f"could not generate a unique sheet name for ref={ref!r}")
 
 
 def export_excel(testcases):
     """testcases: list of draft-schema dicts. Returns the .xlsx workbook as bytes."""
+    if not testcases:
+        raise ValueError("export_excel: testcases list is empty")
     wb = openpyxl.Workbook()
     wb.remove(wb.active)  # drop the default blank sheet
 
@@ -54,7 +72,7 @@ def _write_normal_sheet(wb, testcases):
 
 
 def _write_data_driven_sheet(wb, tc):
-    ws = wb.create_sheet(tc["ref"])
+    ws = wb.create_sheet(_safe_sheet_name(tc["ref"], set(wb.sheetnames)))
     steps = tc["steps"] or [{"description": "", "expected": ""}]
     first = steps[0]
     ws.append([tc["title"], tc["priority"], tc.get("precondition", ""),
@@ -97,6 +115,13 @@ def _selftest():
     header_row = [c.value for c in dd[3]]
     assert header_row[4] == "Description" and header_row[-1] == "Expected", header_row
     assert dd[4][4].value == "empty" and (dd[4][5].value or "") == "" and dd[4][-1].value == "Error shown"
+
+    try:
+        export_excel([])
+        raise AssertionError("expected ValueError for empty testcases list")
+    except ValueError:
+        pass
+
     return "ok"
 
 
