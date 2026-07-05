@@ -871,3 +871,90 @@ def classify_bug(bug_ref, project_id=None):
             "related_testcases": tc_refs,
             "related_testruns": run_refs,
         }
+
+
+def requirement_with_acs(ref, project_id=None):
+    """Return the Requirement's PRD content plus its AcceptanceCriteria.
+
+    Args:
+      ref: Requirement ref (e.g. 'CDM-268').
+      project_id: if given, requirement must belong to that project.
+
+    Returns:
+      {"ref": ref, "found": True, "title": str|None, "detail": str|None,
+       "acs": [{"ref": str, "desc": str}]}
+      or {"ref": ref, "found": False} if no such Requirement exists.
+    """
+    sql = "SELECT id, props_json FROM nodes WHERE type='Requirement' AND ref=%s"
+    params = [ref]
+    if project_id is not None:
+        sql += " AND project_id=%s"
+        params.append(project_id)
+    with conn() as c:
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            return {"ref": ref, "found": False}
+        req_id, props = row
+        props = props or {}
+        acs = c.execute(
+            """
+            SELECT ac.ref, ac.props_json->>'desc' FROM nodes ac
+            JOIN edges h ON h.dst_id=ac.id AND h.rel='has'
+            WHERE h.src_id=%s AND ac.type='AcceptanceCriterion'
+            ORDER BY ac.ref
+            """,
+            (req_id,),
+        ).fetchall()
+    return {
+        "ref": ref,
+        "found": True,
+        "title": props.get("title"),
+        "detail": props.get("detail"),
+        "acs": [{"ref": ac_ref, "desc": desc} for ac_ref, desc in acs],
+    }
+
+
+def testcases_for_requirement(ref, project_id=None):
+    """Return existing TestCase nodes covering any AC of this Requirement.
+
+    Dedup by TestCase ref (a TC can cover multiple AC of the same requirement).
+    Each item includes `ac_refs`: every AC of this requirement that this
+    TestCase covers. Returns [] if the requirement doesn't exist or has no
+    covered ACs yet.
+    """
+    sql = "SELECT id FROM nodes WHERE type='Requirement' AND ref=%s"
+    params = [ref]
+    if project_id is not None:
+        sql += " AND project_id=%s"
+        params.append(project_id)
+    with conn() as c:
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            return []
+        req_id = row[0]
+        rows = c.execute(
+            """
+            SELECT tc.ref, tc.props_json, ac.ref FROM nodes tc
+            JOIN edges cov ON cov.dst_id=tc.id AND cov.rel='coveredBy'
+            JOIN nodes ac ON ac.id=cov.src_id AND ac.type='AcceptanceCriterion'
+            JOIN edges h ON h.dst_id=ac.id AND h.rel='has'
+            WHERE h.src_id=%s AND tc.type='TestCase'
+            ORDER BY tc.ref
+            """,
+            (req_id,),
+        ).fetchall()
+    by_ref = {}
+    for tc_ref, props, ac_ref in rows:
+        props = props or {}
+        if tc_ref not in by_ref:
+            by_ref[tc_ref] = {
+                "ref": tc_ref,
+                "title": props.get("title"),
+                "priority": props.get("priority"),
+                "precondition": props.get("precondition"),
+                "steps": props.get("steps") or [],
+                "data_variants": props.get("data_variants") or [],
+                "ac_refs": [],
+            }
+        by_ref[tc_ref]["ac_refs"].append(ac_ref)
+    return list(by_ref.values())
