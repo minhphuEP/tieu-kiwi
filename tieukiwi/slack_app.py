@@ -489,6 +489,23 @@ def build_app():
         user = body["user"]["id"]
         try:
             testcase_gen.finalize_and_save(state, approved_by=user)
+        except Exception as e:
+            logger.exception("finalize_and_save failed")
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=slack_format.to_slack(f":warning: Error saving testcases: {e}"))
+            return
+        # Remove the Approve/Refine buttons now that the DB write has succeeded,
+        # so a double-click or Slack redelivery can't trigger a second export/upload.
+        try:
+            client.chat_update(
+                channel=channel_id, ts=body["message"]["ts"],
+                blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                         "text": f":white_check_mark: Approved by <@{user}> (v{state['version']})"}}],
+                text=f"Approved by <@{user}>",
+            )
+        except Exception:
+            logger.exception("removing tc_approve buttons failed")
+        try:
             xlsx_bytes = testcase_export.export_excel(state["testcases"])
             client.files_upload_v2(
                 channel=channel_id, thread_ts=thread_ts,
@@ -498,9 +515,14 @@ def build_app():
                                  f"(v{state['version']}) — {len(state['testcases'])} testcase(s) saved.",
             )
         except Exception as e:
-            logger.exception("finalize_and_save/export failed")
-            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=slack_format.to_slack(f":warning: Error: {e}"))
+            logger.exception("export/upload failed")
+            client.chat_postMessage(
+                channel=channel_id, thread_ts=thread_ts,
+                text=slack_format.to_slack(
+                    f":warning: {len(state['testcases'])} testcase(s) were saved successfully, "
+                    f"but exporting/uploading the Excel file failed: {e}"
+                ),
+            )
 
     @app.action("tc_refine")
     def handle_tc_refine(ack, body, client, logger):
