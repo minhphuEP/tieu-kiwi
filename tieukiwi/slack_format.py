@@ -676,15 +676,19 @@ def _golive_selftest():
 
 
 def render_testcase_draft(draft):
-    """Render a testcase_gen draft dict as Slack mrkdwn text (AC/TC/Priority table
-    + condensed steps), for posting alongside Approve/Refine buttons.
+    """Render a testcase_gen draft dict as Slack mrkdwn text (one bullet per
+    testcase: ref, AC refs, priority, title), for posting alongside Approve/Refine
+    buttons.
 
-    Note: deliberately avoids markdown pipe-table syntax (`| ... |`). `to_slack`
-    routes any table with an "AC"-looking column through the golive coverage-report
-    parser (`_parse` / `_coverage_from_table`), which would silently discard this
-    draft's own structure and re-render it as an AC-coverage report instead. A
-    bullet list sidesteps that trigger while still passing through `to_slack`
-    cleanly via its plain-text fallback.
+    Builds mrkdwn directly instead of routing through to_slack(): to_slack's
+    _parse_ac_lines() scans any line for an AC-like ref plus a trigger keyword
+    (pass/fail/coverage gap/chưa có/không có/covered/...) and — if it matches —
+    silently discards the input and replaces it with a fabricated go-live
+    coverage report. A testcase title as plausible as "should fail when..." or
+    a Vietnamese negative-test phrasing containing "không có" would trigger
+    this. Since draft content here is already plain Slack mrkdwn (no GFM
+    artifacts needing conversion), skipping to_slack avoids the landmine
+    entirely rather than trying to make the trigger keyword list table-only.
     """
     lines = [
         f"*Draft test cases — {draft['requirement_ref']} (v{draft['version']})*",
@@ -693,10 +697,12 @@ def render_testcase_draft(draft):
     if draft.get("summary"):
         lines.append(f"> {draft['summary']}")
         lines.append("")
+    if not draft["testcases"]:
+        lines.append("_(no testcases in this draft)_")
     for tc in draft["testcases"]:
-        ac_list = ", ".join(tc["ac_refs"])
+        ac_list = ", ".join(tc["ac_refs"]) or "—"
         lines.append(f"• *{tc['ref']}* — AC: {ac_list} · Priority: {tc['priority']} — {tc['title']}")
-    return to_slack("\n".join(lines))
+    return "\n".join(lines)
 
 
 def _testcase_draft_selftest():
@@ -706,13 +712,22 @@ def _testcase_draft_selftest():
         "summary": "Added AC-4 coverage per reviewer comment.",
         "testcases": [
             {"ref": "TC-1", "ac_refs": ["AC-1"], "priority": "High", "title": "[TC-1] Happy path"},
-            {"ref": "TC-2", "ac_refs": ["AC-4"], "priority": "Medium", "title": "[TC-2] Archive block"},
+            {"ref": "TC-2", "ac_refs": ["AC-4"], "priority": "Medium",
+             "title": "[TC-2] Login should fail with invalid password"},
         ],
     }
     out = render_testcase_draft(draft)
     assert "CDM-268" in out and "v2" in out, out
     assert "TC-1" in out and "TC-2" in out, out
-    assert "Archive block" in out, out
+    assert "should fail with invalid password" in out, out
+    # Guard against the to_slack AC-line-hijacking landmine (see docstring):
+    # a real coverage-report rewrite would replace this text with a
+    # "Tình trạng Test Case" / "Test coverage (" table instead.
+    assert "Tình trạng Test Case" not in out, out
+    assert "Test coverage (" not in out, out
+
+    empty_draft = {"requirement_ref": "CDM-268", "version": 1, "summary": "", "testcases": []}
+    assert "no testcases" in render_testcase_draft(empty_draft)
     return out
 
 
