@@ -432,6 +432,10 @@ def classify_bug(bug_ref, project_id=None):
     Categories (pure graph structure, no heuristics on props_json):
       caught_by_test         Bug has an incoming `finds` edge from a TestRun.
                              OK — QE process worked; no improvement action.
+      leaked_impact_missed   Bug `affects` a Component that the parent Requirement
+                             did NOT declare `impacts` on. Impact analysis failed
+                             to identify this component as at-risk. → improve
+                             impact analysis pipeline (component identification).
       leaked_tc_missing      Bug violates AC(s), but AC has no `coveredBy` edge
                              to any TestCase. → improve `gen_testcase`.
       leaked_tc_not_run      Bug violates AC(s) that ARE covered by TestCases,
@@ -442,6 +446,15 @@ def classify_bug(bug_ref, project_id=None):
                              → improve execution quality / assertions.
       leaked_no_ac_link      Bug has no `violates` edge to any AC. Can't classify
                              automatically — needs a human to link to an AC first.
+
+    Priority: caught_by_test > leaked_impact_missed > (violates-based cases) >
+    leaked_no_ac_link. Impact-missed sits BEFORE violates checks because a bug
+    in an unforeseen component is a distinct root cause even if a human later
+    added an AC link post-hoc — the analysis was still incomplete.
+
+    Requires bug node's `props.jira_parent_ref` to identify the Requirement
+    under test (for impact-missed detection). Falls through to violates-based
+    checks if jira_parent_ref is absent.
 
     Args:
       bug_ref: external ref of the Bug (e.g. 'CDM-287').
@@ -490,7 +503,48 @@ def classify_bug(bug_ref, project_id=None):
                 "related_testruns": [finds_row[0]],
             }
 
-        # 3. Leaked. Find violated ACs.
+        # 3. Leaked in an unforeseen component?
+        # Bug `affects` a Component the parent Requirement did NOT declare `impacts`
+        # on. This is a distinct failure of the impact-analysis pipeline (component
+        # identification), separate from "we knew this feature but had no TC".
+        parent_ref_row = c.execute(
+            "SELECT props_json->>'jira_parent_ref' FROM nodes WHERE id=%s",
+            (bug_id,),
+        ).fetchone()
+        parent_ref = parent_ref_row[0] if parent_ref_row else None
+        if parent_ref:
+            unforeseen = c.execute(
+                """
+                SELECT comp.ref FROM edges af
+                JOIN nodes comp ON comp.id = af.dst_id AND comp.type='Component'
+                WHERE af.src_id=%s AND af.rel='affects'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM edges im
+                    JOIN nodes r ON r.id = im.src_id
+                                AND r.type='Requirement' AND r.ref=%s
+                    WHERE im.dst_id = comp.id AND im.rel='impacts'
+                  )
+                ORDER BY comp.ref
+                """,
+                (bug_id, parent_ref),
+            ).fetchall()
+            if unforeseen:
+                unforeseen_refs = [r[0] for r in unforeseen]
+                return {
+                    "category": "leaked_impact_missed",
+                    "improve": "impact_analysis",
+                    "reasoning": (
+                        f"Bug affects Component(s) {unforeseen_refs} but Requirement "
+                        f"'{parent_ref}' didn't declare `impacts` on them. Impact "
+                        f"analysis missed identifying these components as at-risk."
+                    ),
+                    "violated_acs": [],
+                    "related_testcases": [],
+                    "related_testruns": [],
+                    "unforeseen_components": unforeseen_refs,
+                }
+
+        # 4. Leaked. Find violated ACs.
         violated = c.execute(
             """
             SELECT ac.id, ac.ref FROM edges v
