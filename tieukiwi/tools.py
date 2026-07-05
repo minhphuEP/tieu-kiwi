@@ -1,6 +1,6 @@
 import httpx
 
-from . import config, db, rag
+from . import config, db, rag, testcase_gen
 
 
 # --- Layer A skeletons (TODO: implement) ---
@@ -11,13 +11,11 @@ def _not_implemented(tool, todo):
     return {"tool": tool, "status": "not_implemented", "todo": todo}
 
 
-def gen_testcase(requirement_ref):
-    model = config.model_for("gen_testcase")  # TODO: pass into the Claude call when implemented
-    # TODO: load requirement + ACs (db.trace) and relevant KB (rag.search),
-    # then call the Claude API (model=model) to draft TestCase nodes; return proposed testcases.
-    return _not_implemented(
-        "gen_testcase", "Generate testcases via Claude from requirement + KB context."
-    )
+def gen_testcase(requirement_ref, project_id=None):
+    """Draft (or update) testcases for a requirement. Returns the draft dict from
+    testcase_gen.generate_draft — plain-chat use (no Slack Approve/Refine loop;
+    that loop is driven directly from tieukiwi/slack_app.py, see docs/Gen-testcase-design.md)."""
+    return testcase_gen.generate_draft(requirement_ref, project_id=project_id)
 
 
 def gen_test_plan(requirement_ref):
