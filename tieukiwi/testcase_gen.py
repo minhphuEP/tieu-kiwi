@@ -102,6 +102,98 @@ def _looks_like_full_replacement(comment):
         return None
 
 
+def _fetch_kb_context(project_id=None):
+    template_hits = rag.search("test case template format", k=1, project_id=project_id,
+                                doc_type="template", include_global=True)
+    rubric_hits = rag.search("test case writing rubric conventions", k=1,
+                              project_id=project_id, role="QE", include_global=True)
+    template = template_hits[0][1] if template_hits else _TEMPLATE_FALLBACK
+    rubric = rubric_hits[0][1] if rubric_hits else _RUBRIC_FALLBACK
+    return f"# Test case template\n{template}\n\n# Test case rubric\n{rubric}"
+
+
+def generate_draft(requirement_ref, project_id=None, llm_fn=None):
+    """Branch A (no existing testcases): draft fresh testcases covering every AC.
+    Branch B (existing testcases found): update mismatched ones + add missing.
+    Returns {requirement_ref, project_id, version: 1, testcases, summary}.
+    """
+    llm_fn = llm_fn or llm.complete_json
+    prd = db.requirement_with_acs(requirement_ref, project_id=project_id)
+    if not prd.get("found"):
+        raise ValueError(f"Requirement not found: {requirement_ref}")
+    existing = db.testcases_for_requirement(requirement_ref, project_id=project_id)
+    context = _fetch_kb_context(project_id)
+    ac_lines = "\n".join(f"- {ac['ref']}: {ac['desc']}" for ac in prd["acs"])
+
+    if not existing:
+        prompt = (
+            f"{context}\n\n"
+            f"Requirement {prd['ref']}: {prd.get('title', '')}\n{prd.get('detail', '')}\n\n"
+            f"Acceptance Criteria:\n{ac_lines}\n\n"
+            "Draft testcases covering every AC above."
+        )
+    else:
+        existing_text = json.dumps(existing, ensure_ascii=False, indent=2)
+        prompt = (
+            f"{context}\n\n"
+            f"Requirement {prd['ref']}: {prd.get('title', '')}\n{prd.get('detail', '')}\n\n"
+            f"Acceptance Criteria:\n{ac_lines}\n\n"
+            f"Existing testcases:\n{existing_text}\n\n"
+            "Update any testcase whose steps/expected no longer match the AC text "
+            "above, and add new testcases for any AC not yet covered. Return the "
+            "FULL updated list."
+        )
+
+    raw = llm_fn(prompt, system=_SYSTEM_PROMPT)
+    testcases = _validate_testcases(raw["testcases"])
+    gaps = _ac_gap_refs(prd, testcases)
+    if gaps:
+        raise ValueError(f"LLM draft still leaves AC(s) uncovered: {gaps}")
+    return {
+        "requirement_ref": requirement_ref,
+        "project_id": project_id,
+        "version": 1,
+        "testcases": testcases,
+        "summary": raw.get("summary", ""),
+    }
+
+
+def refine_draft(state, comment, llm_fn=None):
+    """Apply a reviewer comment to the current draft and return version+1.
+    If `comment` parses as a full replacement testcase list, use it directly
+    (no LLM call)."""
+    llm_fn = llm_fn or llm.complete_json
+    replacement = _looks_like_full_replacement(comment)
+    if replacement is not None:
+        testcases = replacement
+        summary = "Replaced draft with the exact testcase list provided by the reviewer."
+    else:
+        context = _fetch_kb_context(state.get("project_id"))
+        current_text = json.dumps(state["testcases"], ensure_ascii=False, indent=2)
+        prompt = (
+            f"{context}\n\nCurrent draft testcases:\n{current_text}\n\n"
+            f"Reviewer comment:\n{comment}\n\n"
+            "Apply the reviewer's comment and return the FULL updated testcase list."
+        )
+        raw = llm_fn(prompt, system=_SYSTEM_PROMPT)
+        testcases = _validate_testcases(raw["testcases"])
+        summary = raw.get("summary", "")
+    return {
+        "requirement_ref": state["requirement_ref"],
+        "project_id": state.get("project_id"),
+        "version": state["version"] + 1,
+        "testcases": testcases,
+        "summary": summary,
+    }
+
+
+def finalize_and_save(state, approved_by):
+    return db.save_testcases(
+        state["requirement_ref"], state["testcases"], approved_by,
+        project_id=state.get("project_id"),
+    )
+
+
 def _selftest():
     prd = {"ref": "REQ-1", "acs": [{"ref": "AC-1", "desc": "x"}, {"ref": "AC-2", "desc": "y"}]}
     existing = [{"ac_refs": ["AC-1"]}]
