@@ -116,6 +116,12 @@ def collect_docs():
             }
             if base == "kb":
                 metadata.update(infer_kb_metadata(f))
+            else:
+                # skills/ docs are role-agnostic, project-agnostic knowledge —
+                # mark them scope="global" so rag.search(..., project_id=X,
+                # include_global=True) can still find them (its $or clause
+                # requires either a matching project_id or scope="global").
+                metadata["scope"] = "global"
 
             docs.append((doc_id, text, metadata))
     return docs

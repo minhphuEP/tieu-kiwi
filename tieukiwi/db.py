@@ -1,7 +1,59 @@
+import re
 import psycopg
 from contextlib import contextmanager
 
 from .config import DATABASE_URL
+
+_DATATABLE_COL_RE = re.compile(r"^datacol_?\d+$", re.IGNORECASE)
+
+
+def is_datatable_testcase(props):
+    """Infer whether a TestCase's props represent a data-driven table testcase.
+
+    LLM-generated testcases (tieukiwi/testcase_gen.py) carry `data_variants`;
+    Excel-ingested testcases (scripts/ingest/testcases.py) instead carry
+    `raw_rows` with DataCol_N columns copied verbatim from the source sheet.
+    Neither schema implies the other, so both must be checked.
+    """
+    if props.get("data_variants"):
+        return True
+    for row in props.get("raw_rows") or []:
+        if isinstance(row, dict) and any(
+            isinstance(k, str) and _DATATABLE_COL_RE.match(k.strip()) for k in row
+        ):
+            return True
+    return False
+
+
+_RENAME_HINT_MARKER = "← not used"
+
+
+def _raw_rows_to_data_variants(raw_rows):
+    """Recover data_variants from Excel-ingested `raw_rows`.
+
+    Per kb/_global/QE/templates/testcase_template.md, a data-driven sheet's
+    Section C is: a `DATA TABLE` separator, a `← not used` rename-hint row,
+    then one data row per variant with Description + DataCol_N + Expected
+    columns filled (Title/Priority/Pre-condition/Step_Description blank).
+    scripts/ingest/testcases.py preserves all of this verbatim into `raw_rows`
+    but never converts it to the `data_variants` shape testcase_gen.py and
+    testcase_export.py expect — without this, an ingested DataTable testcase's
+    real values never reach the LLM (or a re-export), leaving it looking
+    like an empty table.
+    """
+    variants = []
+    for row in raw_rows or []:
+        if not isinstance(row, dict):
+            continue
+        if any(v == _RENAME_HINT_MARKER for v in row.values()):
+            continue  # the rename-hint row itself, not a data variant
+        if not any(isinstance(k, str) and _DATATABLE_COL_RE.match(k.strip()) for k in row):
+            continue  # a plain step row, no DataCol_* columns
+        variants.append({
+            "label": row.get("Description", ""),
+            "values": {k: v for k, v in row.items() if k != "Description"},
+        })
+    return variants
 
 @contextmanager
 def conn():
@@ -871,3 +923,164 @@ def classify_bug(bug_ref, project_id=None):
             "related_testcases": tc_refs,
             "related_testruns": run_refs,
         }
+
+
+def requirement_with_acs(ref, project_id=None):
+    """Return the Requirement's PRD content plus its AcceptanceCriteria.
+
+    Args:
+      ref: Requirement ref (e.g. 'CDM-268').
+      project_id: if given, requirement must belong to that project.
+
+    Returns:
+      {"ref": ref, "found": True, "title": str|None, "detail": str|None,
+       "acs": [{"ref": str, "desc": str}]}
+      or {"ref": ref, "found": False} if no such Requirement exists.
+    """
+    sql = "SELECT id, props_json FROM nodes WHERE type='Requirement' AND ref=%s"
+    params = [ref]
+    if project_id is not None:
+        sql += " AND project_id=%s"
+        params.append(project_id)
+    with conn() as c:
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            return {"ref": ref, "found": False}
+        req_id, props = row
+        props = props or {}
+        acs = c.execute(
+            """
+            SELECT ac.ref, ac.props_json->>'desc' FROM nodes ac
+            JOIN edges h ON h.dst_id=ac.id AND h.rel='has'
+            WHERE h.src_id=%s AND ac.type='AcceptanceCriterion'
+            ORDER BY ac.ref
+            """,
+            (req_id,),
+        ).fetchall()
+    return {
+        "ref": ref,
+        "found": True,
+        "title": props.get("title"),
+        "detail": props.get("detail"),
+        "acs": [{"ref": ac_ref, "desc": desc} for ac_ref, desc in acs],
+    }
+
+
+def testcases_for_requirement(ref, project_id=None):
+    """Return existing TestCase nodes covering any AC of this Requirement.
+
+    Dedup by TestCase ref (a TC can cover multiple AC of the same requirement).
+    Each item includes `ac_refs`: every AC of this requirement that this
+    TestCase covers. Returns [] if the requirement doesn't exist or has no
+    covered ACs yet.
+    """
+    sql = "SELECT id FROM nodes WHERE type='Requirement' AND ref=%s"
+    params = [ref]
+    if project_id is not None:
+        sql += " AND project_id=%s"
+        params.append(project_id)
+    with conn() as c:
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            return []
+        req_id = row[0]
+        rows = c.execute(
+            """
+            SELECT tc.ref, tc.props_json, ac.ref FROM nodes tc
+            JOIN edges cov ON cov.dst_id=tc.id AND cov.rel='coveredBy'
+            JOIN nodes ac ON ac.id=cov.src_id AND ac.type='AcceptanceCriterion'
+            JOIN edges h ON h.dst_id=ac.id AND h.rel='has'
+            WHERE h.src_id=%s AND tc.type='TestCase'
+            ORDER BY tc.ref
+            """,
+            (req_id,),
+        ).fetchall()
+    by_ref = {}
+    for tc_ref, props, ac_ref in rows:
+        props = props or {}
+        if tc_ref not in by_ref:
+            data_variants = props.get("data_variants") or _raw_rows_to_data_variants(props.get("raw_rows"))
+            # Legacy/ingested testcases saved before the `type` field existed
+            # have no explicit type; infer it rather than defaulting
+            # everything to "Normal".
+            inferred_type = props.get("type") or ("DataTable" if is_datatable_testcase(props) else "Normal")
+            by_ref[tc_ref] = {
+                "ref": tc_ref,
+                "title": props.get("title"),
+                "type": inferred_type,
+                "priority": props.get("priority"),
+                "precondition": props.get("precondition"),
+                "steps": props.get("steps") or [],
+                "data_variants": data_variants,
+                "api": props.get("api") or {},
+                "ac_refs": [],
+            }
+        by_ref[tc_ref]["ac_refs"].append(ac_ref)
+    return list(by_ref.values())
+
+
+def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
+    """Upsert draft-schema testcases (tieukiwi/testcase_gen.py) as verified
+    TestCase nodes, and ensure a coveredBy edge from each of their ac_refs.
+
+    Args:
+      requirement_ref: the Requirement these testcases belong to (context only;
+                        edges are created from each testcase's own ac_refs).
+      testcases: list of draft-schema dicts.
+      approved_by: identifier (Slack user id) of the human approver.
+      project_id: scope for resolving ac_refs to node ids and for the upsert
+                  key (project_id, ref).
+
+    Returns:
+      list of TestCase node ids, in the same order as `testcases`.
+    """
+    node_ids = []
+    with conn() as c:
+        for tc in testcases:
+            props = {
+                "title": tc["title"],
+                "type": tc.get("type") or ("DataTable" if is_datatable_testcase(tc) else "Normal"),
+                "priority": tc["priority"],
+                "precondition": tc.get("precondition", ""),
+                "steps": tc["steps"],
+                "api": tc.get("api") or {},
+                "data_variants": tc.get("data_variants") or [],
+                "_meta": {
+                    "extraction_source": "llm:gen_testcase",
+                    "confidence": 0.9,
+                    "review_status": "verified",
+                    "approved_by": approved_by,
+                },
+            }
+            row = c.execute(
+                """
+                INSERT INTO nodes (type, ref, project_id, props_json)
+                VALUES ('TestCase', %s, %s, %s)
+                ON CONFLICT (project_id, ref) WHERE ref IS NOT NULL DO UPDATE
+                  SET props_json = nodes.props_json || EXCLUDED.props_json
+                RETURNING id
+                """,
+                (tc["ref"], project_id, psycopg.types.json.Json(props)),
+            ).fetchone()
+            tc_id = row[0]
+            node_ids.append(tc_id)
+            for ac_ref in tc.get("ac_refs", []):
+                ac_sql = "SELECT id FROM nodes WHERE type='AcceptanceCriterion' AND ref=%s"
+                ac_params = [ac_ref]
+                if project_id is not None:
+                    ac_sql += " AND project_id=%s"
+                    ac_params.append(project_id)
+                ac_row = c.execute(ac_sql, ac_params).fetchone()
+                if not ac_row:
+                    continue
+                ac_id = ac_row[0]
+                exists = c.execute(
+                    "SELECT id FROM edges WHERE src_id=%s AND rel='coveredBy' AND dst_id=%s",
+                    (ac_id, tc_id),
+                ).fetchone()
+                if not exists:
+                    c.execute(
+                        "INSERT INTO edges(src_id, rel, dst_id, props_json) VALUES (%s,'coveredBy',%s,%s)",
+                        (ac_id, tc_id, psycopg.types.json.Json({})),
+                    )
+    return node_ids

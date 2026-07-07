@@ -224,6 +224,7 @@ def ingest(file_path, project_id, sprint_ref=None, only_sheet=None):
 
             props = {
                 "title": tc["title"],
+                "type": "DataTable" if db.is_datatable_testcase(tc) else "Normal",
                 "priority": tc["priority"],
                 "preconditions": tc["preconditions"],
                 "steps": tc["steps"],
