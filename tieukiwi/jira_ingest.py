@@ -22,6 +22,7 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
+from urllib.parse import unquote
 
 import httpx
 
@@ -399,24 +400,25 @@ Rules:
 - Return valid JSON. No prose outside the object.
 """
 
-_MAX_AC_INPUT_CHARS = 12000  # cap prompt so a huge PRD doesn't blow the LLM window
+_MAX_AC_INPUT_CHARS = 60000  # cap prompt so a huge PRD doesn't blow the LLM window
 
 
 def _slice_section(body_text, section_anchor):
-    """Best-effort: return only the text starting at the section that matches
-    section_anchor, ending at the next heading of same-or-higher level.
+    """Best-effort: return only the text of the section matching section_anchor.
 
-    section_anchor is a Confluence URL slug like "15.-Assign-new-creator-...".
-    Confluence slugifies headings by lowercasing + replacing whitespace with `-`
-    + stripping most punctuation. We reverse-match by de-slugging.
+    Returns (sliced_text, matched: bool). When matched=False, the anchor did
+    not resolve to any heading — sliced_text is the WHOLE body (caller may
+    warn and continue, or bail out).
+
+    section_anchor is a Confluence URL slug like "15.-Assign-new-creator..."
+    which is URL-encoded (`&` → `%26`, etc). We decode it before matching.
     """
     if not section_anchor or not body_text:
-        return body_text
-    # Turn "15.-Assign-new-creator-for-a-booking-script-phase-2--ready" into
-    # a fuzzy pattern that matches "15. Assign new creator ...".
-    slug_tokens = [t for t in section_anchor.replace("-", " ").split() if t]
+        return (body_text, True)
+    decoded_anchor = unquote(section_anchor)
+    slug_tokens = [t for t in decoded_anchor.replace("-", " ").split() if t]
     if not slug_tokens:
-        return body_text
+        return (body_text, True)
     # Look for a heading line that contains ALL slug tokens in order.
     lines = body_text.splitlines()
     start_idx = None
@@ -426,7 +428,6 @@ def _slice_section(body_text, section_anchor):
         if not m:
             continue
         heading_text = m.group(2).lower()
-        # Fuzzy: every slug token appears somewhere in the heading, in order.
         pos = 0
         ok = True
         for tok in slug_tokens:
@@ -440,41 +441,57 @@ def _slice_section(body_text, section_anchor):
             heading_level = len(m.group(1))
             break
     if start_idx is None:
-        return body_text  # fall back to whole doc
+        return (body_text, False)
     end_idx = len(lines)
     for j in range(start_idx + 1, len(lines)):
         m = re.match(r"^(#+)\s+", lines[j])
         if m and len(m.group(1)) <= heading_level:
             end_idx = j
             break
-    return "\n".join(lines[start_idx:end_idx])
+    return ("\n".join(lines[start_idx:end_idx]), True)
 
 
 def extract_acs_via_llm(brd_text, section_anchor=None):
-    """Ask the ingestion LLM (Anthropic or Ollama, per LLM_PROVIDER) to extract
-    ACs from a PRD section. Returns list[{desc: str}]. Empty list on any error —
-    caller decides whether to warn.
+    """Ask the ingestion LLM to extract ACs from a PRD section.
+
+    Returns (acs: list[str], warnings: list[str]). Warnings surface silent
+    failure modes (anchor miss, truncation, LLM error, empty output) so the
+    caller can flow them into summary["warnings"] instead of silently 0.
     """
     from .llm import complete_json  # lazy import: LLM providers pull deps
-    section_text = _slice_section(brd_text, section_anchor)
+    warnings = []
+    section_text, matched = _slice_section(brd_text, section_anchor)
+    if section_anchor and not matched:
+        warnings.append(
+            f"Section anchor '{section_anchor}' không match heading nào trong PRD; "
+            "extract từ toàn bộ doc (có thể miss/nhiễu). Check heading text trên Confluence."
+        )
     if len(section_text) > _MAX_AC_INPUT_CHARS:
+        warnings.append(
+            f"PRD section dài {len(section_text)} chars, truncate về {_MAX_AC_INPUT_CHARS} — "
+            "phần cuối bị cắt. Cân nhắc split section hoặc tăng _MAX_AC_INPUT_CHARS."
+        )
         section_text = section_text[:_MAX_AC_INPUT_CHARS] + "\n\n[...truncated for LLM window...]"
     if not section_text.strip():
-        return []
+        warnings.append("PRD section rỗng sau khi slice — không có gì để extract.")
+        return ([], warnings)
     try:
         data = complete_json(section_text, system=_AC_EXTRACT_SYSTEM,
                              max_tokens=2000, temperature=0.1)
-    except Exception:
-        return []
+    except Exception as e:
+        warnings.append(f"LLM extract AC fail: {e}")
+        return ([], warnings)
     acs = data.get("acceptance_criteria") or []
-    # Sanity filter: drop empty strings, cap length per AC
     out = []
-    for i, ac in enumerate(acs):
+    for ac in acs:
         desc = (ac.get("desc") if isinstance(ac, dict) else str(ac)) or ""
         desc = desc.strip()
         if desc:
             out.append(desc[:500])
-    return out
+    if not out:
+        warnings.append("LLM chạy xong nhưng trả về 0 AC — có thể section không có AC rõ ràng "
+                        "hoặc anchor match sai heading.")
+    return (out, warnings)
 
 
 # --- Orchestrator ---------------------------------------------------------
@@ -632,7 +649,8 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
                     # rag stored the full text as chunks; we don't have raw text.
                     # Re-derive by asking Chroma or refetch. Cheapest: refetch once.
                     _sub(f"LLM tách Acceptance Criteria từ BRD (page {page_id})…")
-                    ac_texts = _extract_acs_for_page(page_id, section_anchor)
+                    ac_texts, ac_warnings = _extract_acs_for_page(page_id, section_anchor)
+                    summary["warnings"].extend(ac_warnings)
                     diff = _diff_and_upsert_acs(
                         ac_texts,
                         req_node_id=req_node_id,
@@ -821,21 +839,23 @@ def _diff_and_upsert_acs(new_ac_texts, req_node_id, req_key, project_id, source_
 
 
 def _extract_acs_for_page(page_id, section_anchor):
-    """Helper: re-fetch page body (cheap, already cached by Confluence side or
-    we hit REST once more) and hand to LLM for AC extraction. Kept private
-    because it needs the raw body text which we don't persist in Postgres."""
+    """Helper: re-fetch page body and hand to LLM for AC extraction.
+
+    Returns (acs: list[str], warnings: list[str]). Propagates warnings from
+    extract_acs_via_llm plus surfaces fetch/parse failures.
+    """
     try:
         page = confluence._confluence_get(
             f"/api/v2/pages/{page_id}?body-format=atlas_doc_format"
         )
-    except (httpx.HTTPError, RuntimeError):
-        return []
+    except (httpx.HTTPError, RuntimeError) as e:
+        return ([], [f"Confluence fetch page {page_id} fail: {e}"])
     body_val = ((page.get("body") or {}).get("atlas_doc_format") or {}).get("value")
     if isinstance(body_val, str):
         try:
             body_adf = json.loads(body_val)
         except json.JSONDecodeError:
-            return []
+            return ([], [f"Confluence page {page_id}: ADF body không parse được."])
     else:
         body_adf = body_val
     body_text = adf.to_pretty_text(body_adf) if body_adf else ""
