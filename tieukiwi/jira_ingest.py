@@ -633,21 +633,16 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
                     # Re-derive by asking Chroma or refetch. Cheapest: refetch once.
                     _sub(f"LLM tách Acceptance Criteria từ BRD (page {page_id})…")
                     ac_texts = _extract_acs_for_page(page_id, section_anchor)
-                    for i, ac_desc in enumerate(ac_texts, start=1):
-                        ac_ref = f"AC-{req_key}-{i}"
-                        ac_node_id = db.upsert_node_by_ref(
-                            "AcceptanceCriterion", ac_ref, {
-                                "desc": ac_desc,
-                                "_meta": {
-                                    "extraction_source": "llm",
-                                    "confidence": 0.75,
-                                    "source_file": cf_result.get("url"),
-                                    "review_status": "draft",
-                                },
-                            }, project_id=project_id,
-                        )
-                        db.ensure_edge(req_node_id, "has", ac_node_id)
-                        summary["acs_extracted"].append({"ref": ac_ref, "desc": ac_desc[:80]})
+                    diff = _diff_and_upsert_acs(
+                        ac_texts,
+                        req_node_id=req_node_id,
+                        req_key=req_key,
+                        project_id=project_id,
+                        source_url=cf_result.get("url"),
+                    )
+                    summary["acs_extracted"].extend(diff["created"])
+                    summary["acs_kept"] = diff["kept_count"]
+                    summary["acs_obsoleted"] = diff["obsoleted"]
 
     # 6. Route subtasks — TestRun / bug container / skip.
     # Do TestRuns first (need self-test TR id to link find_by=Testcase bugs).
@@ -728,6 +723,101 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
 
     summary["status"] = "ok"
     return summary
+
+
+def _ac_content_hash(desc):
+    """Stable 8-hex hash of an AC description, used to build hash-based refs
+    and diff old/new AC sets across BRD updates.
+
+    Normalises whitespace but keeps case + punctuation — minor rewording in
+    the PRD ("Reviewer" → "Reviewers") will produce a NEW hash and create a
+    new AC node. That's intentional: the old AC gets marked obsolete rather
+    than silently mutated, preserving Bug -violates- history.
+    """
+    normalised = " ".join((desc or "").split())
+    return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:8]
+
+
+def _diff_and_upsert_acs(new_ac_texts, req_node_id, req_key, project_id, source_url):
+    """Reconcile freshly-extracted ACs with what's already in the graph.
+
+    For each new AC:
+      - Compute hash-based ref: AC-<req_key>-<hash8>. Same desc → same ref
+        → idempotent upsert (no dupes on re-fetch).
+      - If a node with this ref already exists → keep as-is (skip re-upsert
+        to preserve any human edits like review_status='verified').
+      - Else create fresh with _meta.review_status='draft'.
+    For each existing AC of this requirement NOT in the new set:
+      - Mark _meta.review_status='obsolete' + _meta.obsoleted_at.
+      - Do NOT delete — Bug -violates- edges pointing at it should remain
+        so classify_bug's leaked_* categories keep giving history.
+
+    Returns {"created": [{ref, desc}], "kept_count": N, "obsoleted": [refs]}.
+    """
+    with db.conn() as c:
+        # Existing ACs for this Requirement (via `has` edge).
+        sql = (
+            "SELECT ac.id, ac.ref, ac.props_json FROM edges h "
+            "JOIN nodes ac ON ac.id = h.dst_id AND ac.type='AcceptanceCriterion' "
+            "WHERE h.src_id=%s AND h.rel='has'"
+        )
+        params = [req_node_id]
+        if project_id is not None:
+            sql += " AND ac.project_id=%s"
+            params.append(project_id)
+        rows = c.execute(sql, params).fetchall()
+
+    # Map ref → props for quick lookup + delete tracking.
+    existing_by_ref = {r[1]: (r[0], r[2] or {}) for r in rows}
+    seen_refs = set()
+    created = []
+
+    for desc in new_ac_texts:
+        h = _ac_content_hash(desc)
+        ref = f"AC-{req_key}-{h}"
+        seen_refs.add(ref)
+        if ref in existing_by_ref:
+            # Already there — leave existing props (including any human edits).
+            continue
+        ac_node_id = db.upsert_node_by_ref(
+            "AcceptanceCriterion", ref, {
+                "desc": desc,
+                "_meta": {
+                    "extraction_source": "llm",
+                    "confidence": 0.75,
+                    "source_file": source_url,
+                    "review_status": "draft",
+                    "ingested_at": _now_iso(),
+                },
+            }, project_id=project_id,
+        )
+        db.ensure_edge(req_node_id, "has", ac_node_id)
+        created.append({"ref": ref, "desc": desc[:80]})
+
+    # Anything left in existing_by_ref that we didn't see → obsolete.
+    obsoleted = []
+    for ref, (node_id, props) in existing_by_ref.items():
+        if ref in seen_refs:
+            continue
+        meta = props.get("_meta") or {}
+        # Skip if already obsoleted (avoids clobbering obsoleted_at).
+        if meta.get("review_status") == "obsolete":
+            continue
+        # Fetch → mutate → upsert, so we preserve other _meta fields (confidence,
+        # source_file, extraction_source) instead of blowing them away.
+        meta["review_status"] = "obsolete"
+        meta["obsoleted_at"] = _now_iso()
+        new_props = {**props, "_meta": meta}
+        db.upsert_node_by_ref(
+            "AcceptanceCriterion", ref, new_props, project_id=project_id,
+        )
+        obsoleted.append(ref)
+
+    return {
+        "created": created,
+        "kept_count": len(existing_by_ref) - len(obsoleted),
+        "obsoleted": obsoleted,
+    }
 
 
 def _extract_acs_for_page(page_id, section_anchor):
