@@ -349,6 +349,7 @@ def run_tool(name, args, context=None):
     """
     ctx = context or {}
     project_id = ctx.get("project_id")
+    on_step = ctx.get("on_step")
 
     if name == "search_kb":
         # `role` is an opt-in filter set by the LLM via args, NOT auto-injected
@@ -386,6 +387,7 @@ def run_tool(name, args, context=None):
             args["issue_key"],
             project_id=project_id,
             extract_acs=args.get("extract_acs", True),
+            on_step=on_step,
         )
     if name == "fetch_confluence":
         from . import confluence

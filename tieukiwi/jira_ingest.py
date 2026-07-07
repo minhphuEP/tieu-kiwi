@@ -408,7 +408,7 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
 
 # --- Orchestrator ---------------------------------------------------------
 
-def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
+def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
     """Fetch a Jira ticket + its subtasks + every Confluence page it references,
     materialise everything in the graph and Chroma. Idempotent.
 
@@ -416,11 +416,22 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
       issue_key:   Jira key of the top-level Story (or Epic).
       project_id:  multi-tenant scope. All nodes upserted under this project.
       extract_acs: run LLM to pull ACs from BRD section. Default True.
+      on_step:     optional progress callback (see tieukiwi.progress). Called
+                   with sub-step events during the 6-stage pipeline.
 
     Returns:
       summary dict listing what was upserted / fetched / created.
     """
     from . import llm  # noqa
+
+    def _sub(detail):
+        if on_step is None:
+            return
+        try:
+            on_step({"phase": "sub", "name": "ingest_jira_ticket", "detail": detail})
+        except Exception:
+            pass
+
     summary = {
         "tool": "ingest_jira_ticket",
         "issue_key": issue_key,
@@ -435,6 +446,7 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
     }
 
     # 1. Fetch main issue
+    _sub(f"Fetch Jira issue {issue_key}…")
     try:
         issue = fetch_jira_issue(issue_key)
     except (httpx.HTTPError, RuntimeError) as e:
@@ -452,6 +464,7 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
         parent_type = ((parent.get("fields") or {}).get("issuetype") or {}).get("name", "").lower()
         if parent_type == "epic":
             # We don't have full parent fields — fetch it for proper metadata.
+            _sub(f"Fetch parent Epic {parent_key}…")
             try:
                 parent_issue = fetch_jira_issue(parent_key)
                 _, epic_node_id, _ = _upsert_epic_or_story(parent_issue, project_id)
@@ -460,6 +473,7 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
                 summary["warnings"].append(f"Failed to fetch parent Epic {parent_key}: {e}")
 
     # 3. Upsert main Story / Requirement
+    _sub(f"Upsert Story/Requirement {issue_key} vào graph…")
     node_type, req_node_id, req_key = _upsert_epic_or_story(issue, project_id)
     if node_type is None:
         summary["status"] = "error"
@@ -480,7 +494,10 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
         if parsed:
             confluence_targets.append((parsed["page_id"], parsed["section_anchor"], url))
 
+    if confluence_targets:
+        _sub(f"Tải {len(confluence_targets)} Confluence page từ description…")
     for page_id, section_anchor, orig_url in confluence_targets:
+        _sub(f"Fetch Confluence page {page_id}…")
         cf_result = confluence.fetch_confluence(
             page_id, project_id=project_id, section_anchor=section_anchor,
         )
@@ -504,6 +521,7 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
                 if brd_node:
                     # rag stored the full text as chunks; we don't have raw text.
                     # Re-derive by asking Chroma or refetch. Cheapest: refetch once.
+                    _sub(f"LLM tách Acceptance Criteria từ BRD (page {page_id})…")
                     ac_texts = _extract_acs_for_page(page_id, section_anchor)
                     for i, ac_desc in enumerate(ac_texts, start=1):
                         ac_ref = f"AC-{req_key}-{i}"
@@ -524,6 +542,8 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
     # 6. Route subtasks — TestRun / bug container / skip.
     # Do TestRuns first (need self-test TR id to link find_by=Testcase bugs).
     subtask_stubs = fields.get("subtasks") or []
+    if subtask_stubs:
+        _sub(f"Phân loại {len(subtask_stubs)} subtask (TestRun / Bug table)…")
     testrun_by_env = {}
     bug_container_stubs = []
     for st in subtask_stubs:
@@ -542,6 +562,7 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True):
     # Now Bug containers — use self-test TR (if present) to link find_by=Testcase.
     self_test_tr_id = testrun_by_env.get("self")
     for st_key, st_summary in bug_container_stubs:
+        _sub(f"Parse bảng bug trong subtask {st_key}…")
         try:
             subtask_full = fetch_jira_issue(st_key)
         except (httpx.HTTPError, RuntimeError) as e:

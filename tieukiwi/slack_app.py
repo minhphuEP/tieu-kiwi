@@ -13,8 +13,9 @@ ANTHROPIC_API_KEY for the agent). Importing this module does NOT require the tok
 
 import json
 import re
+import time
 
-from . import agent, config, db, memory, routing, slack_format, testcase_export, testcase_gen
+from . import agent, config, db, memory, progress, routing, slack_format, testcase_export, testcase_gen
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
@@ -201,17 +202,48 @@ def _strip_mention(text):
     return _MENTION_RE.sub("", text or "")
 
 
-def handle_question(text, logger=None):
+def handle_question(text, logger=None, on_step=None):
     # Shared logic for both entry points: run the Layer A agent and return a
     # Slack-friendly answer string. Never raises — a failure comes back as an error message.
     # The agent returns GitHub Markdown; convert it to the canonical Slack format.
+    # `on_step` (optional) is forwarded to the agent for live-progress display.
     try:
-        answer = agent.ask(text)
+        answer = agent.ask(text, on_step=on_step)
     except Exception as e:
         if logger is not None:
             logger.exception("agent.ask failed")
         return slack_format.to_slack(f":warning: Error: {e}")
     return slack_format.to_slack(answer)
+
+
+def _make_progress_callback(client, channel_id, progress_ts, logger=None,
+                            min_interval=0.8):
+    # Return an on_step callback that updates the given "Processing…" message
+    # in-place via chat_update. `tool_done` events are swallowed (avoid flicker
+    # between tool finish and next thinking event). Throttled to `min_interval`
+    # seconds so a burst of tool calls doesn't hit Slack rate limits.
+    if not progress_ts or not channel_id:
+        return None
+    last = [0.0]
+
+    def _cb(ev):
+        if (ev or {}).get("phase") == "tool_done":
+            return
+        now = time.monotonic()
+        if now - last[0] < min_interval:
+            return
+        last[0] = now
+        label = progress.label_for(ev)
+        try:
+            client.chat_update(
+                channel=channel_id, ts=progress_ts,
+                text=slack_format.to_slack(label),
+            )
+        except Exception:
+            if logger is not None:
+                logger.exception("progress chat_update failed")
+
+    return _cb
 
 
 # ---------------------------------------------------------------- Layer C curator UI
@@ -875,9 +907,12 @@ def build_app():
                                   event.get("user"), logger)
             return
 
-        # Interim ack in-thread so users see progress, then the final answer.
+        # Interim ack in-thread — keep its ts so we can chat_update in place
+        # with live progress labels, then swap for the final answer.
+        progress_ts = None
         try:
-            say(text=slack_format.to_slack("Processing…"), thread_ts=thread_ts)
+            resp = say(text=slack_format.to_slack("🥝 Đang xử lý…"), thread_ts=thread_ts)
+            progress_ts = (resp or {}).get("ts")
         except Exception:
             logger.exception("interim post failed")
 
@@ -906,8 +941,24 @@ def build_app():
             _do_gen_testcase(say, tc_ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
             return
 
-        answer = handle_question(question, logger)
-        say(blocks=_mrkdwn_blocks(answer), text=answer, thread_ts=thread_ts)
+        on_step = _make_progress_callback(client, channel_id, progress_ts, logger)
+        answer = handle_question(question, logger, on_step=on_step)
+
+        # Replace the "Processing…" message with the final answer in-place
+        # (single tidy message per question). Fall back to a new post if the
+        # update fails so the user always gets a reply.
+        posted = False
+        if progress_ts:
+            try:
+                client.chat_update(
+                    channel=channel_id, ts=progress_ts,
+                    blocks=_mrkdwn_blocks(answer), text=answer,
+                )
+                posted = True
+            except Exception:
+                logger.exception("final chat_update failed")
+        if not posted:
+            say(blocks=_mrkdwn_blocks(answer), text=answer, thread_ts=thread_ts)
 
     return app
 
