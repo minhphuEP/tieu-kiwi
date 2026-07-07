@@ -29,13 +29,13 @@ Hand-authored (not from Jira/Confluence — placeholder content for demo):
       (AC-1 duplicate, AC-2 assign, AC-3 DRAFT status, AC-4 archive-block)
     2 TestCases (1 lead_approved, 1 qe_reviewed) — demo review-state fixtures
     1 Component `reviewer-portal`
-    4 users for project CDM_TEAM (real display names from Jira reporter/assignee;
+    4 users for project CDM (real display names from Jira reporter/assignee;
       slack_ids are placeholders — replace before wiring the Slack layer.)
 
 Expected agent-tool output after seed:
 
     trace('CDM-268')             → full Requirement → AC → TC → TestRun → Bug path
-    coverage_gap(CDM_TEAM)       → [AC-CDM-268-3, AC-CDM-268-4] (uncovered)
+    coverage_gap(CDM)       → [AC-CDM-268-3, AC-CDM-268-4] (uncovered)
     classify_bug('CDM-286-1..3') → caught_by_test  (find_by=Testcase, found by TR CDM-270)
     classify_bug('CDM-286-4')    → leaked_tc_missing  (find_by=Lack, violates uncovered AC-4)
     classify_bug('CDM-286-5')    → caught_by_test
@@ -60,7 +60,7 @@ import psycopg
 from tieukiwi import db
 
 
-PROJECT = "CDM_TEAM"
+PROJECT = "CDM"
 BRD_REF = "CFL-2541551769"
 BRD_ANCHOR = "15.-Assign-new-creator-for-a-booking-script-phase-2--ready"
 BRD_URL = (
@@ -148,7 +148,7 @@ def seed():
     with db.conn() as c:
         cur = c.cursor()
 
-        # ---- Users (routing target for CDM_TEAM) -----------------------
+        # ---- Users (routing target for CDM) -----------------------
         # Real names from Jira; slack_ids are placeholders. Replace with real
         # slack_ids before wiring the Slack layer (Layer B).
         _upsert_user(cur, "U_CDM_PO_OANH",   "Oanh Kieu Thi Nguyen (PO)",
@@ -397,7 +397,7 @@ def main():
     seed()
     _print_check()
 
-    print("\n--- coverage_gap(CDM_TEAM) ---")
+    print("\n--- coverage_gap(CDM) ---")
     print(db.coverage_gap(project_id=PROJECT))
 
     print("\n--- classify_bug for the 5 bugs in CDM-286 table ---")

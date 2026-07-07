@@ -37,7 +37,7 @@ from tieukiwi import db
 from scripts.ingest.testcases import ingest as ingest_testcases
 
 
-PROJECT = "CDM_TEAM"
+PROJECT = "CDM"
 
 EXCEL_RELPATH = _P("kb/CDM/QE/CDM Duplicate-Assign - Test Suite 2026-06-30 (1)_import.xlsx")
 

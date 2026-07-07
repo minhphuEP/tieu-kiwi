@@ -507,6 +507,243 @@ def coverage_gap(project_id=None):
         return _uncovered_acs(c, project_id=project_id)
 
 
+import re as _re
+
+_JIRA_KEY_RE = _re.compile(r"^([A-Z][A-Z0-9]*)-\d+")
+
+
+def project_from_ref(ref):
+    """Derive project_id from a Jira-style ref: 'CDM-199' -> 'CDM'.
+
+    Convention (docs/GRAPH_INSERT_GUIDE.md): project_id equals the prefix before
+    the first '-' in a ref. Also matches nested refs like 'CDM-302-1' (Bug).
+    Returns None if the ref doesn't match a Jira key pattern.
+    """
+    if not ref:
+        return None
+    m = _JIRA_KEY_RE.match(ref)
+    return m.group(1) if m else None
+
+
+def _fetch_node_polymorphic(c, ref, project_id=None):
+    """Find a node by ref with a TR-<ref> fallback (migration 007 convention).
+
+    Slack users type 'CDM-263' but TestRun refs are stored as 'TR-CDM-263'.
+    """
+    def _one(target_ref):
+        sql = "SELECT id, type, ref, project_id, props_json FROM nodes WHERE ref=%s"
+        params = [target_ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"
+            params.append(project_id)
+        sql += " ORDER BY id LIMIT 1"
+        return c.execute(sql, params).fetchone()
+
+    row = _one(ref)
+    if not row and _JIRA_KEY_RE.match(ref or "") and not ref.startswith("TR-"):
+        row = _one(f"TR-{ref}")
+    return row
+
+
+def _view_requirement(c, node_id, ref, props):
+    """Return AC list (with coverage), linked BRDs, parent story, warnings."""
+    us = c.execute(
+        "SELECT n.ref, n.props_json FROM nodes n "
+        "JOIN edges e ON e.src_id=n.id AND e.rel='has' "
+        "WHERE e.dst_id=%s AND n.type='UserStory' LIMIT 1",
+        (node_id,),
+    ).fetchone()
+    user_story = {"ref": us[0], "title": (us[1] or {}).get("title")} if us else None
+
+    brds = [
+        {
+            "ref": r[0], "title": (r[1] or {}).get("title"),
+            "url": (r[1] or {}).get("url") or (r[1] or {}).get("_meta", {}).get("source_file"),
+            "section_anchor": (r[1] or {}).get("section_anchor"),
+            "content_preview": (r[1] or {}).get("content_preview"),
+        }
+        for r in c.execute(
+            "SELECT n.ref, n.props_json FROM nodes n "
+            "JOIN edges e ON e.dst_id=n.id AND e.rel='derivedFrom' "
+            "WHERE e.src_id=%s AND n.type='BRD' ORDER BY n.ref",
+            (node_id,),
+        ).fetchall()
+    ]
+
+    acs = []
+    for ac_id, ac_ref, ac_props in c.execute(
+        "SELECT ac.id, ac.ref, ac.props_json FROM nodes ac "
+        "JOIN edges e ON e.dst_id=ac.id AND e.rel='has' "
+        "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion' ORDER BY ac.ref",
+        (node_id,),
+    ).fetchall():
+        tc_refs = [r[0] for r in c.execute(
+            "SELECT tc.ref FROM nodes tc "
+            "JOIN edges cov ON cov.dst_id=tc.id AND cov.rel='coveredBy' "
+            "WHERE cov.src_id=%s AND tc.type='TestCase' ORDER BY tc.ref",
+            (ac_id,),
+        ).fetchall()]
+        p = ac_props or {}
+        acs.append({
+            "ref": ac_ref, "title": p.get("title"),
+            "detail": p.get("detail") or p.get("desc"),
+            "coverage": {"has_testcase": bool(tc_refs), "testcase_refs": tc_refs},
+        })
+
+    warnings = []
+    if not acs:
+        warnings.append(
+            "0 acceptance criteria trong graph. PRD chưa được extract thành AC — "
+            "gọi ingest_jira_ticket với extract_acs=True. TUYỆT ĐỐI KHÔNG bịa AC."
+        )
+    else:
+        uncovered = [a["ref"] for a in acs if not a["coverage"]["has_testcase"]]
+        if uncovered:
+            warnings.append(
+                f"{len(uncovered)}/{len(acs)} AC chưa có TestCase: {', '.join(uncovered)}. "
+                "Attach TC lên Jira task hoặc chạy gen_testcase."
+            )
+    if not brds:
+        warnings.append("Không có BRD/PRD link. Nếu Jira desc có Confluence URL, gọi ingest_jira_ticket.")
+
+    return {
+        "ref": ref, "type": "Requirement", "found": True, "props": props,
+        "user_story": user_story, "brds": brds,
+        "acceptance_criteria": acs, "warnings": warnings,
+    }
+
+
+def _view_bug(c, node_id, ref, props):
+    """Return severity, affected components, violated ACs, and which TestRun found it."""
+    affects = [r[0] for r in c.execute(
+        "SELECT n.ref FROM nodes n JOIN edges e ON e.dst_id=n.id "
+        "WHERE e.src_id=%s AND e.rel='affects' AND n.type='Component'",
+        (node_id,),
+    ).fetchall()]
+    violates = [r[0] for r in c.execute(
+        "SELECT n.ref FROM nodes n JOIN edges e ON e.dst_id=n.id "
+        "WHERE e.src_id=%s AND e.rel='violates' AND n.type='AcceptanceCriterion'",
+        (node_id,),
+    ).fetchall()]
+    found_by = [r[0] for r in c.execute(
+        "SELECT n.ref FROM nodes n JOIN edges e ON e.src_id=n.id "
+        "WHERE e.dst_id=%s AND e.rel='finds' AND n.type='TestRun'",
+        (node_id,),
+    ).fetchall()]
+    warnings = []
+    if not violates:
+        warnings.append("Bug này chưa link tới AC nào (edge `violates`). Traceability thiếu.")
+    if not found_by:
+        warnings.append("Bug chưa link tới TestRun (edge `finds`) — có thể leaked to production.")
+    return {
+        "ref": ref, "type": "Bug", "found": True, "props": props,
+        "affects_components": affects, "violates_acs": violates,
+        "found_by_testruns": found_by, "warnings": warnings,
+    }
+
+
+def _view_testrun(c, node_id, ref, props):
+    """Return linked TestCase (via executedBy) and bugs found."""
+    tc = c.execute(
+        "SELECT n.ref, n.props_json FROM nodes n JOIN edges e ON e.src_id=n.id "
+        "WHERE e.dst_id=%s AND e.rel='executedBy' AND n.type='TestCase' LIMIT 1",
+        (node_id,),
+    ).fetchone()
+    testcase = {"ref": tc[0], "title": (tc[1] or {}).get("title")} if tc else None
+    bugs = [
+        {"ref": r[0], "severity": (r[1] or {}).get("severity"), "status": (r[1] or {}).get("status")}
+        for r in c.execute(
+            "SELECT n.ref, n.props_json FROM nodes n JOIN edges e ON e.dst_id=n.id "
+            "WHERE e.src_id=%s AND e.rel='finds' AND n.type='Bug' ORDER BY n.ref",
+            (node_id,),
+        ).fetchall()
+    ]
+    warnings = []
+    if not testcase:
+        warnings.append("TestRun chưa link tới TestCase (edge `executedBy`). Đóng góp coverage = 0.")
+    return {
+        "ref": ref, "type": "TestRun", "found": True, "props": props,
+        "testcase": testcase, "bugs_found": bugs, "warnings": warnings,
+    }
+
+
+def _view_userstory_or_epic(c, node_id, ref, props):
+    """Epic/UserStory view: list linked Requirements."""
+    reqs = [
+        {"ref": r[0], "title": (r[1] or {}).get("title")}
+        for r in c.execute(
+            "SELECT n.ref, n.props_json FROM nodes n JOIN edges e ON e.dst_id=n.id "
+            "WHERE e.src_id=%s AND e.rel='has' AND n.type='Requirement' ORDER BY n.ref",
+            (node_id,),
+        ).fetchall()
+    ]
+    return {
+        "ref": ref, "type": "UserStory", "found": True, "props": props,
+        "requirements": reqs,
+        "warnings": [] if reqs else ["Epic/Story chưa có Requirement con nào."],
+    }
+
+
+def _view_brd(c, node_id, ref, props):
+    """BRD view: preview + downstream requirements."""
+    downstream = [r[0] for r in c.execute(
+        "SELECT n.ref FROM nodes n JOIN edges e ON e.src_id=n.id "
+        "WHERE e.dst_id=%s AND e.rel='derivedFrom' AND n.type='Requirement' ORDER BY n.ref",
+        (node_id,),
+    ).fetchall()]
+    return {
+        "ref": ref, "type": "BRD", "found": True, "props": props,
+        "downstream_requirements": downstream, "warnings": [],
+    }
+
+
+def get_ticket(ref, project_id=None):
+    """Polymorphic read: dispatch view by node.type. This is the READ entry point
+    the agent should call first when a user mentions a ticket key (`CDM-XXX`).
+
+    Smart lookup: falls back to `TR-<ref>` if the direct ref misses (matches the
+    convention from migration 007 for TestRun subtasks).
+
+    Returns `{ref, type, found, props, ...type-specific fields..., warnings}`.
+    When `warnings` is non-empty, the agent MUST echo each to the user — they
+    flag missing data / missing edges the user needs to know about.
+
+    See docs/GRAPH_INSERT_GUIDE.md for node type conventions.
+    """
+    with conn() as c:
+        row = _fetch_node_polymorphic(c, ref, project_id=project_id)
+        if not row:
+            return {
+                "ref": ref, "found": False,
+                "warnings": [
+                    f"Ticket {ref} không có trong graph"
+                    + (f" (project_id={project_id})" if project_id else "")
+                    + ". Gọi ingest_jira_ticket để pull từ Jira."
+                ],
+            }
+        node_id, n_type, node_ref, _, props = row
+        props = props or {}
+        # Legacy: some pipelines wrote `summary` instead of `title`. Surface both.
+        if n_type in ("Requirement", "UserStory") and not props.get("title") and props.get("summary"):
+            props = {**props, "title": props["summary"]}
+
+        if n_type == "Requirement":
+            return _view_requirement(c, node_id, node_ref, props)
+        if n_type == "UserStory":
+            return _view_userstory_or_epic(c, node_id, node_ref, props)
+        if n_type == "Bug":
+            return _view_bug(c, node_id, node_ref, props)
+        if n_type == "TestRun":
+            return _view_testrun(c, node_id, node_ref, props)
+        if n_type == "BRD":
+            return _view_brd(c, node_id, node_ref, props)
+        # Default fallback (TestCase, AC, Component, Sprint, Task, ...)
+        return {
+            "ref": node_ref, "type": n_type, "found": True, "props": props,
+            "warnings": [],
+        }
+
+
 def trace(requirement_ref, project_id=None):
     """Walk Requirement -> AC -> TestCase -> TestRun -> Bug for one requirement.
 

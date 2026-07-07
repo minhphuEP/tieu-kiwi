@@ -17,7 +17,7 @@ and `review_status=draft` — a human should mark it `verified` after review.
 
 Usage:
     python scripts/ingest/requirements.py path/to/file.<md|pdf|docx> \\
-        --project=CDM_TEAM \\
+        --project=CDM \\
         --sprint=SPR-26W7 \\
         --us=US-14 \\
         --us-title="Duplicate script"
@@ -205,7 +205,7 @@ def ingest(file_path, project_id, sprint_ref=None, us_ref=None, us_title=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("file", help="Path to requirement (.md|.markdown|.txt|.pdf|.docx|.doc)")
-    ap.add_argument("--project", required=True, help="project_id (e.g. CDM_TEAM)")
+    ap.add_argument("--project", required=True, help="project_id (Jira key prefix, e.g. CDM)")
     ap.add_argument("--sprint", default=None, help="Optional Sprint ref (auto-created)")
     ap.add_argument("--us", default=None, help="Optional UserStory ref (auto-created)")
     ap.add_argument("--us-title", default=None, help="UserStory title (used when --us is given)")

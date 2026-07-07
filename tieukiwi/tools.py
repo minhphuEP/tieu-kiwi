@@ -184,6 +184,26 @@ TOOLS = [
     "input_schema": {"type": "object", "properties": {}},
   },
   {
+    "name": "get_ticket",
+    "description": (
+        "READ-ONLY, POLYMORPHIC lookup for ANY Jira ticket ref (CDM-199, CDM-263, "
+        "CDM-286, CDM-286-1...). Dispatches by node type: Requirement returns "
+        "AC list + BRD + coverage; Bug returns severity + violates + finds; "
+        "TestRun returns TestCase + bugs found; UserStory/Epic returns children; "
+        "BRD returns preview + downstream requirements. Smart lookup: falls back "
+        "to `TR-<ref>` when the direct key misses (test-subtasks are stored with "
+        "the TR- prefix). ALWAYS call this FIRST when user asks about a ticket. "
+        "If found=False OR warnings mention missing data, then call "
+        "ingest_jira_ticket to pull from Jira. NEVER invent data not in the "
+        "returned payload — echo `warnings` verbatim to the user."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {"ref": {"type": "string"}},
+      "required": ["ref"],
+    },
+  },
+  {
     "name": "go_no_go",
     "description": (
         "Assess whether a requirement/feature is ready to go live in production; "
@@ -365,6 +385,8 @@ def run_tool(name, args, context=None):
         )
     if name == "coverage_gap":
         return db.coverage_gap(project_id=project_id)
+    if name == "get_ticket":
+        return db.get_ticket(args["ref"], project_id=project_id)
     if name == "go_no_go":
         return db.go_no_go(args["requirement_ref"], project_id=project_id)
     if name == "trace":

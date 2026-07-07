@@ -14,7 +14,7 @@ against a set of aliases. Extra columns are preserved verbatim into
 props_json.raw_steps for auditability.
 
 Usage:
-    python scripts/ingest/testcases.py path/to/file.xlsx --project=CDM_TEAM
+    python scripts/ingest/testcases.py path/to/file.xlsx --project=CDM
 
 Optional:
     --sprint=<ref>       auto-create Sprint node + `has` edge to each TestCase
@@ -250,7 +250,7 @@ def ingest(file_path, project_id, sprint_ref=None, only_sheet=None):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("file", help="Path to testcase export (.xlsx | .csv)")
-    ap.add_argument("--project", required=True, help="project_id (e.g. CDM_TEAM)")
+    ap.add_argument("--project", required=True, help="project_id (e.g. CDM)")
     ap.add_argument("--sprint", default=None, help="Sprint ref to attach these testcases to")
     ap.add_argument("--sheet", default=None, help="Only ingest this sheet")
     args = ap.parse_args()
