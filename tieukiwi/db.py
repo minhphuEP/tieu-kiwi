@@ -142,27 +142,105 @@ def resolve_role_slack_id(role, project_id=None):
         return row[0] if row else None
 
 
-def upsert_node_by_ref(type_, ref, props=None):
-    # Insert a node, or update its props if one with the same (type, ref) already exists.
-    # Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
+def upsert_node_by_ref(type_, ref, props=None, project_id=None, merge_props=False):
+    """Insert a node, or update its props if one with the same (type, ref) exists.
+
+    Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
+
+    Args:
+      type_:       node type (e.g. 'Requirement', 'BRD').
+      ref:         external ref (e.g. 'CDM-268').
+      props:       props dict; None/omitted → empty {}.
+      project_id:  scope the upsert to a project. Nodes with the same ref
+                   in a DIFFERENT project stay separate. Default None keeps
+                   old callers working (matches ANY project — legacy behaviour).
+      merge_props: True → merge new props into existing (jsonb ||), preserving
+                   unspecified keys. Default False → replace props wholesale
+                   (matches old behaviour).
+
+    Uses the partial unique index (project_id, ref) WHERE ref IS NOT NULL added
+    by migration 003 for ON CONFLICT-based idempotent upsert when project_id is
+    given; falls back to SELECT-then-INSERT/UPDATE for legacy project_id=None
+    calls.
+    """
     props = props or {}
     with conn() as c:
+        if project_id is None:
+            # Legacy path: no project scope → SELECT then INSERT/UPDATE
+            row = c.execute(
+                "SELECT id FROM nodes WHERE type=%s AND ref=%s ORDER BY id LIMIT 1",
+                (type_, ref),
+            ).fetchone()
+            if row:
+                node_id = row[0]
+                if merge_props:
+                    c.execute(
+                        "UPDATE nodes SET props_json = props_json || %s WHERE id=%s",
+                        (psycopg.types.json.Json(props), node_id),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE nodes SET props_json=%s WHERE id=%s",
+                        (psycopg.types.json.Json(props), node_id),
+                    )
+                return node_id
+            row = c.execute(
+                "INSERT INTO nodes(type, ref, props_json) VALUES (%s,%s,%s) RETURNING id",
+                (type_, ref, psycopg.types.json.Json(props)),
+            ).fetchone()
+            return row[0]
+
+        # Multi-tenant path: use ON CONFLICT with the (project_id, ref) unique index
+        conflict_expr = (
+            "props_json = nodes.props_json || EXCLUDED.props_json" if merge_props
+            else "props_json = EXCLUDED.props_json"
+        )
         row = c.execute(
-            "SELECT id FROM nodes WHERE type=%s AND ref=%s ORDER BY id LIMIT 1",
-            (type_, ref),
-        ).fetchone()
-        if row:
-            node_id = row[0]
-            c.execute(
-                "UPDATE nodes SET props_json=%s WHERE id=%s",
-                (psycopg.types.json.Json(props), node_id),
-            )
-            return node_id
-        row = c.execute(
-            "INSERT INTO nodes(type, ref, props_json) VALUES (%s,%s,%s) RETURNING id",
-            (type_, ref, psycopg.types.json.Json(props)),
+            f"""
+            INSERT INTO nodes (type, ref, project_id, props_json)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (project_id, ref) WHERE ref IS NOT NULL DO UPDATE
+              SET {conflict_expr}
+            RETURNING id
+            """,
+            (type_, ref, project_id, psycopg.types.json.Json(props)),
         ).fetchone()
         return row[0]
+
+
+def get_node_by_ref(type_, ref, project_id=None):
+    """Return {id, props_json} for the node, or None. Used to check existing
+    content_hash before re-embedding a Confluence page, etc."""
+    with conn() as c:
+        sql = "SELECT id, props_json FROM nodes WHERE type=%s AND ref=%s"
+        params = [type_, ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"
+            params.append(project_id)
+        row = c.execute(sql + " LIMIT 1", params).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "props_json": row[1] or {}}
+
+
+def ensure_edge(src_id, rel, dst_id, props=None):
+    """Idempotent edge insert (edges has no unique constraint; use WHERE NOT EXISTS).
+
+    Wraps the same pattern all ingest scripts use so runtime code doesn't
+    duplicate edges on re-fetch.
+    """
+    with conn() as c:
+        c.execute(
+            """
+            INSERT INTO edges (src_id, rel, dst_id, props_json)
+            SELECT %s, %s, %s, %s
+            WHERE NOT EXISTS (
+              SELECT 1 FROM edges WHERE src_id=%s AND rel=%s AND dst_id=%s
+            )
+            """,
+            (src_id, rel, dst_id, psycopg.types.json.Json(props or {}),
+             src_id, rel, dst_id),
+        )
 
 
 def get_node_props(ref, type_=None):
