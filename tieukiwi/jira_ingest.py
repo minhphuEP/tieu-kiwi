@@ -7,17 +7,80 @@ This is the orchestrator: fetch Jira → parse links → fetch Confluence → LL
 extract ACs → route subtasks (TestRun / Bug-table / skip). Idempotent: safe
 to re-run; nodes upsert by (project_id, ref), edges by (src, rel, dst).
 
+Freshness: content-based hash-gate (not TTL). See `_story_hash` and
+`_bug_table_hash`. On re-fetch, if the canonical hash on the stored
+Requirement matches the freshly-computed one, the whole pipeline short-
+circuits with status='cached_fresh' — no Confluence fetch, no LLM AC pass.
+Pass `force=True` (or user says "cập nhật"/"refresh") to bypass.
+
 Building blocks (also exported):
     fetch_jira_issue         GET one Jira REST issue + subtask summaries
     parse_bug_subtask_table  ADF description of [Bug] subtask → list[dict]
     route_subtask            classify a subtask → TestRun / bug-container / skip
 """
+import hashlib
 import json
 import re
+from datetime import datetime, timezone
 
 import httpx
 
 from . import adf, config, confluence, db
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+# --- Hash-gate helpers ---------------------------------------------------
+
+def _story_hash(fields):
+    """Canonical hash of the Story's DECISION-RELEVANT fields.
+
+    Includes subtask stubs (key/summary/status) so a subtask being added,
+    removed, or transitioning status invalidates the story cache. Does NOT
+    include subtask descriptions — those get their own hash via
+    `_bug_table_hash` (only fetched when the story hash is dirty, saving
+    N unnecessary REST calls).
+
+    Fields excluded on purpose to avoid churn:
+      - fields.updated (Jira touches this on last-viewed too, unreliable)
+      - custom fields, votes, watchers, comment count
+    """
+    subtasks_stub = fields.get("subtasks") or []
+    description_adf = fields.get("description")
+    canonical = {
+        "summary": fields.get("summary"),
+        "status": (fields.get("status") or {}).get("name"),
+        "assignee": (fields.get("assignee") or {}).get("displayName"),
+        "priority": (fields.get("priority") or {}).get("name"),
+        "description_text": adf.to_pretty_text(description_adf) if description_adf else "",
+        "confluence_urls": sorted(
+            adf.extract_urls(description_adf) if description_adf else []
+        ),
+        "subtasks": sorted([
+            {"key": st.get("key"),
+             "summary": (st.get("fields") or {}).get("summary"),
+             "status": ((st.get("fields") or {}).get("status") or {}).get("name")}
+            for st in subtasks_stub
+        ], key=lambda s: s["key"] or ""),
+    }
+    payload = json.dumps(canonical, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _bug_table_hash(description_adf):
+    """Hash the raw table rows in a [Bug] subtask description.
+
+    Catches the case where the parent story hash is unchanged (subtask
+    summary/status not touched) but a bug row was added/edited/removed
+    inside the table — story hash misses this by design (it doesn't fetch
+    each subtask's description).
+    """
+    tables = adf.extract_tables(description_adf) if description_adf else []
+    canonical = tables[0] if tables else []
+    payload = json.dumps(canonical, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 # --- HTTP -----------------------------------------------------------------
@@ -248,12 +311,20 @@ def _upsert_epic_or_story(issue, project_id):
         "assignee": (fields.get("assignee") or {}).get("displayName") or "Unassigned",
         "reporter": (fields.get("reporter") or {}).get("displayName"),
         "description": description_text,
+        # Hash-gate: canonical fingerprint of decision-relevant fields.
+        # Kept only on the STORY (Requirement) — Epic-level hash isn't used
+        # to short-circuit, and the Story hash already includes Epic parent
+        # transitively via jira_parent_ref lookup.
+        "story_hash": _story_hash(fields) if node_type == "Requirement" else None,
+        "jira_updated": fields.get("updated"),   # ISO-8601, cheap tie-breaker
+        "last_ingested_at": _now_iso(),
     }
     parent = fields.get("parent") or {}
     if parent.get("key"):
         props["jira_parent_ref"] = parent["key"]
 
-    node_id = db.upsert_node_by_ref(node_type, key, props, project_id=project_id)
+    node_id = db.upsert_node_by_ref(node_type, key, props,
+                                     project_id=project_id, merge_props=True)
     return (node_type, node_id, key)
 
 
@@ -408,7 +479,8 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
 
 # --- Orchestrator ---------------------------------------------------------
 
-def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
+def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
+                       force=False):
     """Fetch a Jira ticket + its subtasks + every Confluence page it references,
     materialise everything in the graph and Chroma. Idempotent.
 
@@ -418,6 +490,10 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
       extract_acs: run LLM to pull ACs from BRD section. Default True.
       on_step:     optional progress callback (see tieukiwi.progress). Called
                    with sub-step events during the 6-stage pipeline.
+      force:       skip hash-gate and re-run the whole pipeline. Set true when
+                   the user says "cập nhật"/"refresh" or when a Jira webhook
+                   fires — any other time, leave false so unchanged tickets
+                   short-circuit as status='cached_fresh'.
 
     Returns:
       summary dict listing what was upserted / fetched / created.
@@ -445,7 +521,7 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
         "warnings": [],
     }
 
-    # 1. Fetch main issue
+    # 1. Fetch main issue (always — this is the input to the hash check)
     _sub(f"Fetch Jira issue {issue_key}…")
     try:
         issue = fetch_jira_issue(issue_key)
@@ -455,6 +531,40 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
         return summary
 
     fields = issue.get("fields") or {}
+
+    # 1b. Hash-gate: short-circuit when nothing decision-relevant has changed.
+    # Only applies to Story (Requirement) — Epic-only ingests are rare and
+    # cheap enough to always re-run.
+    #
+    # Trade-off: story hash includes subtask STUBS (key/summary/status) but
+    # NOT their descriptions. So a new row appearing inside a [Bug] subtask's
+    # description table WITHOUT the subtask's summary/status changing will
+    # be missed until the next update that does bump those. In CDM's flow
+    # this is rare — QE usually updates subtask status when adding bugs —
+    # so we accept it. Users can force `refresh` to bypass.
+    if not force:
+        node_type = _map_node_type((fields.get("issuetype") or {}).get("name"))
+        if node_type == "Requirement":
+            new_hash = _story_hash(fields)
+            existing = db.get_node_by_ref("Requirement", issue_key, project_id=project_id)
+            if existing:
+                old_hash = (existing.get("props_json") or {}).get("story_hash")
+                if old_hash == new_hash:
+                    _sub("Hash unchanged, skipping full ingest.")
+                    db.upsert_node_by_ref("Requirement", issue_key, {
+                        "last_seen_at": _now_iso(),
+                    }, project_id=project_id, merge_props=True)
+                    summary["status"] = "cached_fresh"
+                    summary["requirement"] = {
+                        "key": issue_key,
+                        "node_id": existing["id"],
+                        "type": "Requirement",
+                    }
+                    summary["story_hash"] = new_hash
+                    return summary
+                _sub(f"Story hash changed ({old_hash} → {new_hash}) — full ingest.")
+            else:
+                _sub("First ingest — no cached hash.")
 
     # 2. Upsert parent Epic (if any) → UserStory node
     parent = fields.get("parent") or {}
@@ -560,6 +670,14 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
             summary["subtasks"]["skipped"].append({"key": st_key, "summary": st_summary})
 
     # Now Bug containers — use self-test TR (if present) to link find_by=Testcase.
+    # Inner-loop hash-gate: for each [Bug] subtask, hash its description table
+    # and skip re-parse when unchanged since last ingest. Saves a REST fetch
+    # of the subtask AND the LLM-free but non-trivial parse work when the
+    # story hash changed for OTHER reasons (e.g. TestRun status flip).
+    existing_req = db.get_node_by_ref("Requirement", req_key, project_id=project_id) or {}
+    old_bug_hashes = (existing_req.get("props_json") or {}).get("bug_container_hashes") or {}
+    new_bug_hashes = dict(old_bug_hashes)   # copy — mutated when we (re-)parse
+
     self_test_tr_id = testrun_by_env.get("self")
     for st_key, st_summary in bug_container_stubs:
         _sub(f"Parse bảng bug trong subtask {st_key}…")
@@ -569,6 +687,18 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
             summary["warnings"].append(f"Failed to fetch subtask {st_key}: {e}")
             continue
         desc_adf = (subtask_full.get("fields") or {}).get("description")
+
+        # Hash-gate for THIS bug container. Compare table hash before parsing.
+        new_hash = _bug_table_hash(desc_adf)
+        if not force and old_bug_hashes.get(st_key) == new_hash:
+            # Skip re-parse; existing Bug nodes are already correct.
+            summary["subtasks"]["bug_containers"].append({
+                "key": st_key, "rows_parsed": 0, "cached": True,
+            })
+            _sub(f"  {st_key} bảng không đổi (cached).")
+            continue
+        new_bug_hashes[st_key] = new_hash
+
         bugs_raw = parse_bug_subtask_table(desc_adf)
         bug_nodes = _upsert_bugs_from_table(
             st_key, st_summary, req_key, bugs_raw, project_id, component_ids=[],
@@ -589,6 +719,12 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None):
                 "severity": bugs_raw[idx-1]["severity"],
                 "status": bugs_raw[idx-1]["status"],
             })
+
+    # Persist bug container hashes on the Requirement for next-run gating.
+    if new_bug_hashes != old_bug_hashes:
+        db.upsert_node_by_ref("Requirement", req_key, {
+            "bug_container_hashes": new_bug_hashes,
+        }, project_id=project_id, merge_props=True)
 
     summary["status"] = "ok"
     return summary
