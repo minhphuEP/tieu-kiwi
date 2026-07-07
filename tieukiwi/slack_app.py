@@ -27,13 +27,93 @@ _GOLIVE_RE = re.compile(r"go[\s\-]?live|đủ điều kiện|release|go\s*/?\s*n
 # A Jira-style requirement ref, e.g. FRONT-3494.
 _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
 
+# Attempts to reassign the thread's sticky Jira ticket ("thread này giờ là CDM-500",
+# "chuyển sang FRONT-1234", "switch to ABC-1"). Blocked — user must open a new thread.
+_SWITCH_RE = re.compile(
+    r"thread\s+này\s+(?:giờ|bây\s*giờ)\s*(?:là|thành|sang)"
+    r"|(?:đổi|chuyển)\s+(?:sang|qua|thành|thread)"
+    r"|switch\s+(?:to|thread)"
+    r"|change\s+(?:to|thread)",
+    re.I,
+)
 
-def _golive_intent(text):
+
+def _golive_intent(text, fallback_ref=None):
     # Return the requirement ref if this looks like a go-live question, else None.
+    # `fallback_ref` lets the thread's sticky ticket kick in when the message text
+    # itself doesn't repeat the ref ("is it ready to go live?" inside a CDM-268 thread).
     if not text or not _GOLIVE_RE.search(text):
         return None
     m = _REQ_RE.search(text)
-    return m.group(1).upper() if m else None
+    if m:
+        return m.group(1).upper()
+    return fallback_ref
+
+
+def _save_thread_ref(channel_id, thread_ts, ref, logger=None):
+    # Persist ticket_ref into thread_state.state_json (upsert, merges with existing keys).
+    try:
+        state = memory.get_thread_state(channel_id, thread_ts) or {}
+        if state.get("ticket_ref") == ref:
+            return
+        state["ticket_ref"] = ref
+        memory.save_thread_state(channel_id, thread_ts, state)
+    except Exception:
+        if logger is not None:
+            logger.exception("save_thread_state failed")
+
+
+def _resolve_thread_ref(client, channel_id, thread_ts, clean_text, is_reply, logger=None):
+    # Sticky Jira ticket per Slack thread. FIRST-WINS: once a thread's ticket is set,
+    # later messages CANNOT overwrite it (a different ref in a follow-up message is
+    # treated as an ad-hoc reference for that message alone). Resolution order:
+    #   1) Already in thread_state       -> return (no overwrite).
+    #   2) Ref in the current message    -> persist + return.
+    #   3) Only if this is a reply: ref in the thread parent -> persist + return
+    #      (first ref may have been a plain human message, not @kiwi).
+    if not channel_id or not thread_ts:
+        return None
+    try:
+        state = memory.get_thread_state(channel_id, thread_ts) or {}
+    except Exception:
+        if logger is not None:
+            logger.exception("get_thread_state failed")
+        state = {}
+    if state.get("ticket_ref"):
+        return state["ticket_ref"]
+    m = _REQ_RE.search(clean_text or "")
+    if m:
+        ref = m.group(1).upper()
+        _save_thread_ref(channel_id, thread_ts, ref, logger)
+        return ref
+    if not is_reply or client is None:
+        return None
+    try:
+        resp = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=1)
+        msgs = resp.get("messages") or []
+        parent_text = msgs[0].get("text", "") if msgs else ""
+    except Exception:
+        if logger is not None:
+            logger.exception("conversations_replies failed")
+        return None
+    m = _REQ_RE.search(parent_text or "")
+    if not m:
+        return None
+    ref = m.group(1).upper()
+    _save_thread_ref(channel_id, thread_ts, ref, logger)
+    return ref
+
+
+def _switch_attempt_ref(clean_text, sticky_ref):
+    # If the message explicitly tries to reassign the thread's ticket to a DIFFERENT
+    # one, return that new ref (so the caller can refuse politely). Otherwise None.
+    if not sticky_ref or not clean_text or not _SWITCH_RE.search(clean_text):
+        return None
+    m = _REQ_RE.search(clean_text)
+    if not m:
+        return None
+    new_ref = m.group(1).upper()
+    return new_ref if new_ref != sticky_ref else None
 
 
 # Test-case generation intent, e.g. "gen test case cho CDM-268", "tạo test case CDM-268".
@@ -723,7 +803,11 @@ def build_app():
             return
 
         # Always reply IN THREAD (Layer C reads answers from the thread later).
-        thread_ts = event.get("thread_ts") or event["ts"]
+        event_ts = event.get("ts")
+        parent_ts = event.get("thread_ts")
+        thread_ts = parent_ts or event_ts
+        is_reply = bool(parent_ts) and parent_ts != event_ts
+        channel_id = event.get("channel")
 
         clean_text = _strip_mention(event.get("text", "")).strip()
         if not clean_text:
@@ -748,11 +832,36 @@ def build_app():
         except Exception:
             logger.exception("interim post failed")
 
-        # Go-live question -> deterministic go_no_go + (on GO) curator sign-off buttons.
-        ref = _golive_intent(clean_text)
-        if ref:
-            _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
+        # Sticky Jira ticket per thread: first ref (in this msg or the thread parent)
+        # is persisted so later mentions don't have to repeat it. First-wins — a
+        # follow-up message cannot overwrite the thread's ticket.
+        ticket_ref = _resolve_thread_ref(
+            client, channel_id, thread_ts, clean_text, is_reply, logger
+        )
+
+        # Refuse explicit attempts to reassign the thread's ticket ("thread này giờ là
+        # CDM-500", "switch to FRONT-1234"). Ask the user to open a new thread instead.
+        new_ref = _switch_attempt_ref(clean_text, ticket_ref)
+        if new_ref:
+            msg = slack_format.to_slack(
+                f":no_entry: Thread này đã gắn với **{ticket_ref}** và không đổi được. "
+                f"Muốn hỏi về **{new_ref}**, vui lòng mở thread mới."
+            )
+            say(blocks=_mrkdwn_blocks(msg), text="Không thể đổi ticket của thread",
+                thread_ts=thread_ts)
             return
+
+        # Go-live question -> deterministic go_no_go + (on GO) curator sign-off buttons.
+        ref = _golive_intent(clean_text, fallback_ref=ticket_ref)
+        if ref:
+            _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+            return
+
+        # For general questions: if the user didn't name a ticket but the thread has one,
+        # prepend it so the agent knows the ambient context.
+        question = clean_text
+        if ticket_ref and not _REQ_RE.search(clean_text):
+            question = f"(Context: Jira ticket {ticket_ref}) {clean_text}"
 
         # Generate-testcase request -> draft + Approve/Refine buttons.
         tc_ref = _gen_testcase_intent(clean_text)
@@ -760,7 +869,7 @@ def build_app():
             _do_gen_testcase(say, tc_ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
             return
 
-        answer = handle_question(clean_text, logger)
+        answer = handle_question(question, logger)
         say(blocks=_mrkdwn_blocks(answer), text=answer, thread_ts=thread_ts)
 
     return app
