@@ -58,7 +58,29 @@ HEADER_ALIASES = {
     "expected":             "expected",
     "expected result":      "expected",
     "expected_result":      "expected",
+    # Optional: comma/pipe-separated AC refs the TC covers, e.g.
+    #   "AC-CDM-268-1, AC-CDM-268-2"
+    # When present, we create AC -coveredBy-> TC edges after upserting.
+    # Only put THIS value in row 3 (title row); subsequent step rows can be empty.
+    "ac":       "ac_refs",
+    "ac refs":  "ac_refs",
+    "ac_refs":  "ac_refs",
+    "acrefs":   "ac_refs",
+    "acs":      "ac_refs",
+    "coverage": "ac_refs",
+    "covers":   "ac_refs",
+    "covered ac": "ac_refs",
 }
+
+
+# Split "AC-1, AC-2 | AC-3" → ["AC-1", "AC-2", "AC-3"].
+_AC_SPLIT_RE = re.compile(r"[,\|;]+")
+
+def _parse_ac_refs(raw):
+    if not raw or not isinstance(raw, str):
+        return []
+    parts = [p.strip() for p in _AC_SPLIT_RE.split(raw)]
+    return [p for p in parts if p]
 
 TEST_ID_RE = re.compile(r"\[([A-Za-z][A-Za-z0-9_\-]+)\]")
 
@@ -165,6 +187,7 @@ def parse_rows(rows):
         return None
     priority = first[mapping["priority"]] if mapping.get("priority") is not None else None
     preconditions = first[mapping["preconditions"]] if mapping.get("preconditions") is not None else None
+    ac_refs_raw = first[mapping["ac_refs"]] if mapping.get("ac_refs") is not None else None
 
     step_col = mapping.get("step")
     exp_col = mapping.get("expected")
@@ -193,6 +216,7 @@ def parse_rows(rows):
         "steps": steps_text,
         "expected": expected_text,
         "raw_rows": raw_rows,
+        "ac_refs": _parse_ac_refs(ac_refs_raw),
     }
 
 
@@ -237,11 +261,37 @@ def ingest(file_path, project_id, sprint_ref=None, only_sheet=None):
                     "source_file": str(file_path),
                 },
             }
+            if tc.get("ac_refs"):
+                # Keep raw refs on the TC props so an auditor can see the mapping
+                # source (row of the Excel) without walking edges.
+                props["ac_refs"] = tc["ac_refs"]
             tc_id = _upsert_node(cur, "TestCase", tc["ref"], project_id, props)
             if sprint_id:
                 _ensure_edge(cur, sprint_id, "has", tc_id)
+
+            # Link this TC to every AC it covers (idempotent via _ensure_edge).
+            # Missing ACs get logged as warnings but don't fail the ingest —
+            # the AC might be extracted later from the BRD.
+            covered = 0
+            missing = []
+            for ac_ref in (tc.get("ac_refs") or []):
+                cur.execute(
+                    "SELECT id FROM nodes WHERE type='AcceptanceCriterion' "
+                    "AND ref=%s AND project_id=%s",
+                    (ac_ref, project_id),
+                )
+                row = cur.fetchone()
+                if row:
+                    _ensure_edge(cur, row[0], "coveredBy", tc_id)
+                    covered += 1
+                else:
+                    missing.append(ac_ref)
+
             ingested.append((tc["ref"], sheet_name, len(tc["raw_rows"])))
-            print(f"  [ok] {tc['ref']:14s} from {sheet_name!r} ({len(tc['raw_rows'])} steps)")
+            cov_msg = f", covers {covered} AC" if covered else ""
+            miss_msg = f" [missing AC: {missing}]" if missing else ""
+            print(f"  [ok] {tc['ref']:14s} from {sheet_name!r} "
+                  f"({len(tc['raw_rows'])} steps{cov_msg}){miss_msg}")
 
     print(f"\n[done] Ingested {len(ingested)} testcase(s) from {file_path}")
     return ingested
