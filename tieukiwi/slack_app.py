@@ -27,11 +27,18 @@ _GOLIVE_RE = re.compile(r"go[\s\-]?live|đủ điều kiện|release|go\s*/?\s*n
 # A Jira-style requirement ref, e.g. FRONT-3494.
 _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
 
-# Attempts to reassign the thread's sticky Jira ticket ("thread này giờ là CDM-500",
-# "chuyển sang FRONT-1234", "switch to ABC-1"). Blocked — user must open a new thread.
+# Attempts to reassign a thread's Jira ticket ("thread này giờ là CDM-500",
+# "thread này h trao đổi cho CDM-198", "chuyển sang FRONT-1234", "switch to ABC-1",
+# "reset thread"). Blocked — a thread's ticket is set ONCE from the first ref seen
+# and can never be changed; users must open a new thread instead.
 _SWITCH_RE = re.compile(
-    r"thread\s+này\s+(?:giờ|bây\s*giờ)\s*(?:là|thành|sang)"
-    r"|(?:đổi|chuyển)\s+(?:sang|qua|thành|thread)"
+    # "thread này (giờ|h|bây giờ|now)  <change-verb>"
+    #  h = shorthand for "giờ"; verbs cover Vietnamese + English reassignment phrasing.
+    r"thread\s+này\s+(?:giờ|h|bây\s*giờ|now)"
+    r"\s+(?:là|thành|sang|bàn|trao\s*đổi|về|dùng|cho|nói|dành|for|about|is|will|sẽ)"
+    # "(đổi|chuyển|reset|reassign) (thread|sang|qua|thành|to)"
+    r"|(?:đổi|chuyển|reset|reassign)\s+(?:thread|sang|qua|thành|to)"
+    # "switch (to|thread)" / "change (to|thread)"
     r"|switch\s+(?:to|thread)"
     r"|change\s+(?:to|thread)",
     re.I,
@@ -104,10 +111,13 @@ def _resolve_thread_ref(client, channel_id, thread_ts, clean_text, is_reply, log
     return ref
 
 
-def _switch_attempt_ref(clean_text, sticky_ref):
-    # If the message explicitly tries to reassign the thread's ticket to a DIFFERENT
-    # one, return that new ref (so the caller can refuse politely). Otherwise None.
-    if not sticky_ref or not clean_text or not _SWITCH_RE.search(clean_text):
+def _detect_switch_target(clean_text):
+    # Return the target Jira ref if the message uses thread-reassignment language,
+    # "" if switch language is present but no ref was given, or None if not a switch
+    # attempt. Callers refuse the operation regardless of whether a sticky already
+    # exists — the language itself signals intent to change, and a thread's ticket
+    # cannot change once set.
+    if not clean_text or not _SWITCH_RE.search(clean_text):
         return None
     m = _REQ_RE.search(clean_text)
     if not m:
@@ -115,7 +125,23 @@ def _switch_attempt_ref(clean_text, sticky_ref):
     new_ref = m.group(1).upper()
     return new_ref if new_ref != sticky_ref else None
 
-
+def _switch_refusal_text(prior_sticky, switch_target):
+    # Compose the refusal message for a thread-reassignment attempt.
+    if prior_sticky:
+        head = f":no_entry: Thread này đã gắn với **{prior_sticky}** và không đổi được."
+        if switch_target and switch_target != prior_sticky:
+            tail = f"Muốn hỏi về **{switch_target}**, vui lòng mở thread mới."
+        else:
+            tail = "Vui lòng mở thread mới cho ticket khác."
+    else:
+        head = (":no_entry: Không thể *đổi/gán* ticket theo cách này — "
+                "mỗi thread chỉ gắn với 1 ticket (set 1 lần từ ref đầu tiên).")
+        if switch_target:
+            tail = (f"Nếu muốn bắt đầu về **{switch_target}**, mở thread mới và "
+                    f"gõ thẳng câu hỏi, ví dụ: `@Tieu Kiwi cho tôi info về {switch_target}`.")
+        else:
+            tail = "Vui lòng mở thread mới và nhắc ticket ngay từ tin nhắn đầu tiên."
+    return head + " " + tail
 # Test-case generation intent, e.g. "gen test case cho CDM-268", "tạo test case CDM-268".
 _GEN_TC_RE = re.compile(r"gen(?:erate)?\s*test\s*case|t(ạ|a)o\s*test\s*case", re.I)
 
@@ -818,6 +844,29 @@ def build_app():
             say(blocks=_mrkdwn_blocks(usage), text="Usage", thread_ts=thread_ts)
             return
 
+        # Refuse any thread-reassignment attempt BEFORE resolving/saving a sticky —
+        # otherwise a fresh-thread message like "thread này h trao đổi cho CDM-198"
+        # would silently set CDM-198 as the sticky before we get to reject it.
+        # Read the current sticky from thread_state only (no parent fetch here).
+        try:
+            prior_sticky = (memory.get_thread_state(channel_id, thread_ts) or {}).get("ticket_ref")
+        except Exception:
+            logger.exception("get_thread_state failed")
+            prior_sticky = None
+
+        switch_target = _detect_switch_target(clean_text)
+        if switch_target is not None and not (
+            prior_sticky and switch_target and prior_sticky == switch_target
+        ):
+            say(
+                blocks=_mrkdwn_blocks(slack_format.to_slack(
+                    _switch_refusal_text(prior_sticky, switch_target)
+                )),
+                text="Không thể đổi ticket của thread",
+                thread_ts=thread_ts,
+            )
+            return
+
         # Discard command -> cancel the in-progress testcase draft in this thread.
         # Checked before the interim "Processing…" ack so it stays snappy and
         # doesn't look like a new generation request is starting.
@@ -838,18 +887,6 @@ def build_app():
         ticket_ref = _resolve_thread_ref(
             client, channel_id, thread_ts, clean_text, is_reply, logger
         )
-
-        # Refuse explicit attempts to reassign the thread's ticket ("thread này giờ là
-        # CDM-500", "switch to FRONT-1234"). Ask the user to open a new thread instead.
-        new_ref = _switch_attempt_ref(clean_text, ticket_ref)
-        if new_ref:
-            msg = slack_format.to_slack(
-                f":no_entry: Thread này đã gắn với **{ticket_ref}** và không đổi được. "
-                f"Muốn hỏi về **{new_ref}**, vui lòng mở thread mới."
-            )
-            say(blocks=_mrkdwn_blocks(msg), text="Không thể đổi ticket của thread",
-                thread_ts=thread_ts)
-            return
 
         # Go-live question -> deterministic go_no_go + (on GO) curator sign-off buttons.
         ref = _golive_intent(clean_text, fallback_ref=ticket_ref)
