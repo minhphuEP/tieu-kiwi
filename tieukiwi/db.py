@@ -223,6 +223,24 @@ def get_node_by_ref(type_, ref, project_id=None):
         return {"id": row[0], "props_json": row[1] or {}}
 
 
+def count_acs(req_node_id):
+    """Return the number of AcceptanceCriterion nodes a Requirement has.
+
+    Used by ingest to decide whether to re-run AC extraction when the linked
+    BRD's content is unchanged (status='cached') — normally we skip in that
+    case, but if AC count is 0 the previous extraction never persisted
+    anything (LLM error, section-slice miss, etc.) and we should retry.
+    """
+    with conn() as c:
+        row = c.execute(
+            "SELECT count(*) FROM nodes ac "
+            "JOIN edges e ON e.dst_id=ac.id AND e.rel='has' "
+            "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion'",
+            (req_node_id,),
+        ).fetchone()
+        return row[0] if row else 0
+
+
 def linked_brds(src_id):
     """Return BRD nodes reachable via `src -derivedFrom-> BRD`.
 

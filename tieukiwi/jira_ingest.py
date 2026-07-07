@@ -449,8 +449,13 @@ def _slice_section(body_text, section_anchor):
     not resolve to any heading — sliced_text is the WHOLE body (caller may
     warn and continue, or bail out).
 
-    section_anchor is a Confluence URL slug like "15.-Assign-new-creator..."
-    which is URL-encoded (`&` → `%26`, etc). We decode it before matching.
+    Matching strategy:
+      1. URL-decode the anchor (Confluence encodes `&` as `%26`, etc).
+      2. Strict pass — require ALL slug tokens to appear in order.
+      3. Relaxed fallback — require the first 3 tokens only. Handles the
+         common case of a stale anchor (heading was edited AFTER the link
+         was copied into Jira; Confluence keeps the old anchor as a redirect
+         but the heading text no longer matches trailing tokens).
     """
     if not section_anchor or not body_text:
         return (body_text, True)
@@ -458,27 +463,32 @@ def _slice_section(body_text, section_anchor):
     slug_tokens = [t for t in decoded_anchor.replace("-", " ").split() if t]
     if not slug_tokens:
         return (body_text, True)
-    # Look for a heading line that contains ALL slug tokens in order.
     lines = body_text.splitlines()
-    start_idx = None
-    heading_level = None
-    for i, line in enumerate(lines):
-        m = re.match(r"^(#+)\s+(.*)", line)
-        if not m:
-            continue
-        heading_text = m.group(2).lower()
-        pos = 0
-        ok = True
-        for tok in slug_tokens:
-            found = heading_text.find(tok.lower(), pos)
-            if found < 0:
-                ok = False
-                break
-            pos = found + len(tok)
-        if ok:
-            start_idx = i
-            heading_level = len(m.group(1))
-            break
+
+    def _find(tokens):
+        for i, line in enumerate(lines):
+            m = re.match(r"^(#+)\s+(.*)", line)
+            if not m:
+                continue
+            heading_text = m.group(2).lower()
+            pos = 0
+            ok = True
+            for tok in tokens:
+                found = heading_text.find(tok.lower(), pos)
+                if found < 0:
+                    ok = False
+                    break
+                pos = found + len(tok)
+            if ok:
+                return (i, len(m.group(1)))
+        return (None, None)
+
+    start_idx, heading_level = _find(slug_tokens)
+    if start_idx is None and len(slug_tokens) > 3:
+        # Anchor likely stale (heading text edited after link was copied).
+        # Retry with just the section prefix — section-number + first 2 words
+        # are enough to disambiguate in practice.
+        start_idx, heading_level = _find(slug_tokens[:3])
     if start_idx is None:
         return (body_text, False)
     end_idx = len(lines)
@@ -687,8 +697,17 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
             db.ensure_edge(req_node_id, "derivedFrom", cf_result["node_id"],
                            props={"section_anchor": section_anchor} if section_anchor else None)
 
-            # 5. Optional: LLM extract ACs for this section
-            if extract_acs and cf_result.get("status") == "ok":
+            # 5. Optional: LLM extract ACs for this section.
+            # Re-run when:
+            #   - BRD content just changed (status="ok" → fresh chunks indexed)
+            #   - force=True (user explicitly refresh)
+            #   - Requirement has 0 ACs (previous extraction failed silently)
+            # Skip only when: content unchanged AND ACs already exist.
+            should_extract = extract_acs and cf_result.get("status") in ("ok", "cached")
+            if should_extract and cf_result.get("status") == "cached":
+                if not force and db.count_acs(req_node_id) > 0:
+                    should_extract = False
+            if should_extract:
                 brd_node = db.get_node_by_ref("BRD", f"CFL-{page_id}", project_id=project_id)
                 if brd_node:
                     # rag stored the full text as chunks; we don't have raw text.
