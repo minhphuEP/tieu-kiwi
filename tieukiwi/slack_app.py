@@ -48,6 +48,15 @@ def _gen_testcase_intent(text):
     return m.group(1).upper() if m else None
 
 
+# Discard intent: a command (not a button) to cancel the in-progress draft in this
+# thread, e.g. "discard test case", "cancel test cases", "hủy test case".
+_DISCARD_TC_RE = re.compile(r"(discard|cancel|h(ủ|u)y|b(ỏ|o))\s*(the\s*)?test\s*case", re.I)
+
+
+def _discard_testcase_intent(text):
+    return bool(text) and bool(_DISCARD_TC_RE.search(text))
+
+
 def _missing_tokens():
     return [
         name
@@ -243,11 +252,43 @@ def _golive_approval_blocks(requirement_ref, mention):
 
 # ---------------------------------------------------------------- Test-case generation
 
+# Slack section blocks reject text over 3000 chars; a full-detail draft (steps,
+# precondition, data tables) for a real requirement easily exceeds that in one
+# block. Split on line boundaries into multiple section blocks in the SAME
+# message instead (keeps the single message ts thread_state already relies on
+# for chat_update / staleness tracking). Leave headroom under Slack's 50-block
+# cap for the trailing actions block.
+_SECTION_CHAR_LIMIT = 2900
+_MAX_SECTION_BLOCKS = 45
+
+
+def _chunk_mrkdwn(text, limit=_SECTION_CHAR_LIMIT):
+    chunks, current = [], ""
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) > limit and current:
+            chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
 def _testcase_draft_blocks(draft):
     text = slack_format.render_testcase_draft(draft)
-    return [
-        {"type": "section", "text": {"type": "mrkdwn", "text": text}},
-        {
+    chunks = _chunk_mrkdwn(text)
+    truncated = len(chunks) > _MAX_SECTION_BLOCKS
+    if truncated:
+        chunks = chunks[:_MAX_SECTION_BLOCKS]
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in chunks]
+    if truncated:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                       "text": ":warning: _Draft too long to display in full — showing the first "
+                               f"{_MAX_SECTION_BLOCKS} sections. Approve to get the complete list "
+                               "in the exported Excel file._"}})
+    blocks.append({
             "type": "actions",
             "block_id": f"tc_{draft['requirement_ref']}_{draft['version']}",
             "elements": [
@@ -258,8 +299,8 @@ def _testcase_draft_blocks(draft):
                  "text": {"type": "plain_text", "text": "Refine test cases"},
                  "value": draft["requirement_ref"]},
             ],
-        },
-    ]
+    })
+    return blocks
 
 
 def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
@@ -277,6 +318,44 @@ def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_
     anchor_ts = thread_ts or posted["ts"]
     memory.save_thread_state(channel_id, anchor_ts,
                               {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **draft})
+
+
+def _do_discard_testcase(say, client, thread_ts, channel_id, user_id, logger=None):
+    # Text-command counterpart to the Approve/Refine buttons: cancels the
+    # in-progress draft in this thread without needing a clickable button
+    # (which risks an accidental click). Requires typing an explicit command.
+    state = memory.get_thread_state(channel_id, thread_ts)
+    if not state or state.get("flow") != "gen_testcase":
+        say(text=":warning: No active test case draft found in this thread.", thread_ts=thread_ts)
+        return
+    try:
+        deleted = memory.delete_thread_state(channel_id, thread_ts)
+    except Exception:
+        if logger is not None:
+            logger.exception("delete_thread_state failed")
+        say(text=":warning: Failed to discard the draft — please try again.", thread_ts=thread_ts)
+        return
+    if not deleted:
+        # The initial read above found a draft, but by the time we deleted it was
+        # already gone — a concurrent/duplicate discard call won the race. Don't
+        # report a second "discarded" success for the same draft.
+        say(text=":warning: No active test case draft found in this thread.", thread_ts=thread_ts)
+        return
+    draft_ts = state.get("draft_message_ts")
+    if draft_ts:
+        try:
+            client.chat_update(
+                channel=channel_id, ts=draft_ts,
+                blocks=[{"type": "section", "text": {"type": "mrkdwn",
+                         "text": f":no_entry_sign: Discarded by <@{user_id}> "
+                                 f"(v{state.get('version')}) — nothing was saved."}}],
+                text=f"Discarded by <@{user_id}>",
+            )
+        except Exception:
+            if logger is not None:
+                logger.exception("marking draft message as discarded failed")
+    say(text=f":no_entry_sign: Discarded the test case draft for "
+             f"{state.get('requirement_ref')} — nothing was saved.", thread_ts=thread_ts)
 
 
 def _is_stale_draft_click(body, state):
@@ -513,11 +592,16 @@ def build_app():
             return
         # Remove the Approve/Refine buttons now that the DB write has succeeded,
         # so a double-click or Slack redelivery can't trigger a second export/upload.
+        # Keep the rendered testcase list itself — only the actions block is
+        # dropped — so the reviewer can still see what they approved.
         try:
+            kept_blocks = [b for b in (body["message"].get("blocks") or [])
+                           if b.get("type") != "actions"]
+            kept_blocks.append({"type": "section", "text": {"type": "mrkdwn",
+                                "text": f":white_check_mark: Approved by <@{user}> (v{state['version']})"}})
             client.chat_update(
                 channel=channel_id, ts=body["message"]["ts"],
-                blocks=[{"type": "section", "text": {"type": "mrkdwn",
-                         "text": f":white_check_mark: Approved by <@{user}> (v{state['version']})"}}],
+                blocks=kept_blocks,
                 text=f"Approved by <@{user}>",
             )
         except Exception:
@@ -586,13 +670,27 @@ def build_app():
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
                                      text=":warning: No draft found for this thread.")
             return
+        # The refine LLM call can take several seconds; post an immediate
+        # acknowledgement so the user doesn't think the click was dropped.
+        processing = client.chat_postMessage(
+            channel=channel_id, thread_ts=thread_ts,
+            text=":hourglass_flowing_sand: Refining test cases based on your comment…",
+        )
         try:
             refined = testcase_gen.refine_draft(state, comment)
         except Exception as e:
             logger.exception("refine_draft failed")
-            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=slack_format.to_slack(f":warning: Error: {e}"))
+            try:
+                client.chat_update(channel=channel_id, ts=processing["ts"],
+                                    text=slack_format.to_slack(f":warning: Error: {e}"))
+            except Exception:
+                logger.exception("updating processing message with error failed")
             return
+        try:
+            client.chat_update(channel=channel_id, ts=processing["ts"],
+                                text=":white_check_mark: Refinement complete — see the new draft below.")
+        except Exception:
+            logger.exception("updating processing message to complete failed")
         try:
             old_ts = state.get("draft_message_ts")
             if old_ts:
@@ -613,7 +711,7 @@ def build_app():
                                   {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **refined})
 
     @app.event("app_mention")
-    def handle_app_mention(event, body, say, logger):
+    def handle_app_mention(event, body, say, client, logger):
         # Ignore bot authors / bot_message so the bot never replies to itself or other bots.
         if event.get("bot_id") or event.get("subtype") == "bot_message":
             return
@@ -634,6 +732,14 @@ def build_app():
                 "`@Tieu Kiwi is FRONT-3494 ready to go live?`"
             )
             say(blocks=_mrkdwn_blocks(usage), text="Usage", thread_ts=thread_ts)
+            return
+
+        # Discard command -> cancel the in-progress testcase draft in this thread.
+        # Checked before the interim "Processing…" ack so it stays snappy and
+        # doesn't look like a new generation request is starting.
+        if _discard_testcase_intent(clean_text):
+            _do_discard_testcase(say, client, thread_ts, event.get("channel"),
+                                  event.get("user"), logger)
             return
 
         # Interim ack in-thread so users see progress, then the final answer.

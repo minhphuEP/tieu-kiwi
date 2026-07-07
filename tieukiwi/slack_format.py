@@ -675,10 +675,30 @@ def _golive_selftest():
     return render_golive(report_go, res_go), render_golive(report_nogo, res_nogo)
 
 
+def _testcase_line(n, tc):
+    ac_list = ", ".join(tc["ac_refs"]) or "—"
+    tc_type = tc.get("type") or "Normal"
+    lines = [f"{n}. *{tc['ref']}* — AC: {ac_list} — Type: {tc_type} — Priority: {tc['priority']} — {tc['title']}"]
+    if tc_type == "DataTable":
+        variants = tc.get("data_variants") or []
+        if variants:
+            lines.append("DataTable:")
+            # Show only the row label — the column/value breakdown (still fully
+            # present in `values` for the Excel export) is deliberately not
+            # echoed here: the reviewer wrote the label, and appending the
+            # LLM's own decomposition of it back onto the same line reads as
+            # the tool "changing" their wording even when the values merely
+            # restate it.
+            lines.extend(f"• {variant.get('label', '')}" for variant in variants)
+    return lines
+
+
 def render_testcase_draft(draft):
-    """Render a testcase_gen draft dict as Slack mrkdwn text (one bullet per
-    testcase: ref, AC refs, priority, title), for posting alongside Approve/Refine
-    buttons.
+    """Render a testcase_gen draft dict as Slack mrkdwn text — a numbered list,
+    one line per testcase (ref, AC refs, type, priority, title), with a bullet
+    list of data table rows for DataTable testcases only. Kept intentionally
+    short to fit Slack's per-block/message limits; full detail (precondition,
+    steps, API fields) is available in the exported Excel file after approval.
 
     Builds mrkdwn directly instead of routing through to_slack(): to_slack's
     _parse_ac_lines() scans any line for an AC-like ref plus a trigger keyword
@@ -699,10 +719,9 @@ def render_testcase_draft(draft):
         lines.append("")
     if not draft["testcases"]:
         lines.append("_(no testcases in this draft)_")
-    for tc in draft["testcases"]:
-        ac_list = ", ".join(tc["ac_refs"]) or "—"
-        lines.append(f"• *{tc['ref']}* — AC: {ac_list} · Priority: {tc['priority']} — {tc['title']}")
-    return "\n".join(lines)
+    for i, tc in enumerate(draft["testcases"], 1):
+        lines.extend(_testcase_line(i, tc))
+    return "\n".join(lines).rstrip("\n")
 
 
 def _testcase_draft_selftest():
@@ -711,15 +730,43 @@ def _testcase_draft_selftest():
         "version": 2,
         "summary": "Added AC-4 coverage per reviewer comment.",
         "testcases": [
-            {"ref": "TC-1", "ac_refs": ["AC-1"], "priority": "High", "title": "[TC-1] Happy path"},
-            {"ref": "TC-2", "ac_refs": ["AC-4"], "priority": "Medium",
-             "title": "[TC-2] Login should fail with invalid password"},
+            {"ref": "TC-1", "ac_refs": ["AC-1"], "priority": "High", "type": "Normal",
+             "title": "[TC-1] Happy path", "precondition": "1. Logged in.",
+             "steps": [{"description": "Click submit", "expected": "See success"}],
+             "data_variants": [], "api": {}},
+            {"ref": "TC-2", "ac_refs": ["AC-4"], "priority": "Medium", "type": "Normal",
+             "title": "[TC-2] Login should fail with invalid password",
+             "precondition": "", "steps": [{"description": "Submit bad password", "expected": "Error shown"}],
+             "data_variants": [], "api": {}},
+            {"ref": "TC-3", "ac_refs": ["AC-2"], "priority": "Highest", "type": "DataTable",
+             "title": "[TC-3] Field variants", "precondition": "",
+             "steps": [{"description": "Enter value", "expected": "Validated"}],
+             "data_variants": [
+                 {"label": "empty", "values": {"Field": "", "Expected": "Error shown"}},
+             ], "api": {}},
+            {"ref": "TC-4", "ac_refs": ["AC-3"], "priority": "High", "type": "API",
+             "title": "[TC-4] Login API", "precondition": "", "steps": [],
+             "data_variants": [], "api": {"endpoint": "/login", "method": "POST",
+                                           "expected_status": "200"}},
         ],
     }
     out = render_testcase_draft(draft)
     assert "CDM-268" in out and "v2" in out, out
     assert "TC-1" in out and "TC-2" in out, out
     assert "should fail with invalid password" in out, out
+    # Numbered list, one line per testcase, minimal fields only.
+    assert "1. *TC-1*" in out, out
+    assert "2. *TC-2*" in out, out
+    assert "Type: Normal" in out and "Priority: High" in out, out
+    # Steps/precondition/API fields must NOT leak into the Slack render (kept in Excel export only).
+    assert "Click submit" not in out and "See success" not in out, out
+    assert "Precondition" not in out, out
+    assert "/login" not in out and "POST" not in out, out
+    # DataTable testcases show their row labels as bullets — verbatim, with no
+    # column/value breakdown appended (that stays in the Excel export only).
+    assert "3. *TC-3*" in out and "DataTable:" in out, out
+    assert "• empty" in out, out
+    assert "Error shown" not in out, out
     # Guard against the to_slack AC-line-hijacking landmine (see docstring):
     # a real coverage-report rewrite would replace this text with a
     # "Tình trạng Test Case" / "Test coverage (" table instead.

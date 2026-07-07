@@ -1,7 +1,59 @@
+import re
 import psycopg
 from contextlib import contextmanager
 
 from .config import DATABASE_URL
+
+_DATATABLE_COL_RE = re.compile(r"^datacol_?\d+$", re.IGNORECASE)
+
+
+def is_datatable_testcase(props):
+    """Infer whether a TestCase's props represent a data-driven table testcase.
+
+    LLM-generated testcases (tieukiwi/testcase_gen.py) carry `data_variants`;
+    Excel-ingested testcases (scripts/ingest/testcases.py) instead carry
+    `raw_rows` with DataCol_N columns copied verbatim from the source sheet.
+    Neither schema implies the other, so both must be checked.
+    """
+    if props.get("data_variants"):
+        return True
+    for row in props.get("raw_rows") or []:
+        if isinstance(row, dict) and any(
+            isinstance(k, str) and _DATATABLE_COL_RE.match(k.strip()) for k in row
+        ):
+            return True
+    return False
+
+
+_RENAME_HINT_MARKER = "← not used"
+
+
+def _raw_rows_to_data_variants(raw_rows):
+    """Recover data_variants from Excel-ingested `raw_rows`.
+
+    Per kb/_global/QE/templates/testcase_template.md, a data-driven sheet's
+    Section C is: a `DATA TABLE` separator, a `← not used` rename-hint row,
+    then one data row per variant with Description + DataCol_N + Expected
+    columns filled (Title/Priority/Pre-condition/Step_Description blank).
+    scripts/ingest/testcases.py preserves all of this verbatim into `raw_rows`
+    but never converts it to the `data_variants` shape testcase_gen.py and
+    testcase_export.py expect — without this, an ingested DataTable testcase's
+    real values never reach the LLM (or a re-export), leaving it looking
+    like an empty table.
+    """
+    variants = []
+    for row in raw_rows or []:
+        if not isinstance(row, dict):
+            continue
+        if any(v == _RENAME_HINT_MARKER for v in row.values()):
+            continue  # the rename-hint row itself, not a data variant
+        if not any(isinstance(k, str) and _DATATABLE_COL_RE.match(k.strip()) for k in row):
+            continue  # a plain step row, no DataCol_* columns
+        variants.append({
+            "label": row.get("Description", ""),
+            "values": {k: v for k, v in row.items() if k != "Description"},
+        })
+    return variants
 
 @contextmanager
 def conn():
@@ -947,13 +999,20 @@ def testcases_for_requirement(ref, project_id=None):
     for tc_ref, props, ac_ref in rows:
         props = props or {}
         if tc_ref not in by_ref:
+            data_variants = props.get("data_variants") or _raw_rows_to_data_variants(props.get("raw_rows"))
+            # Legacy/ingested testcases saved before the `type` field existed
+            # have no explicit type; infer it rather than defaulting
+            # everything to "Normal".
+            inferred_type = props.get("type") or ("DataTable" if is_datatable_testcase(props) else "Normal")
             by_ref[tc_ref] = {
                 "ref": tc_ref,
                 "title": props.get("title"),
+                "type": inferred_type,
                 "priority": props.get("priority"),
                 "precondition": props.get("precondition"),
                 "steps": props.get("steps") or [],
-                "data_variants": props.get("data_variants") or [],
+                "data_variants": data_variants,
+                "api": props.get("api") or {},
                 "ac_refs": [],
             }
         by_ref[tc_ref]["ac_refs"].append(ac_ref)
@@ -980,9 +1039,11 @@ def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
         for tc in testcases:
             props = {
                 "title": tc["title"],
+                "type": tc.get("type") or ("DataTable" if is_datatable_testcase(tc) else "Normal"),
                 "priority": tc["priority"],
                 "precondition": tc.get("precondition", ""),
                 "steps": tc["steps"],
+                "api": tc.get("api") or {},
                 "data_variants": tc.get("data_variants") or [],
                 "_meta": {
                     "extraction_source": "llm:gen_testcase",
