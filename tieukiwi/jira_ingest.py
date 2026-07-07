@@ -70,6 +70,45 @@ def _story_hash(fields):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
+def _check_brd_freshness(req_node_id, on_step=None):
+    """For every BRD a Requirement derives from, hit Confluence's cheap metadata
+    endpoint and compare `version.number` against what we stored.
+
+    Returns [{ref, page_id, stored_version, current_version}, ...] for BRDs
+    whose Confluence version has drifted (i.e. PRD edited without touching
+    Jira). Empty list = all fresh (safe to short-circuit).
+
+    Fail-safe: any HTTP / network error on the freshness check is treated as
+    "assume fresh" — a Confluence outage should not force full re-ingest of
+    every ticket. The specific BRD is just skipped from the drift check.
+    """
+    stale = []
+    for brd in db.linked_brds(req_node_id):
+        props = brd.get("props_json") or {}
+        page_id = props.get("page_id")
+        stored_version = props.get("version")
+        if not page_id or stored_version is None:
+            continue
+        try:
+            meta = confluence.get_page_metadata(page_id)
+        except (httpx.HTTPError, RuntimeError):
+            if on_step:
+                try:
+                    on_step(f"BRD {brd['ref']} freshness check bỏ qua (Confluence không phản hồi).")
+                except Exception:
+                    pass
+            continue
+        current_version = meta.get("version")
+        if current_version is not None and current_version != stored_version:
+            stale.append({
+                "ref": brd["ref"],
+                "page_id": page_id,
+                "stored_version": stored_version,
+                "current_version": current_version,
+            })
+    return stale
+
+
 def _bug_table_hash(description_adf):
     """Hash the raw table rows in a [Bug] subtask description.
 
@@ -567,19 +606,25 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
             if existing:
                 old_hash = (existing.get("props_json") or {}).get("story_hash")
                 if old_hash == new_hash:
-                    _sub("Hash unchanged, skipping full ingest.")
-                    db.upsert_node_by_ref("Requirement", issue_key, {
-                        "last_seen_at": _now_iso(),
-                    }, project_id=project_id, merge_props=True)
-                    summary["status"] = "cached_fresh"
-                    summary["requirement"] = {
-                        "key": issue_key,
-                        "node_id": existing["id"],
-                        "type": "Requirement",
-                    }
-                    summary["story_hash"] = new_hash
-                    return summary
-                _sub(f"Story hash changed ({old_hash} → {new_hash}) — full ingest.")
+                    stale = _check_brd_freshness(existing["id"], on_step=_sub)
+                    if stale:
+                        _sub(f"PRD update trên Confluence ({stale}) → full ingest.")
+                        # fall through — do not return cached_fresh
+                    else:
+                        _sub("Hash unchanged + BRD fresh, skipping full ingest.")
+                        db.upsert_node_by_ref("Requirement", issue_key, {
+                            "last_seen_at": _now_iso(),
+                        }, project_id=project_id, merge_props=True)
+                        summary["status"] = "cached_fresh"
+                        summary["requirement"] = {
+                            "key": issue_key,
+                            "node_id": existing["id"],
+                            "type": "Requirement",
+                        }
+                        summary["story_hash"] = new_hash
+                        return summary
+                else:
+                    _sub(f"Story hash changed ({old_hash} → {new_hash}) — full ingest.")
             else:
                 _sub("First ingest — no cached hash.")
 

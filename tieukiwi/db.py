@@ -223,6 +223,23 @@ def get_node_by_ref(type_, ref, project_id=None):
         return {"id": row[0], "props_json": row[1] or {}}
 
 
+def linked_brds(src_id):
+    """Return BRD nodes reachable via `src -derivedFrom-> BRD`.
+
+    Each item: {id, ref, props_json}. Used by the ingest hash-gate to check
+    whether any Confluence page a Requirement derived from has drifted
+    version-wise (i.e. the PRD was edited without touching Jira).
+    """
+    with conn() as c:
+        rows = c.execute(
+            "SELECT n.id, n.ref, n.props_json FROM nodes n "
+            "JOIN edges e ON e.dst_id=n.id AND e.rel='derivedFrom' "
+            "WHERE e.src_id=%s AND n.type='BRD'",
+            (src_id,),
+        ).fetchall()
+    return [{"id": r[0], "ref": r[1], "props_json": r[2] or {}} for r in rows]
+
+
 def ensure_edge(src_id, rel, dst_id, props=None):
     """Idempotent edge insert (edges has no unique constraint; use WHERE NOT EXISTS).
 

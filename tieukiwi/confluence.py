@@ -49,6 +49,21 @@ def _confluence_get(path):
     return resp.json()
 
 
+def get_page_metadata(page_id):
+    """Cheap Confluence page metadata fetch (no body).
+
+    Returns {"page_id", "version", "title"} or raises httpx.HTTPError / RuntimeError
+    on failure. Used by hash-gate freshness check — 1 HTTP call per linked BRD
+    when the Jira story hash is unchanged.
+    """
+    page = _confluence_get(f"/api/v2/pages/{page_id}")
+    return {
+        "page_id": str(page_id),
+        "version": (page.get("version") or {}).get("number"),
+        "title":   page.get("title") or "",
+    }
+
+
 def fetch_confluence(page_id, project_id=None, section_anchor=None):
     """Fetch one Confluence page → BRD node (Postgres) + chunks (Chroma).
 
@@ -119,6 +134,11 @@ def fetch_confluence(page_id, project_id=None, section_anchor=None):
     # 4. Idempotency check: same hash → don't re-embed
     existing = db.get_node_by_ref("BRD", ref, project_id=project_id)
     if existing and existing["props_json"].get("content_hash") == content_hash:
+        # Bump stored `version` so the hash-gate freshness check doesn't keep
+        # re-firing when Confluence version drifted (edit-and-revert, whitespace,
+        # etc.) without content change.
+        if version_num and existing["props_json"].get("version") != version_num:
+            db.update_node_props(ref, "version", version_num, type_="BRD")
         return {
             "tool": "fetch_confluence",
             "status": "cached",
