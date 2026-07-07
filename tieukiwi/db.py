@@ -175,7 +175,7 @@ def upsert_node_by_ref(type_, ref, props=None, project_id=None, merge_props=Fals
                 node_id = row[0]
                 if merge_props:
                     c.execute(
-                        "UPDATE nodes SET props_json = props_json || %s WHERE id=%s",
+                        "UPDATE nodes SET props_json = props_json || %s::jsonb WHERE id=%s",
                         (psycopg.types.json.Json(props), node_id),
                     )
                 else:
@@ -198,7 +198,7 @@ def upsert_node_by_ref(type_, ref, props=None, project_id=None, merge_props=Fals
         row = c.execute(
             f"""
             INSERT INTO nodes (type, ref, project_id, props_json)
-            VALUES (%s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s::jsonb)
             ON CONFLICT (project_id, ref) WHERE ref IS NOT NULL DO UPDATE
               SET {conflict_expr}
             RETURNING id
