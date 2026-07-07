@@ -254,6 +254,35 @@ TOOLS = [
     },
   },
   {
+    "name": "mark_reviewed",
+    "description": (
+        "Advance a TestCase through the review state machine. Use when a QE or "
+        "QE Lead explicitly approves/rejects a testcase in Slack (\"QE Dung "
+        "approve TC-CDM-268-A\", \"lead reject CDM_DupScript_002 vì thiếu step\"). "
+        "State transitions: draft → qe_pending → qe_reviewed → lead_pending → "
+        "lead_approved (any state → rejected). Records reviewer_slack_id and "
+        "timestamp per stage in TestCase.props for the audit trail. Do NOT call "
+        "this for questions ABOUT a testcase — only when the user is actually "
+        "signing off / rejecting."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "tc_ref": {"type": "string",
+                   "description": "TestCase ref, e.g. 'CDM_DupScript_002' or 'TC-CDM-268-A'."},
+        "decision": {"type": "string", "enum": ["approve", "reject"],
+                     "description": "'approve' advances to next state; 'reject' → 'rejected'."},
+        "reviewer_slack_id": {"type": "string",
+                              "description": "Slack user id of the reviewer (U0..). "
+                                             "The Slack layer usually fills this from event.user."},
+        "comments": {"type": "string",
+                     "description": "Optional free-text note recorded on the transition. "
+                                    "Include when the user gave a reason for rejection or a caveat."},
+      },
+      "required": ["tc_ref", "decision", "reviewer_slack_id"],
+    },
+  },
+  {
     "name": "gen_testcase",
     "description": "Generate or update test cases for a requirement, following the KB template/rubric. Returns a draft — for interactive Approve/Refine review, use the Slack flow instead of this direct tool call.",
     "input_schema": {
@@ -395,6 +424,11 @@ def run_tool(name, args, context=None):
         return db.bug_blast_radius(args["bug_ref"], project_id=project_id)
     if name == "classify_bug":
         return db.classify_bug(args["bug_ref"], project_id=project_id)
+    if name == "mark_reviewed":
+        return db.mark_reviewed(
+            args["tc_ref"], args["decision"], args["reviewer_slack_id"],
+            comments=args.get("comments"), project_id=project_id,
+        )
     if name == "gen_testcase":
         return gen_testcase(args["requirement_ref"], project_id=project_id)
     if name == "gen_test_plan":

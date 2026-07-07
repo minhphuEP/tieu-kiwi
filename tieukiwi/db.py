@@ -1240,6 +1240,112 @@ def classify_bug(bug_ref, project_id=None):
         }
 
 
+# --- TestCase review workflow --------------------------------------------
+
+# State machine for TestCase.props.review_status:
+#
+#   draft ──approve──▶ qe_pending ──approve──▶ qe_reviewed ──approve──▶ lead_pending
+#     │                    │                        │                        │
+#     └────reject──────────┴────reject──────────────┴────reject──────────────┴───▶ rejected
+#                                                                            │
+#                                                                        approve
+#                                                                            ▼
+#                                                                     lead_approved
+#
+# `qe_pending` and `lead_pending` are "waiting for X's approval" states —
+# used by the Slack layer to know who to @-mention. `qe_reviewed` /
+# `lead_approved` are terminal-approve states.
+_REVIEW_STATE_TRANSITIONS = {
+    "draft":         {"approve": "qe_pending",   "reject": "rejected"},
+    "qe_pending":    {"approve": "qe_reviewed",  "reject": "rejected"},
+    "qe_reviewed":   {"approve": "lead_pending", "reject": "rejected"},
+    "lead_pending":  {"approve": "lead_approved","reject": "rejected"},
+    # Terminal states — no further transitions accepted.
+    "lead_approved": {},
+    "rejected":      {},
+}
+
+
+def _now_utc_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
+
+
+def mark_reviewed(tc_ref, decision, reviewer_slack_id, comments=None, project_id=None):
+    """Advance a TestCase through the review state machine.
+
+    Args:
+      tc_ref:             TestCase ref (e.g. 'CDM_DupScript_002').
+      decision:           'approve' or 'reject'.
+      reviewer_slack_id:  Slack user id doing the review (recorded per stage).
+      comments:           optional free-text comment (recorded on the transition).
+      project_id:         multi-tenant guard. The TC must belong to this project.
+
+    Returns dict:
+      {status: 'ok'|'error'|'terminal', old_state, new_state, tc_ref, reasoning}
+
+    Non-destructive: on error (unknown TC, invalid transition, terminal state)
+    props stay untouched.
+    """
+    if decision not in ("approve", "reject"):
+        return {"status": "error", "tc_ref": tc_ref,
+                "reasoning": f"decision must be 'approve' or 'reject', got {decision!r}"}
+
+    tc = get_node_by_ref("TestCase", tc_ref, project_id=project_id)
+    if not tc:
+        scope = f" in project '{project_id}'" if project_id else ""
+        return {"status": "error", "tc_ref": tc_ref,
+                "reasoning": f"TestCase '{tc_ref}' not found{scope}"}
+
+    props = tc["props_json"] or {}
+    old_state = props.get("review_status") or "draft"
+    transitions = _REVIEW_STATE_TRANSITIONS.get(old_state, {})
+    if not transitions:
+        return {"status": "terminal", "tc_ref": tc_ref, "old_state": old_state,
+                "new_state": old_state,
+                "reasoning": f"TestCase already in terminal state '{old_state}'"}
+
+    new_state = transitions.get(decision)
+    if new_state is None:
+        return {"status": "error", "tc_ref": tc_ref, "old_state": old_state,
+                "reasoning": f"decision '{decision}' invalid from state '{old_state}'"}
+
+    now = _now_utc_iso()
+    # Record reviewer + timestamp on the STAGE, so the audit trail persists
+    # even after the state advances again.
+    stage_key = {
+        ("draft", "approve"):        ("qe_started_at",   "qe_started_by"),
+        ("qe_pending", "approve"):   ("qe_reviewed_at",  "reviewed_by_qe"),
+        ("qe_pending", "reject"):    ("qe_rejected_at",  "rejected_by_qe"),
+        ("qe_reviewed", "approve"):  ("lead_started_at", "lead_started_by"),
+        ("lead_pending", "approve"): ("lead_approved_at","reviewed_by_qe_lead"),
+        ("lead_pending", "reject"):  ("lead_rejected_at","rejected_by_qe_lead"),
+        ("draft", "reject"):         ("draft_rejected_at", "rejected_by"),
+        ("qe_reviewed", "reject"):   ("qe_rejected_at",    "rejected_by"),
+    }.get((old_state, decision))
+    delta = {"review_status": new_state}
+    if stage_key:
+        delta[stage_key[0]] = now
+        delta[stage_key[1]] = reviewer_slack_id
+    if comments:
+        history = list(props.get("review_history") or [])
+        history.append({
+            "at": now, "from": old_state, "to": new_state,
+            "by": reviewer_slack_id, "comment": comments,
+        })
+        delta["review_history"] = history
+
+    upsert_node_by_ref("TestCase", tc_ref, delta,
+                        project_id=project_id, merge_props=True)
+
+    return {
+        "status": "ok", "tc_ref": tc_ref,
+        "old_state": old_state, "new_state": new_state,
+        "reviewer": reviewer_slack_id,
+        "reasoning": f"TestCase {tc_ref}: {old_state} → {new_state}",
+    }
+
+
 def requirement_with_acs(ref, project_id=None):
     """Return the Requirement's PRD content plus its AcceptanceCriteria.
 
