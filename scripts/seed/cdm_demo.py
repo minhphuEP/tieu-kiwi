@@ -72,11 +72,16 @@ BRD_URL = (
 # --- idempotent helpers (mirrors scripts/ingest/bugs.py) -------------------
 
 def _upsert_node(cur, type_, ref, project_id, props):
-    """INSERT or UPDATE via the (project_id, ref) partial unique index (003)."""
+    """INSERT or UPDATE via the (project_id, ref) partial unique index (003).
+
+    Note the `%s::jsonb` cast — psycopg 3 binds `Json(props)` as SQL json, but
+    the `||` operator requires jsonb || jsonb, so EXCLUDED.props_json must be
+    typed jsonb explicitly (see db.upsert_node_by_ref fix in 677d128).
+    """
     cur.execute(
         """
         INSERT INTO nodes (type, ref, project_id, props_json)
-        VALUES (%s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s::jsonb)
         ON CONFLICT (project_id, ref) WHERE ref IS NOT NULL DO UPDATE
           SET props_json = nodes.props_json || EXCLUDED.props_json
         RETURNING id

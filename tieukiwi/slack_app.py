@@ -813,6 +813,14 @@ def build_app():
             slack_format.to_slack(f":x: Release rejected for *{ref}* by <@{user}>"),
         )
 
+    @app.event("message")
+    def handle_message_events(body, logger):
+        # Slack Bolt requires SOME handler for every subscribed event type;
+        # without this, every message in the channel logs an "Unhandled
+        # request" warning. We only respond to @-mentions, so a no-op is
+        # correct — this drops the log noise on purpose.
+        return
+
     @app.action("tc_approve")
     def handle_tc_approve(ack, body, client, logger):
         ack()
