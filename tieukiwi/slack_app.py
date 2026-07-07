@@ -16,6 +16,7 @@ import re
 import time
 
 from . import agent, config, db, memory, progress, routing, slack_format, testcase_export, testcase_gen
+from . import jira_ingest
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
@@ -27,6 +28,12 @@ _MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 _GOLIVE_RE = re.compile(r"go[\s\-]?live|đủ điều kiện|release|go\s*/?\s*no-?go|sẵn sàng", re.I)
 # A Jira-style requirement ref, e.g. FRONT-3494.
 _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
+# Force-refresh intent: user asks to update the ticket from Jira, bypassing
+# the ingest hash-gate. Matches Vietnamese + English phrasings.
+_FORCE_REFRESH_RE = re.compile(
+    r"cập\s*nhật|làm\s*mới|đồng\s*bộ|refresh|resync|re-?fetch|reload|mới\s*nhất",
+    re.I,
+)
 
 # Attempts to reassign a thread's Jira ticket ("thread này giờ là CDM-500",
 # "thread này h trao đổi cho CDM-198", "chuyển sang FRONT-1234", "switch to ABC-1",
@@ -291,6 +298,89 @@ def _finalize_curator_message(client, body, text):
         )
     except Exception:
         pass
+
+
+def _ensure_ticket_fresh(client, channel_id, thread_ts, ref, project_id,
+                          force=False, logger=None):
+    """Pre-flight: make sure `ref`'s subtree is in the graph (and reasonably
+    fresh) before the agent runs its tools. Called for every question that
+    resolves to a ticket.
+
+    Deterministic (dev controls flow, not the LLM): posts progress to the
+    thread and calls `jira_ingest.ingest_jira_ticket`. The tool itself
+    hash-gates internally, so a cached ticket returns in <1s with no
+    Confluence fetch and no LLM AC pass.
+
+    Args:
+      force: bypass hash-gate. Set true when the user's message contains a
+             refresh keyword ("cập nhật", "refresh", ...).
+
+    Returns: the ingest summary dict (or None on total failure so the caller
+    can still try to answer from whatever's already in the graph).
+    """
+    if not ref or not channel_id:
+        return None
+    progress_ts = None
+    try:
+        # Post a lightweight progress message. Cached case will overwrite it
+        # a second later; uncached case will get replaced with a final summary.
+        resp = client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=slack_format.to_slack(
+                f"🔄 Đang đồng bộ *{ref}* từ Jira{' (force)' if force else ''}…"
+            ),
+        )
+        progress_ts = (resp or {}).get("ts")
+    except Exception:
+        if logger is not None:
+            logger.exception("progress post failed")
+
+    try:
+        summary = jira_ingest.ingest_jira_ticket(
+            ref, project_id=project_id, force=force,
+            # Skip LLM AC extraction on Slack pre-flight — it costs 5-15s and
+            # ACs rarely block the go/no-go answer. First cold-ingest via CLI
+            # or a dedicated command should still run with extract_acs=True.
+            extract_acs=False,
+        )
+    except Exception as e:
+        if logger is not None:
+            logger.exception("ingest_jira_ticket failed")
+        _update_or_post(client, channel_id, progress_ts, thread_ts,
+                        f":warning: Không đồng bộ được *{ref}*: {e}", logger)
+        return None
+
+    status = summary.get("status")
+    if status == "cached_fresh":
+        text = f"✅ *{ref}* đã cached (hash không đổi)."
+    elif status == "ok":
+        n_bugs = len(summary.get("bugs") or [])
+        n_conf = len(summary.get("confluence_pages") or [])
+        n_tr = len(((summary.get("subtasks") or {}).get("testruns")) or [])
+        text = (f"✅ *{ref}* đã đồng bộ — "
+                f"{n_tr} test run, {n_bugs} bug, {n_conf} BRD.")
+    else:
+        text = f":warning: *{ref}* ingest status = `{status}`"
+    _update_or_post(client, channel_id, progress_ts, thread_ts, text, logger)
+    return summary
+
+
+def _update_or_post(client, channel_id, ts, thread_ts, text, logger=None):
+    """chat_update the progress message in place; fall back to a new post."""
+    slack_text = slack_format.to_slack(text)
+    if ts:
+        try:
+            client.chat_update(channel=channel_id, ts=ts, text=slack_text)
+            return
+        except Exception:
+            if logger is not None:
+                logger.exception("chat_update failed")
+    try:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=slack_text)
+    except Exception:
+        if logger is not None:
+            logger.exception("chat_postMessage fallback failed")
 
 
 def _project_for_channel(channel_id, logger=None):
@@ -564,10 +654,30 @@ def build_app():
             say(blocks=_mrkdwn_blocks(usage), text="Usage")
             return
 
+        # Pre-flight ingest for any ticket mentioned in the slash command.
+        # Slash commands don't have a thread context, so post progress to the
+        # channel; hash-gate makes cached tickets return in <1s.
+        channel_id = command.get("channel_id")
+        m = _REQ_RE.search(text)
+        if m:
+            ticket_ref = m.group(1)
+            force_refresh = bool(_FORCE_REFRESH_RE.search(text))
+            project_id = _project_for_channel(channel_id, logger)
+            _ensure_ticket_fresh(
+                client, channel_id, None, ticket_ref, project_id,
+                force=force_refresh, logger=logger,
+            )
+
         # Go-live question -> deterministic go_no_go + (on GO) curator sign-off buttons.
         ref = _golive_intent(text)
         if ref:
             _do_golive(say, ref, logger, channel_id=command.get("channel_id"))
+            return
+
+        # Generate-testcase request -> draft + Approve/Refine buttons.
+        tc_ref = _gen_testcase_intent(text)
+        if tc_ref:
+            _do_gen_testcase(say, tc_ref, logger, channel_id=command.get("channel_id"))
             return
 
         # Generate-testcase request -> draft + Approve/Refine buttons.
@@ -922,6 +1032,18 @@ def build_app():
         ticket_ref = _resolve_thread_ref(
             client, channel_id, thread_ts, clean_text, is_reply, logger
         )
+
+        # Pre-flight ingest: make sure the ticket is in the graph and reasonably
+        # fresh before any tool runs on it. Hash-gate keeps this cheap (~500ms)
+        # when the ticket hasn't changed. `force=True` when the user's message
+        # explicitly asks for a refresh ("cập nhật CDM-268", "refresh", ...).
+        if ticket_ref:
+            force_refresh = bool(_FORCE_REFRESH_RE.search(clean_text))
+            project_id = _project_for_channel(channel_id, logger)
+            _ensure_ticket_fresh(
+                client, channel_id, thread_ts, ticket_ref, project_id,
+                force=force_refresh, logger=logger,
+            )
 
         # Go-live question -> deterministic go_no_go + (on GO) curator sign-off buttons.
         ref = _golive_intent(clean_text, fallback_ref=ticket_ref)
