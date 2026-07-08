@@ -23,7 +23,7 @@ Tieu Kiwi is built agent‑first, in three layers. **Layers A and B run today**:
 
 Live tools: `search_kb`, `coverage_gap`, `trace`, `bug_blast_radius`, `go_no_go`, and
 **`fetch_jira`** (reads a Jira issue and writes it into the graph). The content‑generation tools
-`gen_testcase`, `gen_test_plan`, `gen_critic` are still **skeletons with clear TODOs**. The
+`gen_testcase`, `gen_test_plan` are still **skeletons with clear TODOs**. The
 remaining feedback/learning loop (Layer C) is on the roadmap — see
 [`docs/ROADMAP.md`](docs/ROADMAP.md). This README marks planned pieces explicitly so you always
 know what actually works.

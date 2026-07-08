@@ -7,7 +7,7 @@ description: Reviews a requirement/BRD/PRD/Jira story for ambiguity, undefined e
 
 ## Overview
 
-A requirement is ready for QE only when every acceptance criterion is unambiguous and testable. Flag genuine gaps against the four dimensions below — do not manufacture problems in a well-specified section. A requirement with zero findings across all four dimensions is sufficiently specified; say so and stop.
+A requirement is ready for QE only when every acceptance criterion is unambiguous and testable. Flag genuine gaps against the three dimensions below — do not manufacture problems in a well-specified section. A requirement with zero findings across all three dimensions is sufficiently specified; say so and stop.
 
 ## When to Use
 
@@ -26,11 +26,6 @@ A requirement is ready for QE only when every acceptance criterion is unambiguou
 - Is corner-case numbering complete (no gaps like CC1 → CC3 with no CC2)?
 - Are exact copy strings (toasts, empty states, errors) specified, not paraphrased?
 
-**Ask the PO:**
-- "What should happen if the required data is missing or incomplete?"
-- "Should this be real-time, or can it run in the background?"
-- "What is the expected behaviour when the user has no permission?"
-
 ### 2. Constraints
 
 - Is there a latency or performance requirement?
@@ -38,20 +33,19 @@ A requirement is ready for QE only when every acceptance criterion is unambiguou
 - Is a feature flag or phased rollout expected, and is it explicitly gated?
 - Are timezone/locale-dependent values (e.g. "today + 30 days") anchored to a specific clock?
 
-**Ask the PO:**
-- "Is there a latency requirement (e.g. must respond within 2 seconds)?"
-- "Are there data residency or compliance requirements (e.g. GDPR, region-specific rules)?"
-- "Should this be behind a feature flag for a phased rollout?"
-
 ### 3. Conflicts
 
 - Do any requirements contradict each other?
 - Are priorities between requirements stated?
 - Does a described future-state behavior ("will change to X when Y model ships") leave the current-scope behavior ambiguous?
 
-**Ask the PO:**
-- "Which of these two requirements should win if they conflict?"
-- "Is this future-state behavior in scope now, or gated behind a later flag/version?"
+## Top 3 PO Questions
+
+The single highest-value question per dimension — ask these first when a gap is genuinely unresolved:
+
+1. "What should happen if the required data is missing or incomplete?" (Behaviour)
+2. "Should this be behind a feature flag for a phased rollout?" (Constraints)
+3. "Which of these two requirements should win if they conflict?" (Conflicts)
 
 ## Untestable AC Patterns
 
@@ -86,23 +80,17 @@ A requirement is ready for QE only when every acceptance criterion is unambiguou
 
 ## Turning Findings into PO Questions
 
-Each finding in this rubric maps to a question the PO must answer, not just a complaint. When flagging a gap, phrase the fix as the direct question (see "Ask the PO" per dimension above), so the PO can answer it inline rather than re-deriving what's missing. If the answer would be "TBD" or "unsure," call it an **Open Item** and flag it as a blocker before test-case writing begins — do not let an unresolved answer pass silently as a low-severity note.
+Each finding in this rubric maps to a question the PO must answer, not just a complaint. When flagging a gap, phrase the fix as the direct question (see "Top 3 PO Questions" above), so the PO can answer it inline rather than re-deriving what's missing. If the answer would be "TBD" or "unsure," call it an **Open Item** and flag it as a blocker before test-case writing begins — do not let an unresolved answer pass silently as a low-severity note.
 
 ## Interview Workflow
 
-When these findings feed into an actual PO interview (e.g. via `.claude/agents/brd-clarifier.md`), resolve them in this order — only ask about gaps that are genuinely unresolved, skip what the requirement already answers:
+When these findings feed into an actual PO interview (e.g. via `.claude/agents/brd-clarifier.md`), ask from the Top 3 PO Questions list — only ask about gaps that are genuinely unresolved, skip what the requirement already answers.
 
-### Step 1: Resolve behaviour and edge case gaps
+### Step 1: Resolve the top 3 questions
 
-Ask the Dimension 1 questions (up to 3, drawn from genuinely unresolved gaps).
+Ask up to 3 questions, drawn from genuinely unresolved gaps in priority order (Top 3 PO Questions above), regardless of which dimension each belongs to.
 
-### Step 2: Resolve constraints and non-functional gaps
-
-Ask the Dimension 2 questions (up to 3, drawn from genuinely unresolved gaps).
-
-Fold any Dimension 3 (Conflicts) findings into whichever of Steps 1–2 they relate to — there is no separate conflicts step.
-
-### Step 3: Return clarified requirements block
+### Step 2: Return clarified requirements block
 
 Return the answers as:
 

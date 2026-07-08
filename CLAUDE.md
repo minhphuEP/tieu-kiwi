@@ -235,6 +235,6 @@ Already present: config, db (coverage_gap), rag, agent loop, cli, basic tools (s
 coverage_gap), Postgres via Docker, RAG indexing of skills.
 
 Still to add for a complete wireframe: trace / bug_blast_radius / go_no_go; gen_test_plan /
-gen_testcase / gen_critic; fetch_jira; memory.py (tiers 2, 3); routing.py; tables kb_rules /
+gen_testcase; fetch_jira; memory.py (tiers 2, 3); routing.py; tables kb_rules /
 promotion_queue / thread_state; kb/templates + kb/samples; Layer B (Slack app); Layer C (feedback
 loop + KB promotion). Parts belonging to later deadlines may be left as skeleton + TODO.

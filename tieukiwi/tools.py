@@ -39,57 +39,25 @@ def gen_test_plan(requirement_ref):
     )
 
 
-_CRITIC_SYSTEM = """You are Tieu Kiwi's QE critic. Critique the given PRD/Design/spec
-text for gaps, ambiguity, and missing or untestable acceptance criteria, citing the
-KB review rules below wherever they apply. Flag only genuine issues against those
-rules or basic testability — do not manufacture problems in a well-specified section.
-
-Structure your critique as a numbered list of issues (each tagged with a severity:
-critical/high/medium/low, and a concrete fix), followed by a short verdict."""
-
-
-def gen_critic(text, project_id=None):
-    model = config.model_for("gen_critic")
-    rules = rag.search(text, k=6, project_id=project_id, include_global=True)
-    rules_block = "\n\n".join(
-        f"[{meta.get('parent_doc', doc_id)}"
-        + (f" § {meta['section']}" if meta.get("section") else "")
-        + f"]\n{doc}"
-        for doc_id, doc, meta in rules
-    ) or "(no matching review rules found in the KB)"
-
-    user_msg = f"## KB review rules\n{rules_block}\n\n## Text to critique\n{text}"
-
-    resp = _client.messages.create(
-        model=model,
-        max_tokens=2000,
-        system=_CRITIC_SYSTEM,
-        messages=[{"role": "user", "content": user_msg}],
-    )
-    return {
-        "tool": "gen_critic",
-        "status": "ok",
-        "critique": resp.content[0].text,
-        "rules_used": sorted({meta.get("parent_doc") for _, _, meta in rules}),
-    }
-
-
 _AMBIGUITY_SYSTEM = """You are Tieu Kiwi's requirement-clarity reviewer. Given a
-requirement/BRD/PRD/Jira story below, flag genuine ambiguities against the four
-dimensions in the KB rubric provided (Scope and Ownership, Behaviour and Edge Cases,
-Constraints, Conflicts). Do not manufacture problems in a well-specified section —
-a requirement with zero findings is valid; return an empty list for it.
+requirement/BRD/PRD/Jira story below, flag genuine ambiguities against the three
+dimensions in the KB rubric provided (Behaviour and Edge Cases, Constraints, Conflicts).
+Do not manufacture problems in a well-specified section — a requirement with zero
+findings is valid; return an empty list for it.
 
 Phrase each ambiguity as a direct question the PO can answer inline, per the rubric's
-"Turning Findings into PO Questions" guidance.
+"Turning Findings into PO Questions" guidance. If more than 3 genuine ambiguities are
+found, prioritize the rubric's "Top 3 PO Questions" first — missing/invalid data
+handling, feature-flag/rollout gating, and conflicting-requirement resolution — before
+filling remaining slots with other findings.
 
 Return ONLY valid JSON (no prose, no markdown fences), exactly this shape:
-{"ambiguities": [{"dimension": "Scope and Ownership" | "Behaviour and Edge Cases" | "Constraints" | "Conflicts", "question": "<direct question for the PO>", "gap": "<one-sentence description of what's missing>"}]}
+{"ambiguities": [{"dimension": "Behaviour and Edge Cases" | "Constraints" | "Conflicts", "question": "<direct question for the PO>", "gap": "<one-sentence description of what's missing>"}]}
 
-At most 2 ambiguities per dimension (8 total), the most important ones."""
+At most 2 ambiguities per dimension (6 total), the most important ones."""
 
 # Slack modal input blocks are capped for usability; keep the interview short.
-MAX_AMBIGUITIES = 8
+MAX_AMBIGUITIES = 6
 
 # Claude sometimes wraps JSON output in a ```json fence even when told not to,
 # especially with a long user message (e.g. an expanded Confluence PRD). A bare
@@ -295,7 +263,7 @@ def expand_with_confluence(text):
 
     Jira descriptions often link OUT to the real PRD (an inlineCard) instead of
     containing it inline — see _adf_to_text. Without this, tools like
-    find_ambiguities/gen_critic only ever see the label + URL, never the spec.
+    find_ambiguities only ever sees the label + URL, never the spec.
     """
     if not text:
         return text
@@ -419,15 +387,6 @@ TOOLS = [
     },
   },
   {
-    "name": "gen_critic",
-    "description": "Critique a PRD/Design/spec and flag issues against KB rules. (SKELETON — TODO.)",
-    "input_schema": {
-      "type": "object",
-      "properties": {"text": {"type": "string"}},
-      "required": ["text"],
-    },
-  },
-  {
     "name": "find_ambiguities",
     "description": (
         "Identify genuine ambiguities in a requirement/BRD/PRD/Jira story against the "
@@ -498,8 +457,6 @@ def run_tool(name, args, context=None):
         return gen_testcase(args["requirement_ref"], project_id=project_id)
     if name == "gen_test_plan":
         return gen_test_plan(args["requirement_ref"])
-    if name == "gen_critic":
-        return gen_critic(args["text"], project_id=project_id)
     if name == "find_ambiguities":
         return find_ambiguities(args["text"], project_id=project_id)
     if name == "fetch_jira":

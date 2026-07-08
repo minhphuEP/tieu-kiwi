@@ -37,7 +37,6 @@ DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 # Per-task model overrides. Each falls back to DEFAULT_MODEL when its env var is unset.
 TASK_MODELS = {
     "agent":         os.getenv("MODEL_AGENT") or DEFAULT_MODEL,
-    "gen_critic":    os.getenv("MODEL_GEN_CRITIC") or DEFAULT_MODEL,
     "gen_testcase":  os.getenv("MODEL_GEN_TESTCASE") or DEFAULT_MODEL,
     "gen_test_plan": os.getenv("MODEL_GEN_TEST_PLAN") or DEFAULT_MODEL,
     "find_ambiguities": os.getenv("MODEL_FIND_AMBIGUITIES") or DEFAULT_MODEL,
