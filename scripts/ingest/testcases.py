@@ -255,6 +255,16 @@ def ingest(file_path, project_id, sprint_ref=None, only_sheet=None):
                 "expected": tc["expected"],
                 "raw_rows": tc["raw_rows"],
                 "source_sheet": sheet_name,
+                # This ingest path is a SEED/FAKE fixture — used to populate
+                # TC nodes so go_no_go / coverage_gap can be exercised end-to-
+                # end without waiting for the real prod flow (Slack agent
+                # gen_testcase + mark_reviewed) to produce them one by one.
+                # Because the batch simulates "already-reviewed prod TCs",
+                # stamp `review_status='qe_reviewed'` so strict-mode coverage
+                # counts them as verified. Real prod TCs come in via
+                # gen_testcase with review_status='draft' and only advance
+                # via mark_reviewed.
+                "review_status": "qe_reviewed",
                 "_meta": {
                     "extraction_source": "excel-import" if ext == ".xlsx" else "csv-import",
                     "confidence": 1.0,

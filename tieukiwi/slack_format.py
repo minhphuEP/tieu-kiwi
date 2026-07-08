@@ -541,13 +541,23 @@ def _golive_decision_lines(res):
     decision = res.get("decision")
     req = res.get("requirement")
     icon = ":large_green_circle:" if decision == "GO" else ":red_circle:"
-    gaps = res.get("coverage_gaps") or []
+    # Split gap counts so QE sees "3 uncovered · 2 awaiting review" instead of
+    # a single number that hides how much is truly unwritten vs just unreviewed.
+    # Falls back gracefully for callers still returning the pre-split shape.
+    uncovered = res.get("coverage_uncovered")
+    awaiting = res.get("coverage_awaiting_review") or []
+    if uncovered is None:
+        uncovered = res.get("coverage_gaps") or []
     fails = res.get("failing_tests") or []
     bugs = res.get("open_bugs") or []
+
+    gap_bits = [f"{len(uncovered)} coverage gap(s)"]
+    if awaiting:
+        gap_bits.append(f"{len(awaiting)} awaiting QE review")
     return [
         f"{icon} *Go/No-Go — {req}: {decision}*",
         "",
-        f":test_tube: {len(gaps)} coverage gap(s) · "
+        f":test_tube: {' · '.join(gap_bits)} · "
         f":x: {len(fails)} failing test(s) · "
         f":lady_beetle: {len(bugs)} open bug(s)",
     ]

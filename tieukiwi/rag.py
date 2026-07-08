@@ -154,6 +154,22 @@ def wipe():
     _col = None
 
 
+def delete_by_parent_doc(parent_doc):
+    """Remove every chunk whose metadata.parent_doc == parent_doc.
+
+    Needed when a source doc SHRINKS: index_docs upserts chunk ids
+    <parent_doc>#c0..N, so re-indexing a shorter body overwrites 0..M but
+    leaves M+1..N behind as stale vectors. Call this before re-index to
+    make Chroma reflect the current body exactly.
+    """
+    if not parent_doc:
+        return
+    try:
+        _get_col().delete(where={"parent_doc": parent_doc})
+    except Exception:
+        pass
+
+
 def search(query, k=4, project_id=None, role=None, doc_type=None, include_global=False):
     """Semantic search with structural filters.
 

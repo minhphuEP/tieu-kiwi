@@ -29,9 +29,21 @@ _GOLIVE_RE = re.compile(r"go[\s\-]?live|đủ điều kiện|release|go\s*/?\s*n
 # A Jira-style requirement ref, e.g. FRONT-3494.
 _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
 # Force-refresh intent: user asks to update the ticket from Jira, bypassing
-# the ingest hash-gate. Matches Vietnamese + English phrasings.
+# the ingest hash-gate. Matches Vietnamese + English phrasings — both the
+# explicit "refresh please" and the casual "PO đã update, xem lại đi" that
+# QE types when a PRD changes on Confluence.
+#
+# The `(?:\s+được)?` insertion tolerates the Vietnamese passive marker so
+# "PRD đã ĐƯỢC update" still matches. "chạy lại" catches the one-liner
+# "chạy lại đi" that QE uses to trigger a re-ingest.
 _FORCE_REFRESH_RE = re.compile(
-    r"cập\s*nhật|làm\s*mới|đồng\s*bộ|refresh|resync|re-?fetch|reload|mới\s*nhất",
+    r"cập\s*nhật|làm\s*mới|đồng\s*bộ|refresh|resync|re-?fetch|reload|mới\s*nhất"
+    r"|(?:đã|vừa|mới|đang)(?:\s+được)?\s+(?:update|updated|sửa|chỉnh|thay\s*đổi|edit)"
+    r"|được\s+(?:update|updated)"
+    r"|(?:xem|review|check|chạy|run)\s+lại"
+    r"|(?:prd|brd|requirement|req|spec)\s+(?:mới|đã(?:\s+được)?\s*update"
+        r"|vừa(?:\s+được)?\s*update|updated|changed)"
+    r"|just\s+updated|please\s+re-?review|re-?check|re-?run",
     re.I,
 )
 
@@ -362,6 +374,19 @@ def _ensure_ticket_fresh(client, channel_id, thread_ts, ref, project_id,
         n_tr = len(((summary.get("subtasks") or {}).get("testruns")) or [])
         text = (f"✅ *{ref}* đã đồng bộ — "
                 f"{n_tr} test run, {n_bugs} bug, {n_conf} BRD.")
+        # AC diff line — only present when the AC-extract pass actually ran
+        # (summary.acs_kept is set by _diff_and_upsert_acs). Triggered by
+        # extract_acs=True OR by BRD drift auto-elevation inside
+        # ingest_jira_ticket.
+        ac_kept = summary.get("acs_kept")
+        if ac_kept is not None:
+            ac_created = len(summary.get("acs_extracted") or [])
+            ac_obsolete = len(summary.get("acs_obsoleted") or [])
+            if ac_created or ac_obsolete:
+                text += (f"\n📋 AC diff: *+{ac_created}* mới, "
+                         f"{ac_kept} giữ nguyên, *−{ac_obsolete}* obsolete.")
+            else:
+                text += f"\n📋 AC không đổi ({ac_kept} AC giữ nguyên)."
     else:
         text = f":warning: *{ref}* ingest status = `{status}`"
     _update_or_post(client, channel_id, progress_ts, thread_ts, text, logger)

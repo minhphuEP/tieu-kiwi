@@ -186,6 +186,11 @@ def fetch_confluence(page_id, project_id=None, section_anchor=None):
             "brd_ref": ref,
             "path": full_url,
         }
+        # Delete stale chunks first. index_docs upserts by <ref>#c<i>, so a
+        # shorter new body leaves the tail chunks of the old body lingering
+        # in Chroma — search_kb would then retrieve text the PO already
+        # removed from the PRD.
+        rag.delete_by_parent_doc(ref)
         # rag.index_docs is heading-aware; each chunk gets its own `section` meta
         rag.index_docs([(ref, body_text, meta)])
         # Recount: rag doesn't return chunk count, but we can approximate.

@@ -501,21 +501,51 @@ def record_golive_decision(requirement_ref, decision, approver, reason=None):
 HIGH_SEVERITIES = ("critical", "high")
 
 
-def _uncovered_acs(c, requirement_ref=None, project_id=None):
+# TestCase review_status values that DO count as coverage in strict mode —
+# i.e. at least a QE has approved the TC. Drafts, "waiting-for-QE" pending
+# states, and rejected TCs do NOT count.
+#   qe_reviewed   QE has approved (waiting for lead)
+#   lead_pending  lead started reviewing (QE already approved)
+#   lead_approved fully approved
+_VERIFIED_TC_STATES = ("qe_reviewed", "lead_pending", "lead_approved")
+
+
+def _uncovered_acs(c, requirement_ref=None, project_id=None, strict=False):
     # AcceptanceCriterion not coveredBy any TestCase → coverage gap.
     # Ontology: Requirement -has-> AcceptanceCriterion -coveredBy-> TestCase,
     # so an AC is the src of its 'coveredBy' edge.
     # - requirement_ref: scope to that requirement's ACs.
     # - project_id: restrict to ACs belonging to that project (prevents cross-tenant leak).
-    sql = """
-    SELECT ac.id, ac.ref FROM nodes ac
-    WHERE ac.type='AcceptanceCriterion'
-      AND NOT EXISTS (
+    # - strict: when True, an AC counts as covered ONLY if it has a coveredBy
+    #   edge to a TestCase whose props_json.review_status is in
+    #   _VERIFIED_TC_STATES. Drafts / pending / rejected TCs don't count.
+    #   Default False preserves backward-compat with callers that want raw
+    #   "has-any-TC" gaps.
+    if strict:
+        # COALESCE(review_status, 'qe_reviewed'): legacy TC nodes ingested
+        # before the strict-mode rollout have no review_status set. Rather
+        # than force a data migration, we treat NULL as "verified enough" —
+        # only explicit values ('draft', 'qe_pending', 'rejected') exclude a
+        # TC from coverage. New gen_testcase TCs MUST set 'draft' explicitly.
+        cov_exists = """
+        SELECT 1 FROM edges cov
+        JOIN nodes tc ON tc.id = cov.dst_id AND tc.type='TestCase'
+        WHERE cov.src_id=ac.id AND cov.rel='coveredBy'
+          AND COALESCE(tc.props_json->>'review_status', 'qe_reviewed') = ANY(%s)
+        """
+    else:
+        cov_exists = """
         SELECT 1 FROM edges cov
         WHERE cov.src_id=ac.id AND cov.rel='coveredBy'
-      )
+        """
+    sql = f"""
+    SELECT ac.id, ac.ref FROM nodes ac
+    WHERE ac.type='AcceptanceCriterion'
+      AND NOT EXISTS ({cov_exists})
     """
     params = []
+    if strict:
+        params.append(list(_VERIFIED_TC_STATES))
     if project_id is not None:
         sql += " AND ac.project_id=%s"
         params.append(project_id)
@@ -531,15 +561,18 @@ def _uncovered_acs(c, requirement_ref=None, project_id=None):
     return c.execute(sql, params).fetchall()
 
 
-def coverage_gap(project_id=None):
+def coverage_gap(project_id=None, strict=False):
     """List AC nodes without any coveredBy edge.
 
     Args:
       project_id: if given, restrict to ACs belonging to that project (multi-tenant
                   isolation). None (default) = global.
+      strict: when True, only TestCases in _VERIFIED_TC_STATES count as coverage —
+              drafts / pending / rejected TCs are ignored. Use for gating decisions
+              like go_no_go. Default False keeps the raw "any TC" behaviour.
     """
     with conn() as c:
-        return _uncovered_acs(c, project_id=project_id)
+        return _uncovered_acs(c, project_id=project_id, strict=strict)
 
 
 import re as _re
@@ -612,17 +645,35 @@ def _view_requirement(c, node_id, ref, props):
         "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion' ORDER BY ac.ref",
         (node_id,),
     ).fetchall():
-        tc_refs = [r[0] for r in c.execute(
-            "SELECT tc.ref FROM nodes tc "
+        # Pull the TC props alongside its ref so the caller (LLM / Slack) can
+        # render title + review_status + priority without a follow-up call.
+        # Legacy TCs without review_status get COALESCE'd to 'qe_reviewed'
+        # (same rule as strict-coverage in _uncovered_acs).
+        tc_rows = c.execute(
+            "SELECT tc.ref, tc.props_json FROM nodes tc "
             "JOIN edges cov ON cov.dst_id=tc.id AND cov.rel='coveredBy' "
             "WHERE cov.src_id=%s AND tc.type='TestCase' ORDER BY tc.ref",
             (ac_id,),
-        ).fetchall()]
+        ).fetchall()
+        testcases = []
+        for tc_ref, tc_props in tc_rows:
+            tp = tc_props or {}
+            testcases.append({
+                "ref": tc_ref,
+                "title": tp.get("title"),
+                "review_status": tp.get("review_status") or "qe_reviewed",
+                "priority": tp.get("priority"),
+            })
         p = ac_props or {}
         acs.append({
             "ref": ac_ref, "title": p.get("title"),
             "detail": p.get("detail") or p.get("desc"),
-            "coverage": {"has_testcase": bool(tc_refs), "testcase_refs": tc_refs},
+            "coverage": {
+                "has_testcase": bool(testcases),
+                "testcases": testcases,
+                # Legacy: bare-ref list kept for any older caller that reads it.
+                "testcase_refs": [t["ref"] for t in testcases],
+            },
         })
 
     warnings = []
@@ -1025,6 +1076,12 @@ def go_no_go(requirement_ref, project_id=None):
       project_id: if given, all sub-queries scope to that project (multi-tenant).
                   Returns decision='NOT_FOUND' if the requirement doesn't exist
                   in that project.
+
+    Coverage semantics — STRICT: only TestCases in _VERIFIED_TC_STATES count.
+    Drafts / rejected TCs don't cover ACs for gating decisions (they would
+    inflate coverage and lead to false GO calls). ACs with only draft/pending
+    TCs surface under `coverage_awaiting_review` so QE knows what to review,
+    but the decision itself is NO-GO until those TCs advance past QE review.
     """
     with conn() as c:
         exists_sql = "SELECT id FROM nodes WHERE type='Requirement' AND ref=%s"
@@ -1038,25 +1095,77 @@ def go_no_go(requirement_ref, project_id=None):
                 "requirement": requirement_ref,
                 "decision": "NOT_FOUND",
                 "coverage_gaps": [],
+                "coverage_uncovered": [],
+                "coverage_awaiting_review": [],
                 "failing_tests": [],
                 "open_bugs": [],
                 "next_actions": [f"Requirement '{requirement_ref}' not found{scope}"],
             }
 
-        gaps = _uncovered_acs(c, requirement_ref, project_id=project_id)
+        # Strict gaps: AC has NO verified TC covering it.
+        strict_gaps = _uncovered_acs(c, requirement_ref,
+                                     project_id=project_id, strict=True)
+        # Loose gaps: AC has no TC at all (not even a draft).
+        loose_gaps = _uncovered_acs(c, requirement_ref,
+                                    project_id=project_id, strict=False)
+
+        # Fetch AC text for every gap ref in one round-trip so next_actions
+        # can render "AC-X — <what it says>" instead of just an opaque hash.
+        # AC titles live in different props keys depending on the ingest
+        # source: LLM diff writes `desc`, scripts/ingest/requirements.py
+        # writes `title` (+ `detail`). COALESCE picks whichever is present.
+        gap_refs = {ac_ref for _id, ac_ref in strict_gaps}
+        gap_refs |= {ac_ref for _id, ac_ref in loose_gaps}
+        ac_text = {}
+        if gap_refs:
+            title_sql = (
+                "SELECT ref, "
+                "COALESCE(props_json->>'title', "
+                "         props_json->>'desc', "
+                "         props_json->>'detail', '') AS text "
+                "FROM nodes WHERE type='AcceptanceCriterion' "
+                "AND ref = ANY(%s)"
+            )
+            title_params = [list(gap_refs)]
+            if project_id is not None:
+                title_sql += " AND project_id=%s"
+                title_params.append(project_id)
+            for r, t in c.execute(title_sql, title_params).fetchall():
+                ac_text[r] = (t or "").strip()
     failing = failing_tests_for(requirement_ref, project_id=project_id)
     bugs = open_bugs_for(requirement_ref, project_id=project_id)
 
-    coverage_gaps = [ac_ref for _id, ac_ref in gaps]
+    # Set arithmetic: strict-gap MINUS loose-gap = ACs that have a TC but
+    # NO verified TC → those are awaiting review, not truly uncovered.
+    loose_refs = {ac_ref for _id, ac_ref in loose_gaps}
+    strict_refs = {ac_ref for _id, ac_ref in strict_gaps}
+    truly_uncovered = sorted(loose_refs)
+    awaiting_review = sorted(strict_refs - loose_refs)
+
     failing_tests = [{"testrun": tr_ref, "testcase": tc_ref} for tr_ref, tc_ref in failing]
     open_bugs = [{"bug": b_ref, "severity": sev} for b_ref, sev in bugs]
 
     has_high_bug = any((sev or "").lower() in HIGH_SEVERITIES for _b, sev in bugs)
-    decision = "GO" if (not coverage_gaps and not failing_tests and not has_high_bug) else "NO-GO"
+    # Awaiting-review ACs still block GO — reviewing draft TCs is real work,
+    # not a rubber stamp. QE gets a distinct next_action for those vs writing
+    # a TC from scratch.
+    blocks = bool(truly_uncovered or awaiting_review or failing_tests or has_high_bug)
+    decision = "NO-GO" if blocks else "GO"
+
+    def _fmt_ac(ac_ref):
+        # "AC-CDM-268-a1b2c3d4 — 'User can reset password via SMS'" when text
+        # is known; falls back to bare ref if the AC row is missing / empty.
+        text = ac_text.get(ac_ref, "")
+        if not text:
+            return ac_ref
+        snippet = text if len(text) <= 100 else text[:97].rstrip() + "…"
+        return f"{ac_ref} — “{snippet}”"
 
     next_actions = []
-    for ac_ref in coverage_gaps:
-        next_actions.append(f"Write a testcase for {ac_ref}")
+    for ac_ref in truly_uncovered:
+        next_actions.append(f"Write a testcase for {_fmt_ac(ac_ref)}")
+    for ac_ref in awaiting_review:
+        next_actions.append(f"Review draft testcase(s) covering {_fmt_ac(ac_ref)}")
     for ft in failing_tests:
         next_actions.append(f"Fix failing testcase {ft['testcase']} (run {ft['testrun']})")
     for ob in open_bugs:
@@ -1065,7 +1174,12 @@ def go_no_go(requirement_ref, project_id=None):
     return {
         "requirement": requirement_ref,
         "decision": decision,
-        "coverage_gaps": coverage_gaps,
+        # Backward-compat: `coverage_gaps` is the strict set (union of truly
+        # uncovered + awaiting review) so old callers still see the total
+        # blocking count. New callers use the split fields.
+        "coverage_gaps": truly_uncovered + awaiting_review,
+        "coverage_uncovered": truly_uncovered,
+        "coverage_awaiting_review": awaiting_review,
         "failing_tests": failing_tests,
         "open_bugs": open_bugs,
         "next_actions": next_actions,

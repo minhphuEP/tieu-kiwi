@@ -381,6 +381,35 @@ def _upsert_testrun(subtask_key, subtask_summary, env, project_id):
     return node_id
 
 
+# Vietnamese diacritics — presence means the field is likely Vietnamese and
+# needs translation. Skips the LLM call when a bug row is already in English.
+_VN_DIACRITIC_RE = re.compile(
+    r"[àáảãạăằắẳẵặâầấẩẫậèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵđ"
+    r"ÀÁẢÃẠĂẰẮẲẴẶÂẦẤẨẪẬÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴĐ]"
+)
+
+
+def _maybe_translate_bug_field(text):
+    """Translate a bug-table cell to English when it looks Vietnamese.
+
+    Returns the input verbatim when: empty, non-string, or has no Vietnamese
+    diacritics (heuristic — misses VN written without accents, which is rare
+    in QE bug reports). LLM errors fall back to the original text and log a
+    warning so a translate outage never blocks bug ingest.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    if not _VN_DIACRITIC_RE.search(text):
+        return text
+    try:
+        from .llm import translate_to_english
+        return translate_to_english(text)
+    except Exception as e:
+        print(f"[warn] Bug field translate-to-English failed, "
+              f"storing original text: {e}")
+        return text
+
+
 def _upsert_bugs_from_table(container_key, container_summary, parent_story_key,
                             bugs, project_id, component_ids):
     """Materialise N Bug nodes from parsed table rows.
@@ -389,6 +418,11 @@ def _upsert_bugs_from_table(container_key, container_summary, parent_story_key,
       Bug -affects-> each Component in component_ids
       find_by=Testcase → TR (self-test of parent story) -finds-> Bug  (best-effort;
         we don't know exact TR — leave optional linking to orchestrator)
+
+    Free-text fields (summary, steps, actual, expected) are translated to
+    English on the way in — Postgres storage contract is English-only for
+    extracted artifacts.
+
     Returns list[(row_idx, node_id, ref)].
     """
     out = []
@@ -396,7 +430,7 @@ def _upsert_bugs_from_table(container_key, container_summary, parent_story_key,
         ref = f"{container_key}-{idx}"
         node_id = db.upsert_node_by_ref("Bug", ref, {
             **_meta_jira(container_key),
-            "summary": bug["summary"],
+            "summary": _maybe_translate_bug_field(bug["summary"]),
             "severity": bug["severity"] or "medium",
             "status": bug["status"] or "open",
             "find_by": bug["find_by"],
@@ -405,9 +439,9 @@ def _upsert_bugs_from_table(container_key, container_summary, parent_story_key,
             "jira_container_summary": container_summary,
             "jira_parent_ref": parent_story_key,
             "description": {
-                "steps": bug["steps"],
-                "actual": bug["actual"],
-                "expected": bug["expected"],
+                "steps": _maybe_translate_bug_field(bug["steps"]),
+                "actual": _maybe_translate_bug_field(bug["actual"]),
+                "expected": _maybe_translate_bug_field(bug["expected"]),
             },
         }, project_id=project_id)
         for cid in component_ids:
@@ -619,6 +653,12 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
                     stale = _check_brd_freshness(existing["id"], on_step=_sub)
                     if stale:
                         _sub(f"PRD update trên Confluence ({stale}) → full ingest.")
+                        # PRD drift is the primary trigger for AC extract — we
+                        # can't tell if the AC set changed without running it.
+                        # Force extract_acs=True regardless of what the caller
+                        # passed, so `_diff_and_upsert_acs` reconciles new /
+                        # kept / obsolete ACs and the summary lands in Slack.
+                        extract_acs = True
                         # fall through — do not return cached_fresh
                     else:
                         _sub("Hash unchanged + BRD fresh, skipping full ingest.")
