@@ -130,8 +130,7 @@ def _detect_switch_target(clean_text):
     m = _REQ_RE.search(clean_text)
     if not m:
         return None
-    new_ref = m.group(1).upper()
-    return new_ref if new_ref != sticky_ref else None
+    return m.group(1).upper()
 
 def _switch_refusal_text(prior_sticky, switch_target):
     # Compose the refusal message for a thread-reassignment attempt.
@@ -339,10 +338,13 @@ def _ensure_ticket_fresh(client, channel_id, thread_ts, ref, project_id,
     try:
         summary = jira_ingest.ingest_jira_ticket(
             ref, project_id=project_id, force=force,
-            # Skip LLM AC extraction on Slack pre-flight — it costs 5-15s and
-            # ACs rarely block the go/no-go answer. First cold-ingest via CLI
-            # or a dedicated command should still run with extract_acs=True.
-            extract_acs=False,
+            # Extract ACs on every fresh ingest (first-time or force). The +5-15s
+            # only hits when the ticket is genuinely new to the graph — cached
+            # tickets short-circuit at the hash-gate before Step 5 ever runs.
+            # Without this, ACs are never populated from Slack, and downstream
+            # tools (coverage_gap, go_no_go, get_ticket) report the ticket as
+            # having 0 ACs.
+            extract_acs=True,
         )
     except Exception as e:
         if logger is not None:
@@ -672,12 +674,6 @@ def build_app():
         ref = _golive_intent(text)
         if ref:
             _do_golive(say, ref, logger, channel_id=command.get("channel_id"))
-            return
-
-        # Generate-testcase request -> draft + Approve/Refine buttons.
-        tc_ref = _gen_testcase_intent(text)
-        if tc_ref:
-            _do_gen_testcase(say, tc_ref, logger, channel_id=command.get("channel_id"))
             return
 
         # Generate-testcase request -> draft + Approve/Refine buttons.
