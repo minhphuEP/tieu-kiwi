@@ -297,6 +297,7 @@ def generate_draft(requirement_ref, project_id=None, llm_fn=None):
         "requirement_ref": requirement_ref,
         "project_id": project_id,
         "version": 1,
+        "acs": prd["acs"],
         "testcases": testcases,
         "summary": raw.get("summary", ""),
     }
@@ -331,10 +332,18 @@ def refine_draft(state, comment, llm_fn=None):
         testcases = _validate_testcases(raw["testcases"])
         testcases = _merge_returned(state["testcases"], testcases, raw.get("deleted_refs"))
         summary = raw.get("summary", "")
+    acs = state.get("acs")
+    if acs is None:
+        # Thread state from before `acs` was carried in the draft — fall back
+        # to a fresh lookup rather than losing AC coverage rendering for
+        # in-flight drafts started before this change.
+        prd = db.requirement_with_acs(state["requirement_ref"], project_id=state.get("project_id"))
+        acs = prd.get("acs", [])
     return {
         "requirement_ref": state["requirement_ref"],
         "project_id": state.get("project_id"),
         "version": state["version"] + 1,
+        "acs": acs,
         "testcases": testcases,
         "summary": summary,
     }

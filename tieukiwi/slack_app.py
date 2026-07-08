@@ -277,17 +277,33 @@ def _chunk_mrkdwn(text, limit=_SECTION_CHAR_LIMIT):
 
 
 def _testcase_draft_blocks(draft):
-    text = slack_format.render_testcase_draft(draft)
-    chunks = _chunk_mrkdwn(text)
+    # Kept intentionally light: full per-testcase detail (steps, precondition,
+    # data tables, API fields) lives in the exported Excel file only, so the
+    # Slack message stays a quick "does this look complete" scan, not a wall
+    # of text the reviewer has to read through.
+    acs = draft.get("acs") or []
+    intro = (
+        f":sparkles: Đây là bộ Draft test cases cho `{draft['requirement_ref']}` (v{draft['version']}) "
+        f"- {len(draft['testcases'])} test case cho {len(acs)} Acceptance Criteria — file Excel đầy "
+        "đủ đã được đính kèm ngay dưới đây:point_down:\n"
+        "Bạn review file Excel rồi bấm :white_check_mark: Approve nếu ok, hoặc :arrows_counterclockwise: "
+        "Refine kèm comment nếu muốn mình chỉnh sửa thêm nhé! :raised_hands:"
+    )
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": intro}},
+        {"type": "divider"},
+    ]
+    coverage_text = slack_format.render_ac_list(acs)
+    chunks = _chunk_mrkdwn(coverage_text)
     truncated = len(chunks) > _MAX_SECTION_BLOCKS
     if truncated:
         chunks = chunks[:_MAX_SECTION_BLOCKS]
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in chunks]
+    blocks.extend({"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in chunks)
     if truncated:
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                       "text": ":warning: _Draft too long to display in full — showing the first "
-                               f"{_MAX_SECTION_BLOCKS} sections. Approve to get the complete list "
-                               "in the exported Excel file._"}})
+                       "text": ":warning: _Danh sách AC dài quá giới hạn hiển thị — xem đầy đủ trong "
+                               "file Excel._"}})
+    blocks.append({"type": "divider"})
     blocks.append({
             "type": "actions",
             "block_id": f"tc_{draft['requirement_ref']}_{draft['version']}",
@@ -303,7 +319,46 @@ def _testcase_draft_blocks(draft):
     return blocks
 
 
-def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
+def _upload_draft_excel(client, channel_id, thread_ts, testcases, filename,
+                         comment, error_context, logger=None):
+    """Export testcases to the QE Excel template (tieukiwi/testcase_export.py)
+    and upload to the thread. Best-effort: failures are reported in-thread
+    rather than raised, since callers use this alongside a draft/approval
+    message that has already been posted successfully.
+
+    Returns the uploaded file's id (so a later refine/approve can retire it
+    via _delete_superseded_excel), or None if nothing was uploaded."""
+    if not testcases:
+        return None
+    try:
+        xlsx_bytes = testcase_export.export_excel(testcases)
+        result = client.files_upload_v2(channel=channel_id, thread_ts=thread_ts,
+                                         filename=filename, content=xlsx_bytes,
+                                         initial_comment=comment)
+        return (result.get("file") or {}).get("id")
+    except Exception as e:
+        if logger is not None:
+            logger.exception("export/upload failed")
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                 text=slack_format.to_slack(f":warning: {error_context}: {e}"))
+        return None
+
+
+def _delete_superseded_excel(client, file_id, logger=None):
+    # Retire the previous draft's Excel file once a newer version (refine or
+    # approve) has its own file posted, so the thread doesn't accumulate a
+    # stale file per round. Best-effort — a failure here shouldn't block the
+    # new draft/approval, which has already succeeded by the time this runs.
+    if not file_id:
+        return
+    try:
+        client.files_delete(file=file_id)
+    except Exception:
+        if logger is not None:
+            logger.exception("deleting superseded draft excel failed")
+
+
+def _do_gen_testcase(say, client, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     project_id = _project_for_channel(channel_id, logger)
     try:
         draft = testcase_gen.generate_draft(requirement_ref, project_id=project_id)
@@ -316,8 +371,16 @@ def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_
     posted = say(blocks=_testcase_draft_blocks(draft),
                  text=f"Draft test cases for {requirement_ref}", **kwargs)
     anchor_ts = thread_ts or posted["ts"]
+    excel_file_id = _upload_draft_excel(
+        client, channel_id, anchor_ts, draft["testcases"],
+        filename=f"{requirement_ref}_testcases_v{draft['version']}.xlsx",
+        comment=f":page_facing_up: Draft test cases (v{draft['version']}) — "
+                f"{len(draft['testcases'])} testcase(s).",
+        error_context="Excel export for this draft failed", logger=logger,
+    )
     memory.save_thread_state(channel_id, anchor_ts,
-                              {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **draft})
+                              {"flow": "gen_testcase", "draft_message_ts": posted["ts"],
+                               "excel_file_id": excel_file_id, **draft})
 
 
 def _do_discard_testcase(say, client, thread_ts, channel_id, user_id, logger=None):
@@ -435,7 +498,7 @@ def build_app():
         # Generate-testcase request -> draft + Approve/Refine buttons.
         tc_ref = _gen_testcase_intent(text)
         if tc_ref:
-            _do_gen_testcase(say, tc_ref, logger, channel_id=command.get("channel_id"))
+            _do_gen_testcase(say, client, tc_ref, logger, channel_id=command.get("channel_id"))
             return
 
         # 3) Otherwise: call the Layer A agent (shared helper) and post the result.
@@ -606,24 +669,16 @@ def build_app():
             )
         except Exception:
             logger.exception("removing tc_approve buttons failed")
-        try:
-            xlsx_bytes = testcase_export.export_excel(state["testcases"])
-            client.files_upload_v2(
-                channel=channel_id, thread_ts=thread_ts,
-                filename=f"{state['requirement_ref']}_testcases.xlsx",
-                content=xlsx_bytes,
-                initial_comment=f":white_check_mark: Approved by <@{user}> "
-                                 f"(v{state['version']}) — {len(state['testcases'])} testcase(s) saved.",
-            )
-        except Exception as e:
-            logger.exception("export/upload failed")
-            client.chat_postMessage(
-                channel=channel_id, thread_ts=thread_ts,
-                text=slack_format.to_slack(
-                    f":warning: {len(state['testcases'])} testcase(s) were saved successfully, "
-                    f"but exporting/uploading the Excel file failed: {e}"
-                ),
-            )
+        _upload_draft_excel(
+            client, channel_id, thread_ts, state["testcases"],
+            filename=f"{state['requirement_ref']}_testcases_v{state['version']}_approved.xlsx",
+            comment=f":white_check_mark: Approved by <@{user}> "
+                    f"(v{state['version']}) — {len(state['testcases'])} testcase(s) saved.",
+            error_context=f"{len(state['testcases'])} testcase(s) were saved successfully, "
+                          "but exporting/uploading the Excel file failed",
+            logger=logger,
+        )
+        _delete_superseded_excel(client, state.get("excel_file_id"), logger=logger)
 
     @app.action("tc_refine")
     def handle_tc_refine(ack, body, client, logger):
@@ -707,8 +762,17 @@ def build_app():
             blocks=_testcase_draft_blocks(refined),
             text=f"Draft test cases for {refined['requirement_ref']} (v{refined['version']})",
         )
+        excel_file_id = _upload_draft_excel(
+            client, channel_id, thread_ts, refined["testcases"],
+            filename=f"{refined['requirement_ref']}_testcases_v{refined['version']}.xlsx",
+            comment=f":page_facing_up: Draft test cases (v{refined['version']}) — "
+                    f"{len(refined['testcases'])} testcase(s).",
+            error_context="Excel export for this draft failed", logger=logger,
+        )
+        _delete_superseded_excel(client, state.get("excel_file_id"), logger=logger)
         memory.save_thread_state(channel_id, thread_ts,
-                                  {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **refined})
+                                  {"flow": "gen_testcase", "draft_message_ts": posted["ts"],
+                                   "excel_file_id": excel_file_id, **refined})
 
     @app.event("app_mention")
     def handle_app_mention(event, body, say, client, logger):
@@ -757,7 +821,7 @@ def build_app():
         # Generate-testcase request -> draft + Approve/Refine buttons.
         tc_ref = _gen_testcase_intent(clean_text)
         if tc_ref:
-            _do_gen_testcase(say, tc_ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
+            _do_gen_testcase(say, client, tc_ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
             return
 
         answer = handle_question(clean_text, logger)
