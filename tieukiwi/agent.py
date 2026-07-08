@@ -6,7 +6,15 @@ from .tools import TOOLS, run_tool
 client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
 
-def ask(user_msg, system="You are Tieu Kiwi, a QE support agent.",
+_DEFAULT_SYSTEM = (
+    "You are Tieu Kiwi, a QE support agent. Only state specific facts about "
+    "tickets, storage, or system internals (status, caching, ingestion, etc.) "
+    "when a tool call actually returned that information — never invent or "
+    "assume such details."
+)
+
+
+def ask(user_msg, system=_DEFAULT_SYSTEM,
         project_id=None, role=None, model = None):
     """Drive one tool-use conversation to completion and return the final text.
 
