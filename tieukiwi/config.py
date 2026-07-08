@@ -37,9 +37,9 @@ DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 # Per-task model overrides. Each falls back to DEFAULT_MODEL when its env var is unset.
 TASK_MODELS = {
     "agent":         os.getenv("MODEL_AGENT") or DEFAULT_MODEL,
-    "gen_critic":    os.getenv("MODEL_GEN_CRITIC") or DEFAULT_MODEL,
     "gen_testcase":  os.getenv("MODEL_GEN_TESTCASE") or DEFAULT_MODEL,
     "gen_test_plan": os.getenv("MODEL_GEN_TEST_PLAN") or DEFAULT_MODEL,
+    "find_ambiguities": os.getenv("MODEL_FIND_AMBIGUITIES") or DEFAULT_MODEL,
 }
 
 
@@ -52,6 +52,14 @@ def model_for(task):
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
+
+# --- Confluence (PRD pages linked from Jira descriptions) ---
+# Same Atlassian Cloud site as Jira by default (https://<site>.atlassian.net/wiki).
+# Auth reuses JIRA_EMAIL + JIRA_API_TOKEN. Override CONFLUENCE_BASE_URL in .env
+# only if Confluence lives on a different host than Jira.
+CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL") or (
+    f"{JIRA_BASE_URL.rstrip('/')}/wiki" if JIRA_BASE_URL else None
+)
 
 # --- Slack (Layer B, Socket Mode) ---
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
