@@ -38,6 +38,17 @@ def save_thread_state(channel_id, thread_ts, state):
         c.execute(sql, (channel_id, thread_ts, psycopg.types.json.Json(state or {})))
 
 
+def delete_thread_state(channel_id, thread_ts):
+    # Discard the per-thread state blob (e.g. user cancels an in-progress review loop).
+    # Returns True iff a row was actually removed — callers should treat False as
+    # "nothing to discard" rather than reporting success (guards against a
+    # duplicate/racing discard call finding the row already gone).
+    sql = "DELETE FROM thread_state WHERE channel_id=%s AND thread_ts=%s"
+    with db.conn() as c:
+        cur = c.execute(sql, (channel_id, thread_ts))
+        return cur.rowcount > 0
+
+
 # --- Tier 3: per-user memory (TODO, later) ---
 
 def get_user_memory(user_id):

@@ -116,11 +116,11 @@ def collect_docs():
             }
             if base == "kb":
                 metadata.update(infer_kb_metadata(f))
-            elif base == "skills":
-                # skills/ rubrics are Tier 1 shared KB — visible to every project,
-                # same as kb/_global/. Without scope="global", rag.search's
-                # {project_id} OR {scope: global} filter matches neither and the
-                # doc is invisible to every project-scoped call (gen_critic, search_kb).
+            else:
+                # skills/ docs are role-agnostic, project-agnostic knowledge —
+                # mark them scope="global" so rag.search(..., project_id=X,
+                # include_global=True) can still find them (its $or clause
+                # requires either a matching project_id or scope="global").
                 metadata["scope"] = "global"
                 metadata["doc_type"] = "reference"
 

@@ -5,7 +5,7 @@ from html import unescape
 import httpx
 from anthropic import Anthropic
 
-from . import config, db, rag
+from . import config, db, rag, testcase_gen
 
 _client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -18,13 +18,17 @@ def _not_implemented(tool, todo):
     return {"tool": tool, "status": "not_implemented", "todo": todo}
 
 
-def gen_testcase(requirement_ref):
-    model = config.model_for("gen_testcase")  # TODO: pass into the Claude call when implemented
-    # TODO: load requirement + ACs (db.trace) and relevant KB (rag.search),
-    # then call the Claude API (model=model) to draft TestCase nodes; return proposed testcases.
-    return _not_implemented(
-        "gen_testcase", "Generate testcases via Claude from requirement + KB context."
-    )
+def gen_testcase(requirement_ref, project_id=None):
+    """Draft (or update) testcases for a requirement. Returns the draft dict from
+    testcase_gen.generate_draft — plain-chat use (no Slack Approve/Refine loop;
+    that loop is driven directly from tieukiwi/slack_app.py, see docs/Gen-testcase-design.md).
+    Returns a {"tool": "gen_testcase", "status": "error", "error": ...} dict (instead of
+    raising) if the requirement isn't found, the LLM leaves an AC uncovered, or the LLM
+    returns malformed/incomplete JSON — consistent with fetch_jira's error convention."""
+    try:
+        return testcase_gen.generate_draft(requirement_ref, project_id=project_id)
+    except (ValueError, KeyError) as e:
+        return {"tool": "gen_testcase", "status": "error", "error": str(e)}
 
 
 def gen_test_plan(requirement_ref):
@@ -398,7 +402,7 @@ TOOLS = [
   },
   {
     "name": "gen_testcase",
-    "description": "Generate test cases for a requirement/AC. (SKELETON — TODO: implement LLM generation.)",
+    "description": "Generate or update test cases for a requirement, following the KB template/rubric. Returns a draft — for interactive Approve/Refine review, use the Slack flow instead of this direct tool call.",
     "input_schema": {
       "type": "object",
       "properties": {"requirement_ref": {"type": "string"}},
@@ -491,7 +495,7 @@ def run_tool(name, args, context=None):
     if name == "classify_bug":
         return db.classify_bug(args["bug_ref"], project_id=project_id)
     if name == "gen_testcase":
-        return gen_testcase(args["requirement_ref"])
+        return gen_testcase(args["requirement_ref"], project_id=project_id)
     if name == "gen_test_plan":
         return gen_test_plan(args["requirement_ref"])
     if name == "gen_critic":

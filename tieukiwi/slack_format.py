@@ -675,5 +675,45 @@ def _golive_selftest():
     return render_golive(report_go, res_go), render_golive(report_nogo, res_nogo)
 
 
+def render_ac_list(acs):
+    """List the Acceptance Criteria a draft covers, as Slack mrkdwn — ref +
+    description only, one line each. No testcase mapping (that level of
+    detail lives in the exported Excel file only): the Slack message stays a
+    quick scan of "are all the ACs I care about here", not a report.
+
+    Builds mrkdwn directly instead of routing through to_slack(): see the
+    landmine documented on to_slack's _parse_ac_lines() — it rewrites any
+    text containing an AC-like ref plus a trigger keyword into a fabricated
+    go-live coverage report. AC refs are unavoidable here, so skip to_slack
+    entirely rather than fight the trigger keyword list.
+    """
+    lines = [f"*Acceptance Criteria ({len(acs)}):*"]
+    lines.extend(
+        f"• *{ac['ref']}* — {ac['desc']}" if ac.get("desc") else f"• *{ac['ref']}*"
+        for ac in acs
+    )
+    return "\n".join(lines)
+
+
+def _ac_list_selftest():
+    acs = [
+        {"ref": "AC-1", "desc": "User can log in with valid credentials"},
+        {"ref": "AC-2", "desc": "Invalid password shows an error"},
+    ]
+    out = render_ac_list(acs)
+    assert "AC-1" in out and "AC-2" in out, out
+    assert "Acceptance Criteria (2)" in out, out
+    assert "User can log in with valid credentials" in out, out
+    # No testcase mapping — that stays in the Excel export only.
+    assert "TC-" not in out, out
+    # Guard against the to_slack AC-line-hijacking landmine (see docstring):
+    # a real coverage-report rewrite would replace this text with a
+    # "Tình trạng Test Case" table instead.
+    assert "Tình trạng Test Case" not in out, out
+    return out
+
+
 if __name__ == "__main__":
     print(_selftest())
+    print()
+    print(_ac_list_selftest())
