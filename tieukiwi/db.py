@@ -716,11 +716,21 @@ def _view_requirement(c, node_id, ref, props):
             "gọi ingest_jira_ticket với extract_acs=True. TUYỆT ĐỐI KHÔNG bịa AC."
         )
     else:
-        uncovered = [a["ref"] for a in acs if not a["coverage"]["has_testcase"]]
-        if uncovered:
+        def _ac_label(a):
+            # Prefer human-readable desc/title over the opaque hash ref
+            # (AC-CDM-268-0d2262c6). Fall back to ref if neither present.
+            txt = (a.get("detail") or a.get("title") or "").strip()
+            if not txt:
+                return a["ref"]
+            txt = txt.split("\n", 1)[0]
+            return txt if len(txt) <= 80 else txt[:77] + "…"
+
+        uncovered_items = [a for a in acs if not a["coverage"]["has_testcase"]]
+        if uncovered_items:
+            labels = [f"'{_ac_label(a)}'" for a in uncovered_items]
             warnings.append(
-                f"{len(uncovered)}/{len(acs)} AC chưa có TestCase: {', '.join(uncovered)}. "
-                "Attach TC lên Jira task hoặc chạy gen_testcase."
+                f"{len(uncovered_items)}/{len(acs)} AC chưa có TestCase: "
+                f"{', '.join(labels)}. Attach TC lên Jira task hoặc chạy gen_testcase."
             )
     if not brds:
         warnings.append("Không có BRD/PRD link. Nếu Jira desc có Confluence URL, gọi ingest_jira_ticket.")

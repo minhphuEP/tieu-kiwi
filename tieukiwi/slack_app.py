@@ -77,6 +77,28 @@ def _golive_intent(text, fallback_ref=None):
     return fallback_ref
 
 
+# "List ACs" — a pure data query the LLM tends to summarise/drop titles from.
+# Route it to a deterministic renderer instead so QE sees every AC verbatim.
+_LIST_AC_RE = re.compile(
+    r"(?:danh\s*sách|list|liệt\s*kê|show(?:\s+me)?|xem|các|những|all)"
+    r"\s+(?:the\s+)?ac"
+    r"|ac[^\n]{0,20}(?:là\s*gì|nào|có\s*gì|of\b)"
+    r"|acceptance\s+criteri",
+    re.I,
+)
+
+
+def _list_ac_intent(text, fallback_ref=None):
+    # Return the requirement ref if the message is asking for the AC list,
+    # else None. Sticky ticket kicks in when the message doesn't repeat the ref.
+    if not text or not _LIST_AC_RE.search(text):
+        return None
+    m = _REQ_RE.search(text)
+    if m:
+        return m.group(1).upper()
+    return fallback_ref
+
+
 def _save_thread_ref(channel_id, thread_ts, ref, logger=None):
     # Persist ticket_ref into thread_state.state_json (upsert, merges with existing keys).
     try:
@@ -630,6 +652,45 @@ def _is_stale_draft_click(body, state):
     return current_ts is not None and clicked_ts != current_ts
 
 
+def _do_list_acs(say, requirement_ref, project_id=None, thread_ts=None,
+                 channel_id=None, logger=None):
+    """Deterministic 'list ACs' — bypasses the LLM. Prevents Claude from
+    silently rephrasing/dropping AC titles when the user just wants to see
+    every AC of a ticket."""
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    try:
+        res = db.get_ticket(requirement_ref, project_id=project_id)
+        trace = db.trace(requirement_ref, project_id=project_id)
+    except Exception as e:
+        if logger is not None:
+            logger.exception("list_acs failed")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(f":warning: Error: {e}")),
+            text="Error", **kwargs)
+        return
+    if not res or not res.get("found"):
+        text = (f":information_source: *{requirement_ref}* chưa có trong graph. "
+                f"Chạy `ingest_jira_ticket({requirement_ref})` để pull từ Jira trước.")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
+        return
+    acs = (trace or {}).get("acceptance_criteria") or []
+    if not acs:
+        text = (f":information_source: *{requirement_ref}* có 0 Acceptance Criterion "
+                f"trong graph. BRD có thể chưa được extract — chạy "
+                f"`ingest_jira_ticket({requirement_ref}, force=True)`.")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
+        return
+    # Reuse the same report shape + line renderer used by the story report /
+    # go-live output, so formatting stays consistent across all AC listings.
+    report = slack_format.report_from_graph(requirement_ref, res.get("props") or {}, trace)
+    header = f"*{report.get('title') or requirement_ref}*"
+    summary = (f"Story này có *{len(acs)} Acceptance Criteria*. "
+               f"Danh sách đầy đủ:")
+    ac_lines = [slack_format._ac_line(a) for a in report.get("acs") or []]
+    text = "\n".join([header, "", summary] + ac_lines)
+    say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)),
+        text=f"AC list {requirement_ref}", **kwargs)
+
+
 def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     # Run go_no_go and post the analysis; add approve/reject buttons only on GO.
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
@@ -707,6 +768,17 @@ def build_app():
         ref = _golive_intent(text)
         if ref:
             _do_golive(say, ref, logger, channel_id=command.get("channel_id"))
+            return
+
+        # "List ACs" -> deterministic AC dump; skips LLM (which tends to
+        # rephrase warnings and drop AC titles).
+        ac_ref = _list_ac_intent(text)
+        if ac_ref:
+            _do_list_acs(
+                say, ac_ref,
+                project_id=_project_for_channel(command.get("channel_id"), logger),
+                channel_id=command.get("channel_id"), logger=logger,
+            )
             return
 
         # Generate-testcase request -> draft + Approve/Refine buttons.
@@ -1086,6 +1158,16 @@ def build_app():
         ref = _golive_intent(clean_text, fallback_ref=ticket_ref)
         if ref:
             _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+            return
+
+        # "List ACs" -> deterministic AC dump; skips LLM.
+        ac_ref = _list_ac_intent(clean_text, fallback_ref=ticket_ref)
+        if ac_ref:
+            _do_list_acs(
+                say, ac_ref,
+                project_id=_project_for_channel(channel_id, logger),
+                thread_ts=thread_ts, channel_id=channel_id, logger=logger,
+            )
             return
 
         # For general questions: if the user didn't name a ticket but the thread has one,
