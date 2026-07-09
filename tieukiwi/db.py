@@ -851,7 +851,9 @@ def trace(requirement_ref, project_id=None):
 
         acs = c.execute(
             """
-            SELECT ac.id, ac.ref FROM nodes ac
+            SELECT ac.id, ac.ref,
+                   COALESCE(ac.props_json->>'desc', ac.props_json->>'title', '')
+            FROM nodes ac
             JOIN edges h ON h.dst_id=ac.id AND h.rel='has'
             WHERE h.src_id=%s AND ac.type='AcceptanceCriterion'
             ORDER BY ac.ref
@@ -860,7 +862,7 @@ def trace(requirement_ref, project_id=None):
         ).fetchall()
 
         acceptance_criteria = []
-        for ac_id, ac_ref in acs:
+        for ac_id, ac_ref, ac_desc in acs:
             testcases = c.execute(
                 """
                 SELECT tc.id, tc.ref FROM nodes tc
@@ -917,6 +919,7 @@ def trace(requirement_ref, project_id=None):
 
             acceptance_criteria.append({
                 "ref": ac_ref,
+                "desc": ac_desc or None,
                 "covered": bool(tc_list),
                 "test_status": test_status,
                 "testcases": tc_list,

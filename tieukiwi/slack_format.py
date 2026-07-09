@@ -21,9 +21,9 @@ Canonical layout:
     :test_tube: *Tình trạng Test Case*
     Story này có *3 Acceptance Criteria*, nhưng coverage *chưa đầy đủ*:
     *Test coverage (3 acceptance criteria):*
-    :white_check_mark: *AC-1* — :white_check_mark: Có (TC-1 → TR-1) — :large_green_circle: PASS
-    :x: *AC-2* — :x: Chưa có — :white_circle: Không có
-    :x: *AC-3* — :white_check_mark: Có (TC-3 → TR-3) — :red_circle: FAIL
+    :white_check_mark: Entry point: TC-1 PASS
+    :x: Assign new creator modal: chưa có testcase
+    :red_circle: Confirm view: TC-3 FAIL
 
     :warning: *Cần lưu ý*
     1. ...
@@ -373,22 +373,24 @@ def _status_value_icon(status):
 
 
 def _ac_line(ac):
+    # Prefer the AC's description over its opaque hash-ref (AC-CDM-268-0063f2af);
+    # QE reads titles, not hashes. Fall back to ref if desc is missing (legacy
+    # nodes / import from Excel without a title).
+    label = (ac.get("desc") or "").strip() or ac.get("ref") or "?"
+    label = label.replace("\n", " ").strip()
+    if len(label) > 120:
+        label = label[:117] + "…"
     result = ac.get("result")
-    lead = ":white_check_mark:" if result == "PASS" else ":x:"
-    if ac.get("covered"):
-        flow = ac.get("tc") or ""
-        if ac.get("tc") and ac.get("tr"):
-            flow = f"{ac['tc']} → {ac['tr']}"
-        cov = f":white_check_mark: Có ({flow})" if flow else ":white_check_mark: Có"
-    else:
-        cov = ":x: Chưa có"
     if result == "PASS":
-        res = ":large_green_circle: PASS"
+        icon, tail = ":white_check_mark:", f"{ac.get('tc') or 'TC'} PASS"
     elif result == "FAIL":
-        res = ":red_circle: FAIL"
+        icon, tail = ":red_circle:", f"{ac.get('tc') or 'TC'} FAIL"
+    elif ac.get("covered"):
+        tc = ac.get("tc") or "TC"
+        icon, tail = ":large_blue_circle:", f"{tc} chưa chạy"
     else:
-        res = ":white_circle: Không có"
-    return f"{lead} *{ac['ref']}* — {cov} — {res}"
+        icon, tail = ":x:", "chưa có testcase"
+    return f"{icon} {label}: {tail}"
 
 
 # Section builders — the single source of truth for the canonical blocks. Both the
@@ -530,7 +532,8 @@ def report_from_graph(key, props, trace_result):
             tr = run.get("ref")
             st = (run.get("status") or "").lower()
             result = "PASS" if st == "pass" else ("FAIL" if st == "fail" else None)
-        acs.append({"ref": ac.get("ref"), "covered": ac.get("covered"),
+        acs.append({"ref": ac.get("ref"), "desc": ac.get("desc"),
+                    "covered": ac.get("covered"),
                     "tc": tc, "tr": tr, "result": result})
 
     return {"title": title, "key": key, "info": info, "acs": acs,

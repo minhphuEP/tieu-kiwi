@@ -468,12 +468,57 @@ Output shape (JSON, no prose, no markdown fences):
 
 Rules:
 - Preserve original language.
-- Split compound sentences into atomic ACs when possible ("both A and B" → 2 ACs).
-- Focus on behaviour the QE could write a testcase for. Skip pure UI polish notes.
+- **Respect the PRD's own numbering.** If the section lists ACs with explicit
+  markers (e.g. "1.", "2)", "AC1:", "AC-01", "- ", numbered bullets, or a
+  table row per AC), extract EXACTLY ONE AC per marker — verbatim, no
+  splitting, no merging. The count you return MUST equal the count of
+  markers in the source. This is the common case.
+- Only when the PRD has NO numbered/bulleted AC list (e.g. free-flowing
+  prose describing behaviour) may you extract atomic behaviour statements
+  yourself. Even then, prefer fewer, self-contained ACs over many fragments.
+- Never split a single numbered AC into sub-ACs because it mentions multiple
+  UI elements or branches — those are testcase steps inside one AC, not
+  separate ACs.
+- Focus on behaviour the QE could write a testcase for. Skip pure UI polish
+  notes (colors, spacing, exact copy variants) unless the PRD lists them as
+  their own AC.
 - Return valid JSON. No prose outside the object.
 """
 
 _MAX_AC_INPUT_CHARS = 60000  # cap prompt so a huge PRD doesn't blow the LLM window
+
+# Explicit AC markers PMs use in Confluence PRDs. Matches:
+#   AC1: ...            AC-01: ...           AC 1. ...
+#   CC1: ...            CC-01: ...           (corner-case sub-ACs)
+# Kept intentionally strict — leading anchor + digit + colon/period — so
+# arbitrary "abc:" lines are not mistaken for AC markers.
+_AC_MARKER_RE = re.compile(
+    # Optional bullet prefix ([-*•]) — PMs often nest CCs as bullets under
+    # a parent AC. We treat CC1..N as their own ACs so QE can trace coverage
+    # per corner case.
+    r"^\s*[-*•]?\s*(AC|CC)[- ]?(\d{1,3})\s*[:\.]\s*(.+?)\s*$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def _extract_acs_by_regex(section_text):
+    """Deterministic AC extraction for PRDs that use explicit markers.
+
+    Each AC's description is the marker line ONLY — the text after `ACn:` /
+    `CCn:` on the same line. Sub-bullets, tables, and continuation lines
+    below the marker are intentionally NOT concatenated, so the AC stays a
+    single-line testable statement (matches how QE reads them in the doc).
+
+    Returns:
+      list[str]: extracted AC titles (empty when no markers found —
+                 caller may fall back to LLM extraction).
+    """
+    if not section_text:
+        return []
+    matches = list(_AC_MARKER_RE.finditer(section_text))
+    if not matches:
+        return []
+    return [m.group(3).strip()[:500] for m in matches]
 
 
 def _slice_section(body_text, section_anchor):
@@ -549,6 +594,17 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
             f"Section anchor '{section_anchor}' không match heading nào trong PRD; "
             "extract từ toàn bộ doc (có thể miss/nhiễu). Check heading text trên Confluence."
         )
+
+    # Fast path: PRD uses explicit AC markers (AC1:, CC1:, ...). Deterministic,
+    # no LLM cost, no over-splitting. Only fall through to LLM when the doc
+    # has zero markers (free-flowing prose).
+    regex_acs = _extract_acs_by_regex(section_text)
+    if regex_acs:
+        warnings.append(
+            f"[regex] Extracted {len(regex_acs)} AC(s) via explicit ACn:/CCn: markers — LLM skipped."
+        )
+        return (regex_acs, warnings)
+
     if len(section_text) > _MAX_AC_INPUT_CHARS:
         warnings.append(
             f"PRD section dài {len(section_text)} chars, truncate về {_MAX_AC_INPUT_CHARS} — "
@@ -579,14 +635,18 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
 
 # --- Orchestrator ---------------------------------------------------------
 
-def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
+def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=None,
                        force=False):
     """Fetch a Jira ticket + its subtasks + every Confluence page it references,
     materialise everything in the graph and Chroma. Idempotent.
 
     Args:
       issue_key:   Jira key of the top-level Story (or Epic).
-      project_id:  multi-tenant scope. All nodes upserted under this project.
+      project_id:  Optional override. When omitted, project is derived from the
+                   issue key prefix (`CDM-268` → `CDM`) — the Jira key IS the
+                   source of truth for which project a ticket belongs to. If
+                   both are provided and they disagree, the ticket wins and a
+                   warning is emitted.
       extract_acs: run LLM to pull ACs from BRD section. Default True.
       on_step:     optional progress callback (see tieukiwi.progress). Called
                    with sub-step events during the 6-stage pipeline.
@@ -599,6 +659,17 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
       summary dict listing what was upserted / fetched / created.
     """
     from . import llm  # noqa
+
+    derived_project = issue_key.split("-", 1)[0] if "-" in issue_key else None
+    project_mismatch = None
+    if derived_project:
+        if project_id and project_id != derived_project:
+            project_mismatch = (
+                f"Caller passed project_id='{project_id}' but ticket {issue_key} "
+                f"is in Jira project '{derived_project}'. Storing under "
+                f"'{derived_project}' (ticket wins)."
+            )
+        project_id = derived_project
 
     def _sub(detail):
         if on_step is None:
@@ -620,6 +691,8 @@ def ingest_jira_ticket(issue_key, project_id, extract_acs=True, on_step=None,
         "acs_extracted": [],
         "warnings": [],
     }
+    if project_mismatch:
+        summary["warnings"].append(project_mismatch)
 
     # 1. Fetch main issue (always — this is the input to the hash check)
     _sub(f"Fetch Jira issue {issue_key}…")

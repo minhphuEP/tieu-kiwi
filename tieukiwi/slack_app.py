@@ -220,13 +220,16 @@ def _strip_mention(text):
     return _MENTION_RE.sub("", text or "")
 
 
-def handle_question(text, logger=None, on_step=None):
+def handle_question(text, logger=None, on_step=None, channel_id=None):
     # Shared logic for both entry points: run the Layer A agent and return a
     # Slack-friendly answer string. Never raises — a failure comes back as an error message.
     # The agent returns GitHub Markdown; convert it to the canonical Slack format.
     # `on_step` (optional) is forwarded to the agent for live-progress display.
+    # `channel_id` resolves the multi-tenant project scope so tool calls
+    # (coverage_gap / go_no_go / search_kb / ...) filter to the right project.
+    project_id = _project_for_channel(channel_id, logger) if channel_id else None
     try:
-        answer = agent.ask(text, on_step=on_step)
+        answer = agent.ask(text, project_id=project_id, role="QE", on_step=on_step)
     except Exception as e:
         if logger is not None:
             logger.exception("agent.ask failed")
@@ -708,7 +711,7 @@ def build_app():
             return
 
         # 3) Otherwise: call the Layer A agent (shared helper) and post the result.
-        answer = handle_question(text, logger)
+        answer = handle_question(text, logger, channel_id=command.get("channel_id"))
         say(blocks=_mrkdwn_blocks(answer), text=answer)
 
     @app.command("/tieukiwi-curator-test")
@@ -1093,7 +1096,7 @@ def build_app():
             return
 
         on_step = _make_progress_callback(client, channel_id, progress_ts, logger)
-        answer = handle_question(question, logger, on_step=on_step)
+        answer = handle_question(question, logger, on_step=on_step, channel_id=channel_id)
 
         # Replace the "Processing…" message with the final answer in-place
         # (single tidy message per question). Fall back to a new post if the
