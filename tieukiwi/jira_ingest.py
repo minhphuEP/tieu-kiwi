@@ -533,9 +533,11 @@ def _extract_acs_by_regex(section_text):
 def _slice_section(body_text, section_anchor):
     """Best-effort: return only the text of the section matching section_anchor.
 
-    Returns (sliced_text, matched: bool). When matched=False, the anchor did
-    not resolve to any heading — sliced_text is the WHOLE body (caller may
-    warn and continue, or bail out).
+    Returns (sliced_text, matched: bool, heading_text: str|None).
+      - matched=False → anchor didn't resolve; sliced_text = whole body,
+        heading_text = None.
+      - No anchor supplied → matched=True, heading_text = None (caller has
+        no section context).
 
     Matching strategy:
       1. URL-decode the anchor (Confluence encodes `&` as `%26`, etc).
@@ -546,11 +548,11 @@ def _slice_section(body_text, section_anchor):
          but the heading text no longer matches trailing tokens).
     """
     if not section_anchor or not body_text:
-        return (body_text, True)
+        return (body_text, True, None)
     decoded_anchor = unquote(section_anchor)
     slug_tokens = [t for t in decoded_anchor.replace("-", " ").split() if t]
     if not slug_tokens:
-        return (body_text, True)
+        return (body_text, True, None)
     lines = body_text.splitlines()
 
     def _find(tokens):
@@ -568,36 +570,40 @@ def _slice_section(body_text, section_anchor):
                     break
                 pos = found + len(tok)
             if ok:
-                return (i, len(m.group(1)))
-        return (None, None)
+                return (i, len(m.group(1)), m.group(2).strip())
+        return (None, None, None)
 
-    start_idx, heading_level = _find(slug_tokens)
+    start_idx, heading_level, heading_text = _find(slug_tokens)
     if start_idx is None and len(slug_tokens) > 3:
         # Anchor likely stale (heading text edited after link was copied).
         # Retry with just the section prefix — section-number + first 2 words
         # are enough to disambiguate in practice.
-        start_idx, heading_level = _find(slug_tokens[:3])
+        start_idx, heading_level, heading_text = _find(slug_tokens[:3])
     if start_idx is None:
-        return (body_text, False)
+        return (body_text, False, None)
     end_idx = len(lines)
     for j in range(start_idx + 1, len(lines)):
         m = re.match(r"^(#+)\s+", lines[j])
         if m and len(m.group(1)) <= heading_level:
             end_idx = j
             break
-    return ("\n".join(lines[start_idx:end_idx]), True)
+    return ("\n".join(lines[start_idx:end_idx]), True, heading_text)
 
 
 def extract_acs_via_llm(brd_text, section_anchor=None):
     """Ask the ingestion LLM to extract ACs from a PRD section.
 
-    Returns (acs: list[str], warnings: list[str]). Warnings surface silent
-    failure modes (anchor miss, truncation, LLM error, empty output) so the
-    caller can flow them into summary["warnings"] instead of silently 0.
+    Returns (acs: list[str], warnings: list[str], section_title: str|None).
+    section_title = the actual heading line matched in the PRD, so callers
+    can store it on AC nodes for query-by-feature. None when no anchor was
+    supplied OR when the anchor didn't match any heading.
+
+    Warnings surface silent failure modes (anchor miss, truncation, LLM
+    error, empty output).
     """
     from .llm import complete_json  # lazy import: LLM providers pull deps
     warnings = []
-    section_text, matched = _slice_section(brd_text, section_anchor)
+    section_text, matched, section_title = _slice_section(brd_text, section_anchor)
     if section_anchor and not matched:
         warnings.append(
             f"Section anchor '{section_anchor}' không match heading nào trong PRD; "
@@ -612,7 +618,7 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
         warnings.append(
             f"[regex] Extracted {len(regex_acs)} AC(s) via explicit ACn:/CCn: markers — LLM skipped."
         )
-        return (regex_acs, warnings)
+        return (regex_acs, warnings, section_title)
 
     if len(section_text) > _MAX_AC_INPUT_CHARS:
         warnings.append(
@@ -622,13 +628,13 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
         section_text = section_text[:_MAX_AC_INPUT_CHARS] + "\n\n[...truncated for LLM window...]"
     if not section_text.strip():
         warnings.append("PRD section rỗng sau khi slice — không có gì để extract.")
-        return ([], warnings)
+        return ([], warnings, section_title)
     try:
         data = complete_json(section_text, system=_AC_EXTRACT_SYSTEM,
                              max_tokens=2000, temperature=0.1)
     except Exception as e:
         warnings.append(f"LLM extract AC fail: {e}")
-        return ([], warnings)
+        return ([], warnings, section_title)
     acs = data.get("acceptance_criteria") or []
     out = []
     for ac in acs:
@@ -639,7 +645,7 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
     if not out:
         warnings.append("LLM chạy xong nhưng trả về 0 AC — có thể section không có AC rõ ràng "
                         "hoặc anchor match sai heading.")
-    return (out, warnings)
+    return (out, warnings, section_title)
 
 
 # --- Orchestrator ---------------------------------------------------------
@@ -804,7 +810,7 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
     # end. If we called _diff_and_upsert_acs per-page, page N would obsolete
     # every AC from pages 1..N-1 (they aren't in page N's seen_refs), so only
     # the last page's ACs would survive.
-    extracted_acs = []          # list of {"desc": str, "source_url": str}
+    extracted_acs = []          # list of {desc, source_url, section_anchor, section_title}
     any_extract_ran = False
     for page_id, section_anchor, orig_url in confluence_targets:
         _sub(f"Fetch Confluence page {page_id}…")
@@ -841,12 +847,22 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
                     # rag stored the full text as chunks; we don't have raw text.
                     # Re-derive by asking Chroma or refetch. Cheapest: refetch once.
                     _sub(f"LLM tách Acceptance Criteria từ BRD (page {page_id})…")
-                    ac_texts, ac_warnings = _extract_acs_for_page(page_id, section_anchor)
+                    ac_texts, ac_warnings, section_title = _extract_acs_for_page(
+                        page_id, section_anchor
+                    )
                     summary["warnings"].extend(ac_warnings)
                     any_extract_ran = True
                     page_url = cf_result.get("url")
+                    # URL-decode the anchor for storage (VD "3.2%20Login" → "3.2 Login")
+                    # so `props_json->>'section_anchor' LIKE '%Login%'` works cleanly.
+                    decoded_anchor = unquote(section_anchor) if section_anchor else None
                     for desc in ac_texts:
-                        extracted_acs.append({"desc": desc, "source_url": page_url})
+                        extracted_acs.append({
+                            "desc": desc,
+                            "source_url": page_url,
+                            "section_anchor": decoded_anchor,
+                            "section_title": section_title,
+                        })
 
     if any_extract_ran:
         diff = _diff_and_upsert_acs(
@@ -997,6 +1013,8 @@ def _diff_and_upsert_acs(new_acs, req_node_id, req_key, project_id):
     for ac in new_acs:
         desc = ac["desc"]
         source_url = ac.get("source_url")
+        section_anchor = ac.get("section_anchor")
+        section_title = ac.get("section_title")
         h = _ac_content_hash(desc)
         ref = f"AC-{req_key}-{h}"
         if ref in seen_refs:
@@ -1006,17 +1024,25 @@ def _diff_and_upsert_acs(new_acs, req_node_id, req_key, project_id):
         if ref in existing_by_ref:
             # Already there — leave existing props (including any human edits).
             continue
+        # section_anchor + section_title as top-level props so operators can
+        # query by feature: `props_json->>'section_title' LIKE '%Login%'`.
+        # Nulls omitted to keep props tidy for ACs from anchor-less URLs.
+        new_props = {
+            "desc": desc,
+            "_meta": {
+                "extraction_source": "llm",
+                "confidence": 0.75,
+                "source_file": source_url,
+                "review_status": "draft",
+                "ingested_at": _now_iso(),
+            },
+        }
+        if section_anchor:
+            new_props["section_anchor"] = section_anchor
+        if section_title:
+            new_props["section_title"] = section_title
         ac_node_id = db.upsert_node_by_ref(
-            "AcceptanceCriterion", ref, {
-                "desc": desc,
-                "_meta": {
-                    "extraction_source": "llm",
-                    "confidence": 0.75,
-                    "source_file": source_url,
-                    "review_status": "draft",
-                    "ingested_at": _now_iso(),
-                },
-            }, project_id=project_id,
+            "AcceptanceCriterion", ref, new_props, project_id=project_id,
         )
         db.ensure_edge(req_node_id, "has", ac_node_id)
         created.append({"ref": ref, "desc": desc[:80]})
@@ -1050,21 +1076,22 @@ def _diff_and_upsert_acs(new_acs, req_node_id, req_key, project_id):
 def _extract_acs_for_page(page_id, section_anchor):
     """Helper: re-fetch page body and hand to LLM for AC extraction.
 
-    Returns (acs: list[str], warnings: list[str]). Propagates warnings from
-    extract_acs_via_llm plus surfaces fetch/parse failures.
+    Returns (acs: list[str], warnings: list[str], section_title: str|None).
+    Propagates warnings from extract_acs_via_llm plus surfaces fetch/parse
+    failures. section_title = the matched PRD heading, for storing on the AC.
     """
     try:
         page = confluence._confluence_get(
             f"/api/v2/pages/{page_id}?body-format=atlas_doc_format"
         )
     except (httpx.HTTPError, RuntimeError) as e:
-        return ([], [f"Confluence fetch page {page_id} fail: {e}"])
+        return ([], [f"Confluence fetch page {page_id} fail: {e}"], None)
     body_val = ((page.get("body") or {}).get("atlas_doc_format") or {}).get("value")
     if isinstance(body_val, str):
         try:
             body_adf = json.loads(body_val)
         except json.JSONDecodeError:
-            return ([], [f"Confluence page {page_id}: ADF body không parse được."])
+            return ([], [f"Confluence page {page_id}: ADF body không parse được."], None)
     else:
         body_adf = body_val
     body_text = adf.to_pretty_text(body_adf) if body_adf else ""
