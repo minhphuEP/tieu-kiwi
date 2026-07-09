@@ -22,7 +22,6 @@ _TOOL_LABELS = {
     "go_no_go":           "🚦 Đang đánh giá GO/NO-GO cho{ref}…",
     "bug_blast_radius":   "💥 Đang tính blast radius cho bug{bug}…",
     "classify_bug":       "🐛 Đang phân loại bug{bug}…",
-    "fetch_jira":         "⬇️ Đang gọi Jira lấy{issue}…",
     "ingest_jira_ticket": "📥 Đang import{issue} vào graph…",
     "fetch_confluence":   "📄 Đang tải Confluence page{page}…",
     "gen_testcase":       "✏️ Đang sinh testcase cho{ref}…",

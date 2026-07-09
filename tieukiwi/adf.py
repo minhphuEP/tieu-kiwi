@@ -1,4 +1,4 @@
-"""Atlassian Document Format (ADF) parsers used by fetch_jira / fetch_confluence.
+"""Atlassian Document Format (ADF) parsers used by ingest_jira_ticket / fetch_confluence.
 
 ADF is Atlassian's JSON tree format for rich text — issue descriptions,
 Confluence bodies, comments. Docs: https://developer.atlassian.com/cloud/jira/platform/apis/document/structure/

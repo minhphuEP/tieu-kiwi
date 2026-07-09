@@ -502,7 +502,7 @@ def to_slack(answer):
 
 def report_from_graph(key, props, trace_result):
     """Build a canonical report dict from a Requirement's graph node props (as stored by
-    fetch_jira) + the output of db.trace(). Pure transformation — no DB access here."""
+    ingest_jira_ticket) + the output of db.trace(). Pure transformation — no DB access here."""
     props = props or {}
     fix = props.get("fix_versions")
     fix_str = ", ".join(fix) if isinstance(fix, list) else (fix or None)

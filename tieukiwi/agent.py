@@ -25,9 +25,6 @@ Rules for answering questions about tickets / requirements / BRDs / test coverag
   values. If the tool returns 0 items, say so explicitly ("chưa có AC nào
   trong graph"), never list AC1/AC2/AC4 etc. from your own imagination.
 
-- Use `fetch_jira` ONLY when the user explicitly asks to "refresh chỉ status
-  / assignee" — otherwise prefer `ingest_jira_ticket` for full ingest.
-
 - Use `fetch_confluence` ONLY when the user pastes a Confluence URL directly
   outside of a Jira context — `ingest_jira_ticket` already handles Confluence
   URLs found in Jira descriptions.

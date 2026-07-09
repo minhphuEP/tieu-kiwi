@@ -17,7 +17,7 @@ def gen_testcase(requirement_ref, project_id=None):
     that loop is driven directly from tieukiwi/slack_app.py, see docs/Gen-testcase-design.md).
     Returns a {"tool": "gen_testcase", "status": "error", "error": ...} dict (instead of
     raising) if the requirement isn't found, the LLM leaves an AC uncovered, or the LLM
-    returns malformed/incomplete JSON — consistent with fetch_jira's error convention."""
+    returns malformed/incomplete JSON — consistent with the tool error convention."""
     try:
         return testcase_gen.generate_draft(requirement_ref, project_id=project_id)
     except (ValueError, KeyError) as e:
@@ -310,21 +310,6 @@ TOOLS = [
     },
   },
   {
-    "name": "fetch_jira",
-    "description": (
-        "Fetch ONE Jira issue by key (e.g. CDM-268) and upsert its metadata as a "
-        "Requirement node. Does NOT fetch subtasks, parent Epic, or Confluence pages "
-        "linked in the description — use `ingest_jira_ticket` for the full ingest. "
-        "Use this only when the user wants to REFRESH an existing issue's fields "
-        "(status, assignee) without re-fetching the whole subtree."
-    ),
-    "input_schema": {
-      "type": "object",
-      "properties": {"issue_key": {"type": "string"}},
-      "required": ["issue_key"],
-    },
-  },
-  {
     "name": "ingest_jira_ticket",
     "description": (
         "Full-fetch a Jira ticket into the graph: upsert the Story/Requirement, its "
@@ -435,8 +420,6 @@ def run_tool(name, args, context=None):
         return gen_test_plan(args["requirement_ref"])
     if name == "gen_critic":
         return gen_critic(args["text"])
-    if name == "fetch_jira":
-        return fetch_jira(args["issue_key"])
     if name == "ingest_jira_ticket":
         from . import jira_ingest
         return jira_ingest.ingest_jira_ticket(

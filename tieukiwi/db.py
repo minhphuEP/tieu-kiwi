@@ -676,6 +676,39 @@ def _view_requirement(c, node_id, ref, props):
             },
         })
 
+    # TestRun subtasks of this Requirement — linked via props.jira_parent_ref
+    # (not by edge; convention in jira_ingest since the parent link is Jira-native).
+    test_runs = [
+        {
+            "ref": r[0],
+            "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
+            "environment": (r[1] or {}).get("environment"),
+            "status": (r[1] or {}).get("status"),
+        }
+        for r in c.execute(
+            "SELECT ref, props_json FROM nodes "
+            "WHERE type='TestRun' AND props_json->>'jira_parent_ref'=%s ORDER BY ref",
+            (ref,),
+        ).fetchall()
+    ]
+
+    # Bugs linked to this Requirement — via props.jira_parent_ref (covers
+    # bugs materialised from a [Bug]-subtask table under this Story).
+    linked_bugs = [
+        {
+            "ref": r[0],
+            "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
+            "severity": (r[1] or {}).get("severity"),
+            "status": (r[1] or {}).get("status"),
+            "find_by": (r[1] or {}).get("find_by"),
+        }
+        for r in c.execute(
+            "SELECT ref, props_json FROM nodes "
+            "WHERE type='Bug' AND props_json->>'jira_parent_ref'=%s ORDER BY ref",
+            (ref,),
+        ).fetchall()
+    ]
+
     warnings = []
     if not acs:
         warnings.append(
@@ -691,11 +724,25 @@ def _view_requirement(c, node_id, ref, props):
             )
     if not brds:
         warnings.append("Không có BRD/PRD link. Nếu Jira desc có Confluence URL, gọi ingest_jira_ticket.")
+    if not test_runs:
+        warnings.append(
+            "Chưa có TestRun subtask nào. QE có thể chưa tạo subtask '[QE] testing on beta/prod' "
+            "trên Jira, hoặc chạy ingest_jira_ticket để pull subtree."
+        )
+    open_critical = [b for b in linked_bugs if b["status"] not in ("done", "closed") and b["severity"] in ("critical", "high")]
+    if open_critical:
+        warnings.append(
+            f"{len(open_critical)} critical/high bug đang open: "
+            f"{', '.join(b['ref'] for b in open_critical)}. Cần fix trước khi go-live."
+        )
 
     return {
         "ref": ref, "type": "Requirement", "found": True, "props": props,
         "user_story": user_story, "brds": brds,
-        "acceptance_criteria": acs, "warnings": warnings,
+        "acceptance_criteria": acs,
+        "test_runs": test_runs,
+        "linked_bugs": linked_bugs,
+        "warnings": warnings,
     }
 
 
@@ -754,7 +801,8 @@ def _view_testrun(c, node_id, ref, props):
 
 
 def _view_userstory_or_epic(c, node_id, ref, props):
-    """Epic/UserStory view: list linked Requirements."""
+    """Epic/UserStory view: list linked Requirements + aggregate TestRuns/Bugs
+    across all children (via jira_parent_ref chain)."""
     reqs = [
         {"ref": r[0], "title": (r[1] or {}).get("title")}
         for r in c.execute(
@@ -763,10 +811,49 @@ def _view_userstory_or_epic(c, node_id, ref, props):
             (node_id,),
         ).fetchall()
     ]
+
+    # Aggregate TestRuns of all child Requirements — bằng cách join qua
+    # jira_parent_ref của TestRun (parent = child Requirement.ref, không phải Epic).
+    child_refs = [r["ref"] for r in reqs]
+    test_runs = []
+    linked_bugs = []
+    if child_refs:
+        test_runs = [
+            {
+                "ref": r[0],
+                "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
+                "environment": (r[1] or {}).get("environment"),
+                "status": (r[1] or {}).get("status"),
+                "parent_story": (r[1] or {}).get("jira_parent_ref"),
+            }
+            for r in c.execute(
+                "SELECT ref, props_json FROM nodes "
+                "WHERE type='TestRun' AND props_json->>'jira_parent_ref' = ANY(%s) ORDER BY ref",
+                (child_refs,),
+            ).fetchall()
+        ]
+        linked_bugs = [
+            {
+                "ref": r[0],
+                "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
+                "severity": (r[1] or {}).get("severity"),
+                "status": (r[1] or {}).get("status"),
+                "parent_story": (r[1] or {}).get("jira_parent_ref"),
+            }
+            for r in c.execute(
+                "SELECT ref, props_json FROM nodes "
+                "WHERE type='Bug' AND props_json->>'jira_parent_ref' = ANY(%s) ORDER BY ref",
+                (child_refs,),
+            ).fetchall()
+        ]
+
+    warnings = [] if reqs else ["Epic/Story chưa có Requirement con nào."]
     return {
         "ref": ref, "type": "UserStory", "found": True, "props": props,
         "requirements": reqs,
-        "warnings": [] if reqs else ["Epic/Story chưa có Requirement con nào."],
+        "test_runs": test_runs,
+        "linked_bugs": linked_bugs,
+        "warnings": warnings,
     }
 
 

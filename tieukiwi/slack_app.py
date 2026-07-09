@@ -462,22 +462,27 @@ def _run_curator_demo(client, channel_id, user_id, logger=None):
 def _golive_report(requirement_ref, logger=None):
     # Assemble the structured report (ticket info + coverage) for the go-live message,
     # reusing the SAME slack_format builder as the story report. Reads the graph node
-    # props; if empty and Jira is configured, fetch_jira to populate, then re-read.
+    # props; if empty and Jira is configured, run ingest_jira_ticket to populate the
+    # full subtree (Story + subtasks + BRD), then re-read.
     props = {}
     try:
         props = db.get_node_props(requirement_ref, "Requirement")
     except Exception:
         if logger is not None:
             logger.exception("get_node_props failed")
-    has_info = any(props.get(k) for k in ("summary", "assignee", "priority", "status", "issuetype"))
+    has_info = any(props.get(k) for k in ("title", "summary", "assignee", "priority", "status", "issuetype"))
     if not has_info and config.JIRA_BASE_URL and config.JIRA_EMAIL and config.JIRA_API_TOKEN:
         try:
-            from .tools import fetch_jira
-            if fetch_jira(requirement_ref).get("status") == "ok":
+            from . import jira_ingest
+            project_id = db.project_from_ref(requirement_ref)
+            res = jira_ingest.ingest_jira_ticket(
+                requirement_ref, project_id=project_id, extract_acs=False,
+            )
+            if res.get("status") != "error":
                 props = db.get_node_props(requirement_ref, "Requirement")
         except Exception:
             if logger is not None:
-                logger.exception("fetch_jira fallback failed")
+                logger.exception("ingest_jira_ticket fallback failed")
     try:
         trace_result = db.trace(requirement_ref)
     except Exception:

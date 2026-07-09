@@ -344,6 +344,7 @@ def _upsert_epic_or_story(issue, project_id):
 
     props = {
         **_meta_jira(key),
+        "jira_key": key,   # explicit identity — survives ref renames (VD TR- prefix)
         "title": fields.get("summary"),
         "status": (fields.get("status") or {}).get("name"),
         "priority": (fields.get("priority") or {}).get("name"),
@@ -368,14 +369,19 @@ def _upsert_epic_or_story(issue, project_id):
     return (node_type, node_id, key)
 
 
-def _upsert_testrun(subtask_key, subtask_summary, env, project_id):
-    """Upsert a TestRun node from a test-env subtask."""
-    # Basic subtask info comes from the parent-issue GET; fetch details only if
-    # we care about status/comments — for TestRun we don't (yet).
-    node_id = db.upsert_node_by_ref("TestRun", subtask_key, {
+def _upsert_testrun(subtask_key, subtask_summary, env, project_id, parent_story_key=None):
+    """Upsert a TestRun node from a test-env subtask.
+
+    Ref = `TR-<subtask_key>` (TR- prefix avoids collision under (project_id, ref)
+    unique index — see migration 007). `jira_key` and `jira_parent_ref` are
+    stored explicitly so downstream queries don't need to parse the ref.
+    """
+    node_id = db.upsert_node_by_ref("TestRun", "TR-" + subtask_key, {
         **_meta_jira(subtask_key),
+        "jira_key": subtask_key,               # actual Jira subtask key (bare)
+        "jira_parent_ref": parent_story_key,   # parent Story — for "which ticket owns this TR"
+        "title": subtask_summary,              # canonical field
         "environment": env,
-        "summary": subtask_summary,
         "status": "pending",
     }, project_id=project_id)
     return node_id
@@ -428,16 +434,19 @@ def _upsert_bugs_from_table(container_key, container_summary, parent_story_key,
     out = []
     for idx, bug in enumerate(bugs, start=1):
         ref = f"{container_key}-{idx}"
+        translated_summary = _maybe_translate_bug_field(bug["summary"])
         node_id = db.upsert_node_by_ref("Bug", ref, {
             **_meta_jira(container_key),
-            "summary": _maybe_translate_bug_field(bug["summary"]),
+            "jira_key": container_key,             # Jira container subtask (bugs share this)
+            "jira_parent_ref": parent_story_key,   # parent Story — for "bug thuộc ticket nào"
+            "title": translated_summary,           # canonical field
+            "summary": translated_summary,         # keep for backward-compat renderers
             "severity": bug["severity"] or "medium",
             "status": bug["status"] or "open",
             "find_by": bug["find_by"],
             "origin": "testing",
             "jira_container_ref": container_key,
             "jira_container_summary": container_summary,
-            "jira_parent_ref": parent_story_key,
             "description": {
                 "steps": _maybe_translate_bug_field(bug["steps"]),
                 "actual": _maybe_translate_bug_field(bug["actual"]),
@@ -851,7 +860,8 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
         st_summary = ((st.get("fields") or {}).get("summary") or "").strip()
         kind, env = route_subtask(st_summary)
         if kind == "testrun":
-            tr_id = _upsert_testrun(st_key, st_summary, env, project_id)
+            tr_id = _upsert_testrun(st_key, st_summary, env, project_id,
+                                    parent_story_key=req_key)
             testrun_by_env[env] = tr_id
             summary["subtasks"]["testruns"].append({"key": st_key, "env": env, "node_id": tr_id})
         elif kind == "bug_container":
