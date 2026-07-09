@@ -240,6 +240,31 @@ TOOLS = [
     },
   },
   {
+    "name": "feature_blast_radius",
+    "description": (
+        "Impact analysis from a FEATURE (Component), not from a code diff. "
+        "Use when the user asks 'what could break if feature X is developed/"
+        "changed?' before code exists. Returns: (a) the target Component + "
+        "all Components that dependsOn it (transitively) — the 'features at "
+        "risk'; (b) Requirements/ACs/TestCases scoped to those Components, so "
+        "QE can plan tests. Severity: target + direct dependents = HIGH, "
+        "transitive dependents = MEDIUM. If you have a code diff instead, "
+        "use `code_impact`."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "component_ref": {
+          "type": "string",
+          "description": "Component ref, e.g. 'COMP-CDM-SCRIPT-ASSIGN' or "
+                         "'COMP-CDM-OFFER-REVIEWER'. Look up refs with "
+                         "search_kb or by listing Components in the graph.",
+        },
+      },
+      "required": ["component_ref"],
+    },
+  },
+  {
     "name": "code_impact",
     "description": (
         "Impact analysis for a code change (e.g. an MR diff): given a list of "
@@ -449,6 +474,8 @@ def run_tool(name, args, context=None):
             depth=args.get("depth", 3),
             project_id=project_id,
         )
+    if name == "feature_blast_radius":
+        return db.feature_blast_radius(args["component_ref"], project_id=project_id)
     if name == "classify_bug":
         return db.classify_bug(args["bug_ref"], project_id=project_id)
     if name == "mark_reviewed":
