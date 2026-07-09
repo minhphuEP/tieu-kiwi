@@ -800,6 +800,12 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
 
     if confluence_targets:
         _sub(f"Tải {len(confluence_targets)} Confluence page từ description…")
+    # Accumulate ACs across ALL Confluence pages, then reconcile ONCE at the
+    # end. If we called _diff_and_upsert_acs per-page, page N would obsolete
+    # every AC from pages 1..N-1 (they aren't in page N's seen_refs), so only
+    # the last page's ACs would survive.
+    extracted_acs = []          # list of {"desc": str, "source_url": str}
+    any_extract_ran = False
     for page_id, section_anchor, orig_url in confluence_targets:
         _sub(f"Fetch Confluence page {page_id}…")
         cf_result = confluence.fetch_confluence(
@@ -837,16 +843,21 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
                     _sub(f"LLM tách Acceptance Criteria từ BRD (page {page_id})…")
                     ac_texts, ac_warnings = _extract_acs_for_page(page_id, section_anchor)
                     summary["warnings"].extend(ac_warnings)
-                    diff = _diff_and_upsert_acs(
-                        ac_texts,
-                        req_node_id=req_node_id,
-                        req_key=req_key,
-                        project_id=project_id,
-                        source_url=cf_result.get("url"),
-                    )
-                    summary["acs_extracted"].extend(diff["created"])
-                    summary["acs_kept"] = diff["kept_count"]
-                    summary["acs_obsoleted"] = diff["obsoleted"]
+                    any_extract_ran = True
+                    page_url = cf_result.get("url")
+                    for desc in ac_texts:
+                        extracted_acs.append({"desc": desc, "source_url": page_url})
+
+    if any_extract_ran:
+        diff = _diff_and_upsert_acs(
+            extracted_acs,
+            req_node_id=req_node_id,
+            req_key=req_key,
+            project_id=project_id,
+        )
+        summary["acs_extracted"] = diff["created"]
+        summary["acs_kept"] = diff["kept_count"]
+        summary["acs_obsoleted"] = diff["obsoleted"]
 
     # 6. Route subtasks — TestRun / bug container / skip.
     # Do TestRuns first (need self-test TR id to link find_by=Testcase bugs).
@@ -943,8 +954,14 @@ def _ac_content_hash(desc):
     return hashlib.sha256(normalised.encode("utf-8")).hexdigest()[:8]
 
 
-def _diff_and_upsert_acs(new_ac_texts, req_node_id, req_key, project_id, source_url):
+def _diff_and_upsert_acs(new_acs, req_node_id, req_key, project_id):
     """Reconcile freshly-extracted ACs with what's already in the graph.
+
+    Args:
+      new_acs: list of {"desc": str, "source_url": str} — the UNION of ACs
+        extracted across every Confluence page linked from this ticket.
+        Must be batched by the caller; per-page diffs would obsolete other
+        pages' ACs (bug fixed 2026-07).
 
     For each new AC:
       - Compute hash-based ref: AC-<req_key>-<hash8>. Same desc → same ref
@@ -977,9 +994,14 @@ def _diff_and_upsert_acs(new_ac_texts, req_node_id, req_key, project_id, source_
     seen_refs = set()
     created = []
 
-    for desc in new_ac_texts:
+    for ac in new_acs:
+        desc = ac["desc"]
+        source_url = ac.get("source_url")
         h = _ac_content_hash(desc)
         ref = f"AC-{req_key}-{h}"
+        if ref in seen_refs:
+            # Same desc extracted from 2 pages this run — first wins.
+            continue
         seen_refs.add(ref)
         if ref in existing_by_ref:
             # Already there — leave existing props (including any human edits).
