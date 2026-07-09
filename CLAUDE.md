@@ -223,9 +223,14 @@ db.bind_channel("C0123XYZ", "CDM_TEAM", note="wired by <you>")
 - When adding a new tool: add an entry to `TOOLS` (clear input_schema + description) and a branch in
   `run_tool`; do NOT rewrite the agent loop.
 - When ingesting via LLM: always embed `_meta` provenance in `props_json` (see convention above).
-- Ask-routing: two APIs coexist. `routing.owner_for(entity_type)` = class-level role name (legacy),
-  `routing.resolve_owner_slack(node_id)` = instance-level Slack user with 3-tier fallback (new).
-  Prefer the second for anything that will actually @mention someone.
+- Ask-routing (ONE system): canonical role constants live only in `tieukiwi/routing.py`
+  (`DELIVERY_MANAGER`/`QE_LEAD`/`PO`/`DEV`). `routing.approver_role_for(decision_type)` maps a
+  problem/decision to a role; `routing.route_gap(entity_type)` maps an ontology entity to its owner
+  role; `routing.curator_role_for(applies_to)` routes rule domains through `approver_role_for`.
+  Role → real Slack user is ONE helper: `db.resolve_role_slack_id(role, project_id)` and
+  `db.mention_for(role, project_id)` (users table first, then optional `ROLE_<ROLE>` env override,
+  then a non-crashing "@role (unconfigured)" label). Never hardcode Slack ids; never add a second
+  role map or resolution path.
 - Test with `python -c "import tieukiwi.<module>"` instead of running `python -m tieukiwi.cli`
   (the CLI needs a real API key + Postgres).
 

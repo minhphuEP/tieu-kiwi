@@ -66,6 +66,6 @@ SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN")
 SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
 
-# Slack user id of the Delivery Manager who signs off go-live releases.
-# Unset -> the curator block shows a plain "@Delivery Manager" label + a note.
-DELIVERY_MANAGER_SLACK_ID = os.getenv("DELIVERY_MANAGER_SLACK_ID")
+# Role -> Slack user resolution lives in db.resolve_role_slack_id / db.mention_for
+# (users table first, then optional per-role env overrides ROLE_DELIVERY_MANAGER /
+# ROLE_QE_LEAD / ROLE_PO / ROLE_DEV read via os.getenv). No hardcoded ids here.

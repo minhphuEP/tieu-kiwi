@@ -1,8 +1,12 @@
+import logging
+import os
 import re
 import psycopg
 from contextlib import contextmanager
 
 from .config import DATABASE_URL
+
+_log = logging.getLogger(__name__)
 
 _DATATABLE_COL_RE = re.compile(r"^datacol_?\d+$", re.IGNORECASE)
 
@@ -140,6 +144,26 @@ def resolve_role_slack_id(role, project_id=None):
             (role,),
         ).fetchone()
         return row[0] if row else None
+
+
+def mention_for(role, project_id=None):
+    """Resolve a role to a Slack mention string — the ONE mention path used everywhere.
+
+    Order: users table (project-scoped first, then role-only) -> optional per-role env
+    override ROLE_<ROLE> (last resort, so demos don't break on an empty table) -> a
+    clear, non-crashing "@<role> (unconfigured)" label (logs a warning). Never raises.
+    """
+    sid = None
+    try:
+        sid = resolve_role_slack_id(role, project_id)
+    except Exception:
+        _log.exception("resolve_role_slack_id failed for role=%s", role)
+    if not sid:
+        sid = os.getenv(f"ROLE_{role.upper()}")  # e.g. ROLE_DELIVERY_MANAGER
+    if sid:
+        return f"<@{sid}>"
+    _log.warning("No Slack user for role '%s' (project=%s); mention unconfigured", role, project_id)
+    return f"@{role} (unconfigured)"
 
 
 def upsert_node_by_ref(type_, ref, props=None):

@@ -6,6 +6,6 @@ python-dotenv
 httpx
 slack_bolt
 pandas
-openpyxl
+openpyxl>=3.1
 pypdf
 python-docx
