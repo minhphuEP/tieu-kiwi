@@ -167,18 +167,28 @@ def mention_for(role, project_id=None):
 
 
 def upsert_node_by_ref(type_, ref, props=None):
-    # Insert a node, or update its props if one with the same (type, ref) already exists.
-    # Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
+    # Insert a node, or MERGE props into the existing one with this (type, ref) —
+    # never create a second node. Avoids duplicates when re-fetching the same
+    # external item (e.g. a Jira issue). If duplicates already exist, prefer the
+    # node that has 'has' edges (the one linked to ACs) so re-fetch updates the
+    # right node rather than an empty duplicate; props merge preserves existing
+    # keys (e.g. _meta provenance) and overlays the new metadata.
     props = props or {}
     with conn() as c:
         row = c.execute(
-            "SELECT id FROM nodes WHERE type=%s AND ref=%s ORDER BY id LIMIT 1",
+            """
+            SELECT n.id FROM nodes n
+            WHERE n.type=%s AND n.ref=%s
+            ORDER BY (SELECT count(*) FROM edges e WHERE e.src_id=n.id AND e.rel='has') DESC,
+                     n.id ASC
+            LIMIT 1
+            """,
             (type_, ref),
         ).fetchone()
         if row:
             node_id = row[0]
             c.execute(
-                "UPDATE nodes SET props_json=%s WHERE id=%s",
+                "UPDATE nodes SET props_json = COALESCE(props_json,'{}'::jsonb) || %s::jsonb WHERE id=%s",
                 (psycopg.types.json.Json(props), node_id),
             )
             return node_id
@@ -1043,21 +1053,34 @@ def testcases_for_requirement(ref, project_id=None):
     return list(by_ref.values())
 
 
+def project_id_from_ref(ref):
+    """Canonical project id = the Jira key prefix before the first '-'
+    (e.g. 'CDM-268' -> 'CDM'). Returns the ref unchanged if it has no '-'."""
+    return ref.split("-")[0] if ref and "-" in ref else ref
+
+
 def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
     """Upsert draft-schema testcases (tieukiwi/testcase_gen.py) as verified
-    TestCase nodes, and ensure a coveredBy edge from each of their ac_refs.
+    TestCase nodes in the CANONICAL props_json shape (see CLAUDE.md _meta contract
+    + docs/Gen-testcase-design.md), and ensure a coveredBy edge from each ac_ref.
+
+    Canonical props_json: title, type (Normal|API|DataTable), priority, precondition,
+    steps (ARRAY of {description, expected}), data_variants, api, and
+    _meta {extraction_source:'llm:gen_testcase', confidence, review_status:'verified',
+    approved_by:<slack id>, source_requirement:<REQ key>}.
 
     Args:
-      requirement_ref: the Requirement these testcases belong to (context only;
-                        edges are created from each testcase's own ac_refs).
+      requirement_ref: the Requirement these testcases belong to; also sets the
+                        canonical project_id (= key prefix before '-') on the nodes.
       testcases: list of draft-schema dicts.
       approved_by: identifier (Slack user id) of the human approver.
-      project_id: scope for resolving ac_refs to node ids and for the upsert
-                  key (project_id, ref).
+      project_id: legacy/ignored for the node key — the canonical project is derived
+                  from requirement_ref (project_id_from_ref).
 
     Returns:
       list of TestCase node ids, in the same order as `testcases`.
     """
+    tc_project = project_id_from_ref(requirement_ref)
     node_ids = []
     with conn() as c:
         for tc in testcases:
@@ -1074,6 +1097,7 @@ def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
                     "confidence": 0.9,
                     "review_status": "verified",
                     "approved_by": approved_by,
+                    "source_requirement": requirement_ref,
                 },
             }
             row = c.execute(
@@ -1084,17 +1108,22 @@ def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
                   SET props_json = nodes.props_json || EXCLUDED.props_json
                 RETURNING id
                 """,
-                (tc["ref"], project_id, psycopg.types.json.Json(props)),
+                (tc["ref"], tc_project, psycopg.types.json.Json(props)),
             ).fetchone()
             tc_id = row[0]
             node_ids.append(tc_id)
             for ac_ref in tc.get("ac_refs", []):
-                ac_sql = "SELECT id FROM nodes WHERE type='AcceptanceCriterion' AND ref=%s"
-                ac_params = [ac_ref]
-                if project_id is not None:
-                    ac_sql += " AND project_id=%s"
-                    ac_params.append(project_id)
-                ac_row = c.execute(ac_sql, ac_params).fetchone()
+                # Resolve the AC in the canonical project first, then any project
+                # (so links survive nodes whose project_id predates this rule).
+                ac_row = c.execute(
+                    "SELECT id FROM nodes WHERE type='AcceptanceCriterion' AND ref=%s AND project_id=%s",
+                    (ac_ref, tc_project),
+                ).fetchone()
+                if not ac_row:
+                    ac_row = c.execute(
+                        "SELECT id FROM nodes WHERE type='AcceptanceCriterion' AND ref=%s ORDER BY id LIMIT 1",
+                        (ac_ref,),
+                    ).fetchone()
                 if not ac_row:
                     continue
                 ac_id = ac_row[0]

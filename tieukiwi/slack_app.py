@@ -81,8 +81,17 @@ def _golive_intent(text):
     return m.group(1).upper() if m else None
 
 
-# Test-case generation intent, e.g. "gen test case cho CDM-268", "tạo test case CDM-268".
-_GEN_TC_RE = re.compile(r"gen(?:erate)?\s*test\s*case|t(ạ|a)o\s*test\s*case", re.I)
+# Test-case generation intent, e.g. "gen test case cho CDM-268", "write a testcase for AC-...",
+# "viết test case", "tạo/sinh test case". `test\s*case` matches both "test case" and "testcase".
+# Requires the words "test case" adjacent, so it never over-matches go-live/curator-test/bug.
+_GEN_TC_RE = re.compile(
+    r"gen(?:erate)?\s*test\s*case"
+    r"|write\s*(?:a\s*)?test\s*case"
+    r"|vi(?:ế|e)t\s*test\s*case"
+    r"|t(?:ạ|a)o\s*test\s*case"
+    r"|sinh\s*test\s*case",
+    re.I,
+)
 
 
 def _gen_testcase_intent(text):
@@ -349,7 +358,7 @@ def _chunk_mrkdwn(text, limit=_SECTION_CHAR_LIMIT):
     return chunks or [""]
 
 
-def _testcase_draft_blocks(draft):
+def _testcase_draft_blocks(draft, approver_mention=None):
     # Kept intentionally light: full per-testcase detail (steps, precondition,
     # data tables, API fields) lives in the exported Excel file only, so the
     # Slack message stays a quick "does this look complete" scan, not a wall
@@ -377,6 +386,12 @@ def _testcase_draft_blocks(draft):
                        "text": ":warning: _Danh sách AC dài quá giới hạn hiển thị — xem đầy đủ trong "
                                "file Excel._"}})
     blocks.append({"type": "divider"})
+    # Ask-routing: testcase -> qe_lead. @mention the QE Lead as the approver, near the
+    # buttons. `approver_mention` is a resolved "<@id>" (or a graceful "@qe_lead
+    # (unconfigured)" label from mention_for) — never raises.
+    if approver_mention:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": slack_format.to_slack(
+            f":raising_hand: {approver_mention} — vui lòng review file Excel và *Approve* nếu ổn.")}})
     blocks.append({
             "type": "actions",
             "block_id": f"tc_{draft['requirement_ref']}_{draft['version']}",
@@ -441,9 +456,31 @@ def _do_gen_testcase(say, client, requirement_ref, logger=None, thread_ts=None, 
         say(text=slack_format.to_slack(f":warning: Error: {e}"))
         return
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
-    posted = say(blocks=_testcase_draft_blocks(draft),
+    qe_lead = db.mention_for(routing.approver_role_for("testcase"), project_id)
+    posted = say(blocks=_testcase_draft_blocks(draft, qe_lead),
                  text=f"Draft test cases for {requirement_ref}", **kwargs)
     anchor_ts = thread_ts or posted["ts"]
+
+    # Persist the draft FIRST — before the Excel export — so Approve can ALWAYS find
+    # it. If the export fails (e.g. missing files:write scope), the save must not be
+    # skipped: that Excel-before-save ordering was the "No draft found" bug.
+    try:
+        memory.save_thread_state(
+            channel_id, anchor_ts,
+            {"flow": "gen_testcase", "draft_message_ts": posted["ts"],
+             "excel_file_id": None, "bot_participant": True,
+             "current_ref": requirement_ref, **draft},
+        )
+    except Exception:
+        if logger is not None:
+            logger.exception("saving draft state failed")
+        say(text=slack_format.to_slack(
+            ":warning: Draft shown above, but I couldn't save it for approval "
+            "(storage error) — please regenerate."), **kwargs)
+        return
+
+    # Best-effort Excel export; a failure is reported in-thread but does NOT affect
+    # the saved draft or the Approve flow.
     excel_file_id = _upload_draft_excel(
         client, channel_id, anchor_ts, draft["testcases"],
         filename=f"{requirement_ref}_testcases_v{draft['version']}.xlsx",
@@ -451,11 +488,49 @@ def _do_gen_testcase(say, client, requirement_ref, logger=None, thread_ts=None, 
                 f"{len(draft['testcases'])} testcase(s).",
         error_context="Excel export for this draft failed", logger=logger,
     )
-    memory.save_thread_state(channel_id, anchor_ts,
-                              {"flow": "gen_testcase", "draft_message_ts": posted["ts"],
-                               "excel_file_id": excel_file_id,
-                               "bot_participant": True, "current_ref": requirement_ref,
-                               **draft})
+    if excel_file_id:
+        try:
+            state = memory.get_thread_state(channel_id, anchor_ts) or {}
+            state["excel_file_id"] = excel_file_id
+            memory.save_thread_state(channel_id, anchor_ts, state)
+        except Exception:
+            if logger is not None:
+                logger.exception("recording excel_file_id on draft state failed")
+
+
+def _saved_confirmation(state, user):
+    # Confirm exactly what Approve saved: TC ref -> covered AC refs. Length-capped
+    # so a huge draft can't make chat_update exceed Slack's 3000-char block limit.
+    tcs = state.get("testcases") or []
+    header = f":white_check_mark: Approved by <@{user}> (v{state.get('version')}) — saved {len(tcs)} test case(s):"
+    lines = []
+    for tc in tcs:
+        acs = ", ".join(tc.get("ac_refs") or []) or "—"
+        lines.append(f"• `{tc.get('ref')}` covering {acs}")
+    text = header + "\n" + "\n".join(lines)
+    if len(text) > 2800:
+        text = header + f"\n• {len(tcs)} test cases saved (list too long to show)."
+    return slack_format.to_slack(text)
+
+
+def _load_draft_state(channel_id, thread_ts, logger=None):
+    """Load a gen_testcase draft for (channel_id, thread_ts). Never raises.
+
+    Returns (state, status) where status is:
+      "ok"      -> state is a valid gen_testcase draft (has testcases),
+      "absent"  -> no draft here (truly missing / a non-draft thread),
+      "error"   -> a storage read error (transient).
+    Lets callers show the right message and never crash the Slack handler.
+    """
+    try:
+        state = memory.get_thread_state(channel_id, thread_ts)
+    except Exception:
+        if logger is not None:
+            logger.exception("get_thread_state failed")
+        return None, "error"
+    if not state or state.get("flow") != "gen_testcase" or "testcases" not in state:
+        return None, "absent"
+    return state, "ok"
 
 
 def _do_discard_testcase(say, client, thread_ts, channel_id, user_id, logger=None):
@@ -987,12 +1062,20 @@ def build_app():
     @app.action("tc_approve")
     def handle_tc_approve(ack, body, client, logger):
         ack()
-        channel_id = body["channel"]["id"]
-        thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
-        state = memory.get_thread_state(channel_id, thread_ts)
-        if not state:
+        try:
+            channel_id = body["channel"]["id"]
+            thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
+        except Exception:
+            logger.exception("tc_approve: bad payload")
+            return
+        state, status = _load_draft_state(channel_id, thread_ts, logger)
+        if status == "error":
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=":warning: No draft found for this thread.")
+                                     text=":warning: Couldn't read the draft (temporary storage error) — please try again.")
+            return
+        if status == "absent":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread — please regenerate the test cases.")
             return
         if _is_stale_draft_click(body, state):
             client.chat_postMessage(
@@ -1002,6 +1085,15 @@ def build_app():
             )
             return
         user = body["user"]["id"]
+        # TODO (Level 2 — approver gating): restrict Approve to the QE Lead.
+        #   qe = db.resolve_role_slack_id("qe_lead", _project_for_channel(channel_id, logger))
+        #   if qe and user != qe:
+        #       client.chat_postEphemeral(channel=channel_id, user=user,
+        #           text="Chỉ QE Lead mới approve được.")  # (needs thread_ts for in-thread)
+        #       return
+        #   if not qe: logger.warning("qe_lead unresolved; allowing approve")  # never block demo
+        # Left as a TODO on purpose: with a seeded qe_lead this would block any other
+        # tester from approving during the demo. Enable once roles are finalized.
         try:
             testcase_gen.finalize_and_save(state, approved_by=user)
         except Exception as e:
@@ -1009,15 +1101,22 @@ def build_app():
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
                                      text=slack_format.to_slack(f":warning: Error saving testcases: {e}"))
             return
+        # Mark the draft approved so a redelivery/double-click can't re-save (best-effort).
+        try:
+            state["status"] = "approved"
+            memory.save_thread_state(channel_id, thread_ts, state)
+        except Exception:
+            logger.exception("marking draft approved failed")
         # Remove the Approve/Refine buttons now that the DB write has succeeded,
         # so a double-click or Slack redelivery can't trigger a second export/upload.
         # Keep the rendered testcase list itself — only the actions block is
-        # dropped — so the reviewer can still see what they approved.
+        # dropped — so the reviewer can still see what they approved, and append a
+        # confirmation of exactly what was saved (TC ref -> covered ACs).
         try:
             kept_blocks = [b for b in (body["message"].get("blocks") or [])
                            if b.get("type") != "actions"]
             kept_blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                                "text": f":white_check_mark: Approved by <@{user}> (v{state['version']})"}})
+                                "text": _saved_confirmation(state, user)}})
             client.chat_update(
                 channel=channel_id, ts=body["message"]["ts"],
                 blocks=kept_blocks,
@@ -1039,12 +1138,20 @@ def build_app():
     @app.action("tc_refine")
     def handle_tc_refine(ack, body, client, logger):
         ack()
-        channel_id = body["channel"]["id"]
-        thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
-        state = memory.get_thread_state(channel_id, thread_ts)
-        if not state:
+        try:
+            channel_id = body["channel"]["id"]
+            thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
+        except Exception:
+            logger.exception("tc_refine: bad payload")
+            return
+        state, status = _load_draft_state(channel_id, thread_ts, logger)
+        if status == "error":
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=":warning: No draft found for this thread.")
+                                     text=":warning: Couldn't read the draft (temporary storage error) — please try again.")
+            return
+        if status == "absent":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread — please regenerate the test cases.")
             return
         if _is_stale_draft_click(body, state):
             client.chat_postMessage(
@@ -1073,13 +1180,21 @@ def build_app():
     @app.view("tc_refine_submit")
     def handle_tc_refine_submit(ack, body, client, view, logger):
         ack()
-        meta = json.loads(view["private_metadata"])
-        channel_id, thread_ts = meta["channel_id"], meta["thread_ts"]
-        comment = view["state"]["values"]["comment_block"]["comment_input"]["value"]
-        state = memory.get_thread_state(channel_id, thread_ts)
-        if not state:
+        try:
+            meta = json.loads(view["private_metadata"])
+            channel_id, thread_ts = meta["channel_id"], meta["thread_ts"]
+            comment = view["state"]["values"]["comment_block"]["comment_input"]["value"]
+        except Exception:
+            logger.exception("tc_refine_submit: bad payload")
+            return
+        state, status = _load_draft_state(channel_id, thread_ts, logger)
+        if status == "error":
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=":warning: No draft found for this thread.")
+                                     text=":warning: Couldn't read the draft (temporary storage error) — please try again.")
+            return
+        if status == "absent":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread — please regenerate the test cases.")
             return
         # The refine LLM call can take several seconds; post an immediate
         # acknowledgement so the user doesn't think the click was dropped.
@@ -1113,9 +1228,11 @@ def build_app():
                 )
         except Exception:
             logger.exception("removing stale draft buttons failed")
+        qe_lead = db.mention_for(routing.approver_role_for("testcase"),
+                                  _project_for_channel(channel_id, logger))
         posted = client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts,
-            blocks=_testcase_draft_blocks(refined),
+            blocks=_testcase_draft_blocks(refined, qe_lead),
             text=f"Draft test cases for {refined['requirement_ref']} (v{refined['version']})",
         )
         excel_file_id = _upload_draft_excel(
