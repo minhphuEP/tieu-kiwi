@@ -58,6 +58,26 @@ DEFAULT_MAP    = _P(__file__).resolve().parents[2] / "kb" / "CDM" / "component_c
 TEST_SUFFIXES  = (".test.tsx", ".test.ts")
 
 
+def _is_test_file(sf: str) -> bool:
+    """True if `sf` looks like a test file — skipped from ingest.
+
+    Handles both FE (`*.test.tsx`, `*.test.ts`) and BE (Python) conventions
+    (`test_*.py`, `conftest.py`, anything under `/tests/`).
+    """
+    if not sf:
+        return False
+    if sf.endswith(TEST_SUFFIXES):
+        return True
+    if "/tests/" in sf:
+        return True
+    basename = sf.rsplit("/", 1)[-1]
+    if basename == "conftest.py":
+        return True
+    if basename.startswith("test_") and basename.endswith(".py"):
+        return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Glob helpers — same logic as the dry-run in kb/CDM/component_code_map.yml docs.
 # ---------------------------------------------------------------------------
@@ -106,15 +126,21 @@ def _iter_graph_nodes(graph: dict):
     """Yield non-test CodeUnit nodes with normalized fields."""
     for n in graph.get("nodes", []):
         sf = n.get("source_file", "") or ""
-        if sf.endswith(TEST_SUFFIXES):
+        if _is_test_file(sf):
             continue
         yield n
 
 
-def ingest_code_units(project_id: str, graph: dict, dry_run: bool) -> tuple[dict, int, int]:
-    """Upsert CodeUnit nodes. Returns (ref->id map, upserted, stale_marked)."""
+def ingest_code_units(project_id: str, graph: dict, source_tag: Optional[str],
+                       dry_run: bool) -> Tuple[dict, int, int]:
+    """Upsert CodeUnit nodes. Returns (ref->id map, upserted, stale_marked).
+
+    `source_tag` (e.g. 'frontend', 'backend') is stored in _meta.source_graph
+    and used to SCOPE the stale sweep — so ingesting a BE graph doesn't
+    accidentally mark all FE nodes as stale (they came from a different graph).
+    """
     built_commit = graph.get("built_at_commit")
-    id_by_ref: dict[str, int] = {}
+    id_by_ref: Dict[str, int] = {}
     upserted = 0
     stale = 0
 
@@ -133,23 +159,12 @@ def ingest_code_units(project_id: str, graph: dict, dry_run: bool) -> tuple[dict
                 "review_status":     "verified",
                 "built_at_commit":   built_commit,
                 "source_file":       n.get("source_file"),
+                "source_graph":      source_tag,
             },
         }
         if dry_run:
             id_by_ref[ref] = -1
             continue
-
-        # Check existing for stale detection
-        existing = db.get_node_by_ref("CodeUnit", ref, project_id=project_id)
-        if existing:
-            old_commit = ((existing["props_json"] or {}).get("_meta") or {}).get("built_at_commit")
-            if old_commit and built_commit and old_commit != built_commit:
-                # Different commit — mark as stale-then-refresh in the same upsert.
-                # We're replacing with fresh data, but flag that node HAD an older
-                # extraction. Not strictly needed since we overwrite, but useful
-                # if we later want to detect deleted files (nodes whose ref no
-                # longer appears in a fresh graph.json — see cleanup below).
-                pass
 
         nid = db.upsert_node_by_ref(
             "CodeUnit", ref, props=props, project_id=project_id, merge_props=True,
@@ -157,20 +172,25 @@ def ingest_code_units(project_id: str, graph: dict, dry_run: bool) -> tuple[dict
         id_by_ref[ref] = nid
         upserted += 1
 
-    # Stale sweep: CodeUnits in DB for this project whose commit is different
-    # AND whose ref did NOT appear in this graph → likely deleted files.
-    if not dry_run and built_commit:
-        stale = _mark_stale_code_units(project_id, present_refs=set(id_by_ref.keys()),
-                                        current_commit=built_commit)
+    # Stale sweep: only touch CodeUnits with matching source_graph. Without
+    # this, running the BE ingest would mark all FE nodes as stale (they
+    # weren't in the BE graph). If source_tag is None (legacy), skip the sweep.
+    if not dry_run and built_commit and source_tag:
+        stale = _mark_stale_code_units(
+            project_id, source_tag=source_tag,
+            present_refs=set(id_by_ref.keys()),
+            current_commit=built_commit,
+        )
 
     return id_by_ref, upserted, stale
 
 
-def _mark_stale_code_units(project_id: str, present_refs: set[str], current_commit: str) -> int:
+def _mark_stale_code_units(project_id: str, source_tag: str,
+                            present_refs: set, current_commit: str) -> int:
     """Flip _meta.review_status → 'stale' for CodeUnits absent from the new graph.
 
-    Nodes NOT in present_refs and whose stored built_at_commit != current_commit
-    are considered deleted from the current codebase; we keep them for history.
+    Scoped: only affects CodeUnits with `_meta.source_graph == source_tag`. This
+    lets FE and BE ingests coexist without wrongfully staling each other's nodes.
     """
     from tieukiwi.db import conn
     import psycopg
@@ -180,8 +200,9 @@ def _mark_stale_code_units(project_id: str, present_refs: set[str], current_comm
             SELECT id, ref, props_json
               FROM nodes
              WHERE type='CodeUnit' AND project_id=%s
+               AND props_json->'_meta'->>'source_graph' = %s
             """,
-            (project_id,),
+            (project_id, source_tag),
         ).fetchall()
         n_marked = 0
         for row_id, ref, props in rows:
@@ -191,8 +212,6 @@ def _mark_stale_code_units(project_id: str, present_refs: set[str], current_comm
                 continue  # still present in current graph
             if meta.get("review_status") == "stale":
                 continue  # already marked
-            if meta.get("built_at_commit") == current_commit:
-                continue  # was written by this run, shouldn't happen but guard
             new_meta = {**meta, "review_status": "stale"}
             c.execute(
                 "UPDATE nodes SET props_json = props_json || %s::jsonb WHERE id=%s",
@@ -306,6 +325,10 @@ def main():
                     help=f"path to component_code_map.yml (default: {DEFAULT_MAP})")
     ap.add_argument("--project-id", default=DEFAULT_PROJECT,
                     help=f"Tieu Kiwi project_id (default: {DEFAULT_PROJECT})")
+    ap.add_argument("--source-tag", default=None,
+                    help="Tag stored in _meta.source_graph (e.g. 'frontend', 'backend'). "
+                         "Also SCOPES the stale sweep so ingesting one graph doesn't "
+                         "wrongfully mark nodes from another graph as stale.")
     ap.add_argument("--dry-run", action="store_true",
                     help="don't touch DB, just count")
     ap.add_argument("--skip-code-edges", action="store_true",
@@ -327,7 +350,9 @@ def main():
 
     # 1) CodeUnit nodes
     print("[1/3] Upserting CodeUnit nodes...")
-    ref_to_id, upserted, stale = ingest_code_units(args.project_id, graph, args.dry_run)
+    ref_to_id, upserted, stale = ingest_code_units(
+        args.project_id, graph, args.source_tag, args.dry_run,
+    )
     print(f"      CodeUnits upserted: {upserted}")
     print(f"      Stale marked:       {stale}")
 

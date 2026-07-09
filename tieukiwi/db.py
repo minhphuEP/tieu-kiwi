@@ -1769,7 +1769,12 @@ def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
 # might be affected — via the union of code-closure impact and Component
 # dependsOn closure. This is what a QE agent uses to answer "what should I
 # re-test?" for a MR.
-_CODE_EDGE_RELS = ('imports', 'imports_from', 'calls', 'references', 're_exports', 'indirect_call')
+_CODE_EDGE_RELS = (
+    'imports', 'imports_from', 'calls', 'references', 're_exports', 'indirect_call',
+    # BE (Python) additions from graphify:
+    'uses',      # class/instance uses another class
+    'inherits',  # subclass relationship — change to parent affects children
+)
 
 
 def code_impact(target, direction='downstream', depth=3, project_id=None):
