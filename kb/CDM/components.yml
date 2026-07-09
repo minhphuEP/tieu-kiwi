@@ -1,0 +1,242 @@
+# CDM Component ontology (business features)
+#
+# Each entry becomes a Component node:
+#   type='Component', ref=<ref field below>, project_id='CDM'
+#   props_json = {name, description, owners, source, _meta}
+#
+# Ref format follows existing CDM convention (see scripts/seed/cdm_demo.py:169):
+#   COMP-CDM-<UPPERCASE-KEBAB-SLUG>
+#
+# Rules (per CLAUDE.md + memory + scripts/seed/cdm_components.py docstring):
+#   - Component = BUSINESS FEATURE / user-facing capability, not FE module or BE service.
+#   - `owners` = QE/PO/Dev role names for routing; leave [] if unknown.
+#   - `depends_on` (below) = Component→Component `dependsOn` edges,
+#     HAND-AUTHORED with PO/tech lead. Never extracted from code imports.
+#   - `source` is a hint for the FE globs in component_code_map.yml — not the truth.
+#
+# Draft generated 2026-07-09 by Claude from graph.json + graphify-out + existing Requirements.
+# Please review and edit.
+
+components:
+
+  - ref: COMP-CDM-JOIN-FLOW
+    name: Join Flow (Creator Onboarding Wizard)
+    description: >
+      Multi-step creator onboarding wizard (account type → basic info → verify email
+      → categories → portfolio). Also handles invite-based signup.
+    owners: []
+    source: pages/auth/join-wizard, features/auth  (creator app)
+
+  - ref: COMP-CDM-AUTH
+    name: Authentication
+    description: >
+      Login, SSO (Google), password flows, session bootstrapping. Excludes signup
+      (see COMP-CDM-JOIN-FLOW) and invite-accept (see COMP-CDM-INVITATION-FLOW).
+    owners: []
+    source: features/auth, pages/auth  (creator + reviewer)
+
+  - ref: COMP-CDM-CREATOR-PROFILE
+    name: Creator Profile
+    description: >
+      Creator-facing profile: personal info, avatar, portfolio, shipping addresses,
+      email edit, categories. Includes the profile-completion nudge dialog.
+    owners: []
+    source: pages/profile, pages/common/profile-completion  (creator app)
+
+  - ref: COMP-CDM-REVIEWER-PROFILE
+    name: Reviewer Profile
+    description: Reviewer-facing profile page + account settings surface.
+    owners: []
+    source: pages/profile  (reviewer app)
+
+  - ref: COMP-CDM-SCRIPT-EDIT
+    name: Script Authoring (Content Editor)
+    description: >
+      Reviewer authors a script — content tab, scenes tab, persona tab, product
+      assets, references, variant pickers, autosave, undo/redo. The core editing
+      workspace. Excludes publish, translation, duplicate/assign, and list views.
+    owners: []
+    source: features/script-edit, entities/scene, pages/scripts/script-editor-page  (reviewer)
+
+  - ref: COMP-CDM-SCRIPT-PUBLISH
+    name: Script Publish
+    description: Publish workflow — validation, confirm view, distribution summary.
+    owners: []
+    source: features/script-publish  (reviewer)
+
+  - ref: COMP-CDM-SCRIPT-TRANSLATION
+    name: Script Translation
+    description: >
+      Multi-language script flow — language toggle, translate action, translation
+      status bar, stale banner.
+    owners: []
+    source: features/script-translation  (reviewer)
+
+  - ref: COMP-CDM-SCRIPT-DUPLICATE
+    name: Script Duplicate
+    description: >
+      Reviewer duplicates an existing script — can be used to create a template
+      without assigning (independent from SCRIPT-ASSIGN despite CDM-268 bundling
+      them in one UI flow).
+    owners: []
+    source: features/script-duplicate  (reviewer)
+
+  - ref: COMP-CDM-SCRIPT-ASSIGN
+    name: Script Assign to Creator
+    description: >
+      Reviewer assigns a script to a creator. Can target an existing script
+      without duplicating first (independent from SCRIPT-DUPLICATE despite
+      CDM-268 bundling them in one UI flow).
+    owners: []
+    source: features/script-assign  (reviewer)
+
+  - ref: COMP-CDM-SCRIPT-MANAGE
+    name: Script Browse & List (incl. Public Share)
+    description: >
+      Read-only side of script management — list toolbar, filter chips, hub
+      columns, public share page. Excludes the editor and the duplicate/assign
+      workflows (see SCRIPT-DUPLICATE, SCRIPT-ASSIGN).
+    owners: []
+    source: features/script-manage, entities/script, pages/scripts/scripts-list-page, pages/share  (reviewer)
+
+  - ref: COMP-CDM-OFFER-REVIEWER
+    name: Offer — Reviewer Side
+    description: >
+      Reviewer-side offer flow: create/assign offer, review submissions, add
+      tracking, mark paid, fitting approve/pending/waiting, offer-review-page
+      actions. Excludes footage sidebar (see FOOTAGE-FLOW) and sample logistics
+      (see SAMPLE-TRACKING).
+    owners: []
+    source: features/offers, features/reviewer-offer-filter, entities/offer, pages/offers  (reviewer)
+
+  - ref: COMP-CDM-OFFER-CREATOR
+    name: Offer — Creator Side
+    description: >
+      Creator-side offer flow: view offer, take on offer, offer timeline, home
+      status, list card, new panel, i18n. Excludes sample submission (see
+      SAMPLE-TRACKING) and footage submission (see FOOTAGE-FLOW).
+    owners: []
+    source: pages/offers  (creator)
+
+  - ref: COMP-CDM-FOOTAGE-FLOW
+    name: Footage Flow
+    description: >
+      Creator submits footage per offer scene; reviewer previews, gives feedback,
+      accepts or rejects. Cross-role but same footage entity.
+    owners: []
+    source: >
+      widgets/footage-review-sidebar, pages/footage, entities/scene-footage  (reviewer)
+      + footage-* files under pages/offers/components  (creator)
+
+  - ref: COMP-CDM-PRODUCT-MGMT
+    name: Product Management
+    description: Reviewer-side product catalog — list, detail, PCM dialog, manage.
+    owners: []
+    source: features/product-manage, entities/product, pages/products  (reviewer app)
+
+  - ref: COMP-CDM-SAMPLE-TRACKING
+    name: Sample Tracking
+    description: >
+      Physical product samples shipped to creators for filming — shipping address
+      capture, payment for sample cost, ship-sample dialog, size details.
+    owners: []
+    source: sample-*, shipping-* files under pages/offers/components  (creator app)
+
+  - ref: COMP-CDM-CREATOR-DIRECTORY
+    name: Creator Directory
+    description: >
+      Reviewer's directory of creators — list, detail card, hub filters, columns,
+      creator summary widget.
+    owners: []
+    source: entities/creator-summary, pages/creators  (reviewer app)
+
+  - ref: COMP-CDM-INVITATION-FLOW
+    name: Invitation Flow
+    description: >
+      Reviewer invites creators (features/invitation-manage, pages/invitations);
+      creator accepts via invite-signup page. Two ends of the same business flow.
+    owners: []
+    source: features/invitation-manage, pages/invitations (reviewer) + invite-signup-page (creator)
+
+  - ref: COMP-CDM-RULES-TEMPLATES
+    name: Rules Templates
+    description: Reviewer settings page for authoring reusable rules templates.
+    owners: []
+    source: features/rules-templates, pages/settings  (reviewer app)
+
+  - ref: COMP-CDM-ANALYTICS
+    name: Analytics Dashboard
+    description: Reviewer analytics, dashboard, and audit pages (read-only reporting).
+    owners: []
+    source: pages/analytics, pages/dashboard, pages/audit  (reviewer app)
+
+  - ref: COMP-CDM-PAYMENT
+    name: Payment Setup
+    description: >
+      Creator payment methods CRUD (used by sample_tracking; kept separate because
+      it's independently reusable and has its own PCI-adjacent handling).
+    owners: []
+    source: payment-* files under components/  (creator app)
+
+
+# ---------------------------------------------------------------------------
+# Component → Component `dependsOn` edges.
+#
+# Meaning: src DEPENDS ON dst  →  src cannot work correctly if dst is broken.
+# HAND-AUTHORED. Never auto-extracted from code imports. Requires PO / tech
+# lead confirmation. Leave empty until reviewed.
+#
+# Below is TÔI đề xuất draft; bạn sửa/xoá/thêm.
+# ---------------------------------------------------------------------------
+depends_on:
+  # sample_tracking cần payment method của creator để thu phí sample
+  - { src: COMP-CDM-SAMPLE-TRACKING,   dst: COMP-CDM-PAYMENT }
+
+  # Reviewer offer flow chạm sample logistics + footage delivery (đầu reviewer)
+  - { src: COMP-CDM-OFFER-REVIEWER,    dst: COMP-CDM-FOOTAGE-FLOW }
+  - { src: COMP-CDM-OFFER-REVIEWER,    dst: COMP-CDM-SAMPLE-TRACKING }
+  # Creator offer flow: nhận offer → làm sample → submit footage
+  - { src: COMP-CDM-OFFER-CREATOR,     dst: COMP-CDM-SAMPLE-TRACKING }
+  - { src: COMP-CDM-OFFER-CREATOR,     dst: COMP-CDM-FOOTAGE-FLOW }
+
+  # SCRIPT-ASSIGN chọn creator từ directory
+  - { src: COMP-CDM-SCRIPT-ASSIGN,     dst: COMP-CDM-CREATOR-DIRECTORY }
+  # SCRIPT-PUBLISH / TRANSLATION chỉ chạy sau khi SCRIPT-EDIT có nội dung
+  - { src: COMP-CDM-SCRIPT-PUBLISH,    dst: COMP-CDM-SCRIPT-EDIT }
+  - { src: COMP-CDM-SCRIPT-TRANSLATION,dst: COMP-CDM-SCRIPT-EDIT }
+  # DUPLICATE và ASSIGN đều cần script tồn tại từ SCRIPT-EDIT
+  - { src: COMP-CDM-SCRIPT-DUPLICATE,  dst: COMP-CDM-SCRIPT-EDIT }
+  - { src: COMP-CDM-SCRIPT-ASSIGN,     dst: COMP-CDM-SCRIPT-EDIT }
+  # Reviewer offer flow gọi SCRIPT-ASSIGN khi tạo offer từ script có sẵn
+  - { src: COMP-CDM-OFFER-REVIEWER,    dst: COMP-CDM-SCRIPT-ASSIGN }
+
+  # Invitation flow tạo tài khoản creator → xong sẽ vào Join flow completing
+  - { src: COMP-CDM-INVITATION-FLOW,   dst: COMP-CDM-JOIN-FLOW }
+
+  # Auth là dep của mọi feature — chỉ list flow chính, không list all
+  - { src: COMP-CDM-OFFER-REVIEWER,    dst: COMP-CDM-AUTH }
+  - { src: COMP-CDM-OFFER-CREATOR,     dst: COMP-CDM-AUTH }
+  - { src: COMP-CDM-SCRIPT-EDIT,       dst: COMP-CDM-AUTH }
+  - { src: COMP-CDM-SCRIPT-MANAGE,     dst: COMP-CDM-AUTH }
+  - { src: COMP-CDM-SCRIPT-DUPLICATE,  dst: COMP-CDM-AUTH }
+  - { src: COMP-CDM-SCRIPT-ASSIGN,     dst: COMP-CDM-AUTH }
+
+  # PRODUCT-MGMT là dep của mọi flow tiêu thụ Product data:
+  # - SCRIPT-EDIT: script gắn product asset/image/variant (product-image-gallery,
+  #   product-usp-features, product-variants-list, script-product-assets-section)
+  # - SCRIPT-MANAGE: list script filter/columns theo product (product-detail-script-columns)
+  # - OFFER-REVIEWER: offer tạo từ product cụ thể
+  # - OFFER-CREATOR: creator xem product info trên offer (offer-product-images, offers-product-filter)
+  - { src: COMP-CDM-SCRIPT-EDIT,       dst: COMP-CDM-PRODUCT-MGMT }
+  - { src: COMP-CDM-SCRIPT-MANAGE,     dst: COMP-CDM-PRODUCT-MGMT }
+  - { src: COMP-CDM-SCRIPT-DUPLICATE,  dst: COMP-CDM-PRODUCT-MGMT }   # duplicate copy sang product asset
+  - { src: COMP-CDM-OFFER-REVIEWER,    dst: COMP-CDM-PRODUCT-MGMT }
+  - { src: COMP-CDM-OFFER-CREATOR,     dst: COMP-CDM-PRODUCT-MGMT }
+  # PRODUCT-MGMT tự chạy cũng cần auth (reviewer login mới CRUD product được)
+  - { src: COMP-CDM-PRODUCT-MGMT,      dst: COMP-CDM-AUTH }
+
+
+# --- Deferred / merged, do NOT create as Component ---
+# - welcome-page.tsx     → part of COMP-CDM-JOIN-FLOW (post-signup), 1 file
+# - pages/share/*        → 1 file, unclear scope
+# - hooks/, lib/, shared/ → cross-cutting infrastructure, not features

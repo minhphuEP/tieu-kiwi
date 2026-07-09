@@ -240,6 +240,41 @@ TOOLS = [
     },
   },
   {
+    "name": "code_impact",
+    "description": (
+        "Impact analysis for a code change (e.g. an MR diff): given a list of "
+        "changed source files (or CodeUnit refs), returns which business "
+        "Components, Requirements, and AcceptanceCriteria might be affected. "
+        "Walks the code graph (imports/calls/references) to find transitive "
+        "consumers, then joins to Component ownership and Component dependsOn "
+        "closure. Use this to answer 'what should I re-test for this MR?'."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of changed source files (repo-relative, e.g. "
+                         "'frontend/apps/reviewer/src/pages/offers/offer-review-page.tsx') "
+                         "OR CodeUnit refs (e.g. 'CDM:reviewer_offer_review_page'). "
+                         "Both forms may be mixed.",
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["downstream", "upstream"],
+          "description": "'downstream' (default) = who USES this = MR impact scope. "
+                         "'upstream' = what this USES = dependency audit.",
+        },
+        "depth": {
+          "type": "integer",
+          "description": "Max recursion depth over code edges (default 3).",
+        },
+      },
+      "required": ["files"],
+    },
+  },
+  {
     "name": "classify_bug",
     "description": (
         "Classify how a bug was detected to route it into the improvement loop. "
@@ -407,6 +442,13 @@ def run_tool(name, args, context=None):
         return db.trace(args["requirement_ref"], project_id=project_id)
     if name == "bug_blast_radius":
         return db.bug_blast_radius(args["bug_ref"], project_id=project_id)
+    if name == "code_impact":
+        return db.code_impact(
+            args["files"],
+            direction=args.get("direction", "downstream"),
+            depth=args.get("depth", 3),
+            project_id=project_id,
+        )
     if name == "classify_bug":
         return db.classify_bug(args["bug_ref"], project_id=project_id)
     if name == "mark_reviewed":

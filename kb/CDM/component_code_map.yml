@@ -1,0 +1,213 @@
+# CDM Component → CodeUnit map (FE only, this iteration)
+#
+# Format: <Component ref>: list of glob patterns (relative to repo root of samx-cdm).
+#
+# Ingest resolves each glob against graph.json source_files, creates:
+#   Component -implementedBy-> CodeUnit
+# edges for every matched file.
+#
+# Rules:
+#   - Match order = declaration order below. First-match-wins for a file.
+#     → put SPECIFIC globs BEFORE broad ones.
+#   - Test files (*.test.tsx/*.test.ts) currently EXCLUDED at ingest time
+#     (per user decision — see plan). Add later if needed.
+#   - Cross-cutting infra (hooks/, lib/, shared/, shell/, main.tsx, vite-env, scss.d)
+#     are NOT mapped to any Component. Left uncovered by design.
+#   - If a file matches ZERO Components, dry-run will flag it — user reviews.
+#
+# Draft 2026-07-09 — REVIEW BEFORE INGEST.
+
+COMP-CDM-JOIN-FLOW:
+  - frontend/apps/creator/src/pages/auth/join-wizard/**
+  - frontend/apps/creator/src/pages/auth/sso-complete-profile-page.tsx
+  - frontend/apps/creator/src/pages/auth/components/sso-complete-profile-form.tsx
+  - frontend/apps/creator/src/pages/welcome/**
+  - frontend/apps/creator/src/app/routes/signup.*
+  - frontend/apps/creator/src/app/routes/welcome.*
+
+COMP-CDM-INVITATION-FLOW:
+  # creator side: accepting invite. reviewer side: creating invite.
+  - frontend/apps/creator/src/pages/auth/invite-signup-page.tsx
+  - frontend/apps/creator/src/features/auth/invite-attach-errors.ts
+  - frontend/apps/creator/src/features/auth/use-invite-attach-success.ts
+  - frontend/apps/reviewer/src/features/invitation-manage/**
+  - frontend/apps/reviewer/src/pages/invitations/**
+  - frontend/apps/reviewer/src/app/routes/invitations.*
+
+COMP-CDM-AUTH:
+  - frontend/apps/creator/src/features/auth/**   # remaining after INVITATION-FLOW claimed some
+  - frontend/apps/creator/src/pages/auth/forgot-password-page.tsx
+  - frontend/apps/creator/src/pages/auth/reset-password-page.tsx
+  - frontend/apps/creator/src/pages/auth/components/existing-account-prompt.tsx
+  - frontend/apps/creator/src/pages/auth/components/existing-password-form.tsx
+  - frontend/apps/creator/src/pages/auth/components/google-sign-in-button.tsx
+  - frontend/apps/creator/src/components/auth/**
+  - frontend/apps/creator/src/app/routes/forgot-password.tsx
+  - frontend/apps/creator/src/app/routes/reset-password.tsx
+  - frontend/apps/creator/src/app/routes/index.tsx    # landing → login
+
+COMP-CDM-CREATOR-PROFILE:
+  - frontend/apps/creator/src/pages/profile/**
+  - frontend/apps/creator/src/pages/common/profile-completion/**
+  - frontend/apps/creator/src/app/routes/profile.tsx
+
+COMP-CDM-REVIEWER-PROFILE:
+  - frontend/apps/reviewer/src/pages/profile/**
+  - frontend/apps/reviewer/src/app/routes/profile.tsx
+
+# --- SCRIPT feature family (was SCRIPT-MGMT, tách theo user quyết) --------
+# ORDER matters (first-match-wins). Put SPECIFIC subfeatures BEFORE the broad
+# SCRIPT-EDIT so files in features/script-publish/** don't get claimed by SCRIPT-EDIT.
+
+COMP-CDM-SCRIPT-PUBLISH:
+  - frontend/apps/reviewer/src/features/script-publish/**
+
+COMP-CDM-SCRIPT-TRANSLATION:
+  - frontend/apps/reviewer/src/features/script-translation/**
+
+COMP-CDM-SCRIPT-DUPLICATE:
+  - frontend/apps/reviewer/src/features/script-duplicate/**
+
+COMP-CDM-SCRIPT-ASSIGN:
+  - frontend/apps/reviewer/src/features/script-assign/**
+
+COMP-CDM-SCRIPT-MANAGE:
+  - frontend/apps/reviewer/src/features/script-manage/**
+  - frontend/apps/reviewer/src/entities/script/**
+  - frontend/apps/reviewer/src/pages/scripts/scripts-list-page.tsx
+  - frontend/apps/reviewer/src/pages/share/**
+  - frontend/apps/reviewer/src/app/routes/scripts.tsx
+  - frontend/apps/reviewer/src/app/routes/scripts.index.tsx
+  - frontend/apps/reviewer/src/app/routes/share.*
+
+COMP-CDM-SCRIPT-EDIT:
+  # Broad — declared LAST in the script family so subfeatures claim first.
+  - frontend/apps/reviewer/src/features/script-edit/**
+  - frontend/apps/reviewer/src/entities/scene/**
+  - frontend/apps/reviewer/src/pages/scripts/script-editor-page.tsx
+  - frontend/apps/reviewer/src/app/routes/scripts.$scriptId.tsx
+
+
+# --- OFFER family (was OFFER-LIFECYCLE, tách theo role) --------------------
+
+COMP-CDM-OFFER-REVIEWER:
+  - frontend/apps/reviewer/src/features/offers/**
+  - frontend/apps/reviewer/src/features/reviewer-offer-filter/**
+  - frontend/apps/reviewer/src/entities/offer/**
+  - frontend/apps/reviewer/src/pages/offers/**
+  - frontend/apps/reviewer/src/app/routes/offers.*
+
+COMP-CDM-OFFER-CREATOR:
+  - frontend/apps/creator/src/pages/offers/components/offer-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/offer-*.ts
+  - frontend/apps/creator/src/pages/offers/components/offers-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/home-status-card.tsx
+  - frontend/apps/creator/src/pages/offers/components/creator-home-onboarding.tsx
+  - frontend/apps/creator/src/pages/offers/offer-detail-page.tsx
+  - frontend/apps/creator/src/pages/offers/offers-list-page.tsx
+  - frontend/apps/creator/src/app/routes/offers.*
+
+COMP-CDM-FOOTAGE-FLOW:
+  # reviewer side: sidebar + fitting/footage dialogs on offer detail
+  - frontend/apps/reviewer/src/widgets/footage-review-sidebar/**
+  - frontend/apps/reviewer/src/entities/scene-footage/**
+  - frontend/apps/reviewer/src/pages/footage/**
+  # ↓ these live under features/offers but ARE about footage — override the
+  # OFFER-LIFECYCLE claim. Put BEFORE OFFER-LIFECYCLE in the ingest order.
+  # (documented here as "override" but real precedence is declaration order —
+  #  because FOOTAGE-FLOW is declared before OFFER-LIFECYCLE in this file,
+  #  wait no it isn't. TODO fix order or add explicit override list.)
+  # For now, we handle overrides via `overrides:` list at the bottom.
+  # creator side: fitting sections + footage cards
+  - frontend/apps/creator/src/pages/offers/components/creator-fitting-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/fitting-upload-grid.tsx
+  - frontend/apps/creator/src/pages/offers/components/footage-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/footage-*.ts
+  - frontend/apps/creator/src/pages/offers/components/scene-footage-preview-dialog.tsx
+  - frontend/apps/creator/src/pages/offers/components/upload-queued-scene.ts
+
+COMP-CDM-SAMPLE-TRACKING:
+  # creator side: sample forms + shipping + take-on-offer + size details
+  - frontend/apps/creator/src/pages/offers/components/sample-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/sample-*.ts
+  - frontend/apps/creator/src/pages/offers/components/previous-sample-section.tsx
+  - frontend/apps/creator/src/pages/offers/components/size-entry-fields.tsx
+  - frontend/apps/creator/src/pages/offers/components/shipping-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/take-on-offer-modal.tsx
+  - frontend/apps/creator/src/components/shipping-address-form.tsx
+  - frontend/apps/creator/src/components/shipping-address-item-card.tsx
+
+COMP-CDM-PAYMENT:
+  - frontend/apps/creator/src/components/payment-*.tsx
+  - frontend/apps/creator/src/components/payment-*.ts
+  # reviewer-side payment view lives under entities/offer/... — keep it in OFFER
+  # unless user wants it split.
+
+COMP-CDM-PRODUCT-MGMT:
+  - frontend/apps/reviewer/src/features/product-manage/**
+  - frontend/apps/reviewer/src/entities/product/**
+  - frontend/apps/reviewer/src/pages/products/**
+  - frontend/apps/reviewer/src/app/routes/products.*
+
+COMP-CDM-CREATOR-DIRECTORY:
+  - frontend/apps/reviewer/src/entities/creator-summary/**
+  - frontend/apps/reviewer/src/pages/creators/**
+  - frontend/apps/reviewer/src/app/routes/creators.*
+
+COMP-CDM-RULES-TEMPLATES:
+  - frontend/apps/reviewer/src/features/rules-templates/**
+  - frontend/apps/reviewer/src/pages/settings/rules-templates-page.tsx
+  - frontend/apps/reviewer/src/app/routes/rules-templates.*
+
+COMP-CDM-ANALYTICS:
+  - frontend/apps/reviewer/src/pages/analytics/**
+  - frontend/apps/reviewer/src/pages/audit/**
+  - frontend/apps/reviewer/src/pages/dashboard/**
+  - frontend/apps/reviewer/src/app/routes/analytics.*
+  - frontend/apps/reviewer/src/app/routes/audit.*
+  - frontend/apps/reviewer/src/app/routes/dashboard.*
+  - frontend/apps/reviewer/src/app/routes/reviewer.tsx
+
+
+# ---------------------------------------------------------------------------
+# Explicit overrides — file → Component reassignment.
+# For cases a broad glob would misclassify. Overrides ANY glob match.
+# ---------------------------------------------------------------------------
+overrides:
+  # These live under features/offers but ARE reviewer-side footage/fitting UI:
+  frontend/apps/reviewer/src/features/offers/fitting-review-dialog.tsx: COMP-CDM-FOOTAGE-FLOW
+  frontend/apps/reviewer/src/features/offers/reject-scene-footage-dialog.tsx: COMP-CDM-FOOTAGE-FLOW
+  frontend/apps/reviewer/src/features/offers/review-footage-action-bar.tsx: COMP-CDM-FOOTAGE-FLOW
+  frontend/apps/reviewer/src/features/offers/ship-sample-dialog.tsx: COMP-CDM-SAMPLE-TRACKING
+
+
+# ---------------------------------------------------------------------------
+# Files explicitly NOT mapped to any Component (cross-cutting infra).
+# Excluded to reduce dry-run "unmapped" noise. Not a hard exclude — just for
+# reporting.
+# ---------------------------------------------------------------------------
+excluded_globs:
+  - "**/hooks/**"
+  - "**/lib/**"
+  - "**/shared/**"
+  - "**/shell/**"
+  - "**/main.tsx"
+  - "**/scss.d.ts"
+  - "**/vite-env.d.ts"
+  - "**/app/routes/__root.tsx"                                  # tanstack-router shell root
+  - frontend/apps/reviewer/src/app/routes/index.tsx             # reviewer landing (redirects to dashboard)
+  # Build / config / package files (top-level per-app, not under src/)
+  - "**/package.json"
+  - "**/tsconfig.json"
+  - "**/tsconfig.*.json"
+  - "**/vercel.json"
+  - "**/vite.config.ts"
+  - "**/vite.config.js"
+  - "**/vitest.config.ts"
+  - "**/vitest.setup.ts"
+  # Cross-cutting UI atoms — not features:
+  - frontend/apps/creator/src/components/limited-text-input.tsx
+  - frontend/apps/creator/src/components/locale/**
+  - frontend/apps/creator/src/components/location-selects.tsx
+  - frontend/apps/creator/src/components/phone-number-input.tsx
+  - frontend/apps/creator/src/components/searchable-select.tsx
