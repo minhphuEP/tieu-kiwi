@@ -218,11 +218,20 @@ With `.env` filled in, Postgres up, and the schema applied:
 ```bash
 # (optional) load sample graph + KB so the tools have data to reason over
 python3 scripts/seed/kb.py           # index skills/ + kb/ into Chroma (RAG)
-python3 scripts/seed/graph.py     # insert a sample requirement graph (JIRA-101) for testing
+python3 scripts/seed/graph.py        # insert a sample requirement graph (graph data only)
+
+# reset the users table to EXACTLY the 4 real demo users (routing targets).
+# This is the single source of truth for users; safe to re-run (idempotent).
+python3 scripts/seed/users_real.py
 
 # start the interactive agent
 python3 -m tieukiwi.cli
 ```
+
+> **Reproducible users / role routing.** `scripts/seed/users_real.py` is the ONLY script that
+> writes the `users` table — it wipes any leftover/placeholder rows and inserts the 4 real demo
+> users (`delivery_manager` / `qe_lead` / `po` / `dev`, project `CDM`). Run it on every machine to
+> get identical routing. `graph.py` and `cdm_demo.py` seed graph data only and never touch `users`.
 
 You should see:
 

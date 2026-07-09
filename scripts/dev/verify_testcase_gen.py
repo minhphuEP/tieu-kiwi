@@ -1,8 +1,9 @@
 """Manual verification for testcase_gen.generate_draft/refine_draft/finalize_and_save,
 using a stub LLM (no API calls) and an isolated fixture (own project_id/Requirement/AC,
 created and torn down by this script — does not touch shared demo data like CDM_TEAM).
-Requires: Postgres up, migrations applied, VOYAGEAI_API_KEY set in .env (rag.search is
-called for real inside _fetch_kb_context; empty results are fine, but the key must exist).
+Requires: Postgres up, migrations applied. rag.search is called for real inside
+_fetch_kb_context (empty results are fine); it uses the local ONNX all-MiniLM-L6-v2
+embedding — no API key needed.
 Run: python scripts/dev/verify_testcase_gen.py
 """
 import sys

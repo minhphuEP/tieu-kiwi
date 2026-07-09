@@ -101,23 +101,6 @@ def _ensure_edge(cur, src_id, rel, dst_id, props=None):
     )
 
 
-def _upsert_user(cur, slack_id, display_name, role, project_id,
-                 jira_account_id=None, email=None):
-    cur.execute(
-        """
-        INSERT INTO users (slack_id, jira_account_id, email, display_name, role, project_id)
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (slack_id) DO UPDATE
-          SET display_name    = EXCLUDED.display_name,
-              role            = EXCLUDED.role,
-              project_id      = EXCLUDED.project_id,
-              jira_account_id = COALESCE(EXCLUDED.jira_account_id, users.jira_account_id),
-              email           = COALESCE(EXCLUDED.email,           users.email)
-        """,
-        (slack_id, jira_account_id, email, display_name, role, project_id),
-    )
-
-
 def _meta_jira(source_ref, confidence=1.0):
     """Provenance for data pulled from Jira REST (structured, high confidence)."""
     return {"_meta": {
@@ -148,17 +131,9 @@ def seed():
     with db.conn() as c:
         cur = c.cursor()
 
-        # ---- Users (routing target for CDM_TEAM) -----------------------
-        # Real names from Jira; slack_ids are placeholders. Replace with real
-        # slack_ids before wiring the Slack layer (Layer B).
-        _upsert_user(cur, "U_CDM_PO_OANH",   "Oanh Kieu Thi Nguyen (PO)",
-                     "PO",          PROJECT, email="oanh.ktnguyen@crossian.com")
-        _upsert_user(cur, "U_CDM_DEV_TAN",   "Tan Duc Nguyen (Dev)",
-                     "DEV",         PROJECT, email="tan.ducnguyen@crossian.com")
-        _upsert_user(cur, "U_CDM_QE_LEAD",   "QE Lead CDM (placeholder)",
-                     "QE_LEAD",     PROJECT)
-        _upsert_user(cur, "U_CDM_QE_EXEC",   "QE Executor CDM (placeholder)",
-                     "QE_EXECUTOR", PROJECT)
+        # Users are seeded separately by scripts/seed/users_real.py (the one source
+        # of the users table). cdm_demo seeds GRAPH data only — the U_CDM_* strings
+        # in node props below are demo metadata, not user-table rows.
 
         # ---- Component (single one for CDM portal) --------------------
         comp = _upsert_node(cur, "Component", "COMP-CDM-REVIEWER", PROJECT, {

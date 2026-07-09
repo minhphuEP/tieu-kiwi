@@ -59,25 +59,15 @@ def _add_edge(src_id, rel, dst_id, props=None):
         )
 
 
-def _add_user(slack_id, display_name, role, project_id=None,
-              jira_account_id=None, email=None):
-    with db.conn() as c:
-        c.execute(
-            """
-            INSERT INTO users (slack_id, jira_account_id, email, display_name, role, project_id)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (slack_id) DO NOTHING
-            """,
-            (slack_id, jira_account_id, email, display_name, role, project_id),
-        )
-
-
 def _reset():
-    """Clear graph + users for deterministic re-seed (dev/test DB only)."""
+    """Clear graph data for a deterministic re-seed (dev/test DB only).
+
+    Does NOT touch the `users` table — users are owned solely by the canonical
+    seed (scripts/seed/users_real.py), so graph re-seeds never disturb routing.
+    """
     with db.conn() as c:
         c.execute("DELETE FROM edges")
         c.execute("DELETE FROM nodes")
-        c.execute("DELETE FROM users")
 
 
 # --- provenance meta --------------------------------------------------------
@@ -103,14 +93,8 @@ def _meta_human():
 def seed():
     _reset()
 
-    # ---- Users (routing target) ----
-    _add_user("U01_PO_ANH",    "Anh (PO)",         "PO",          "PROJ_AUTH")
-    _add_user("U02_BA_BINH",   "Binh (BA)",        "BA",          "PROJ_AUTH")
-    _add_user("U03_QE_CUONG",  "Cuong (QE Lead)",  "QE_LEAD",     "PROJ_AUTH")
-    _add_user("U04_QE_DUNG",   "Dung (QE Exec)",   "QE_EXECUTOR", "PROJ_AUTH")
-    _add_user("U05_DEV_EM",    "Em (Dev)",         "DEV",         "PROJ_AUTH")
-    _add_user("U06_TL_FONG",   "Fong (Tech Lead)", "TECH_LEAD",   "PROJ_AUTH")
-    _add_user("U07_TL_GIANG",  "Giang (TL Notif)", "TECH_LEAD",   "PROJ_NOTIF")
+    # Users are seeded separately by scripts/seed/users_real.py (the one source of
+    # the users table) — graph.py seeds GRAPH data only.
 
     # ---- Components (2 projects for cross-project demo) ----
     comp_auth = _add_node("Component", "COMP-AUTH", "PROJ_AUTH",
@@ -196,7 +180,7 @@ def seed():
          "status": "open",
          "summary": "OTP SMS delayed >30s",
          "origin": "testing",
-         "assignee": "U05_DEV_EM"})
+         "assignee": "U0BF8SHCZ41"})
     _add_edge(tr_c, "finds", bug)
     _add_edge(bug, "affects", comp_auth)
     _add_edge(bug, "affects", comp_notif)   # cross-project
@@ -205,7 +189,7 @@ def seed():
     # ---- Feedback (about an AC, to demo resolve_owner_slack hop) ----
     fb = _add_node("Feedback", "FB-001", "PROJ_AUTH",
         {"content": "AC-101-3 nên nói rõ 3 lần thất bại LIÊN TIẾP hay tích lũy",
-         "created_by": "U03_QE_CUONG",
+         "created_by": "U0BERHH2F39",
          "status": "pending"})
     _add_edge(fb, "about", ac3)
 
