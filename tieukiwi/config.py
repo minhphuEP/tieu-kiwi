@@ -48,7 +48,7 @@ def model_for(task):
     return TASK_MODELS.get(task, DEFAULT_MODEL)
 
 
-# --- Jira (data source read through the fetch_jira tool) ---
+# --- Jira (data source consumed by ingest_jira_ticket + jira_ingest module) ---
 JIRA_BASE_URL = os.getenv("JIRA_BASE_URL")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")

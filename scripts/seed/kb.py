@@ -68,6 +68,9 @@ def infer_kb_metadata(path: Path) -> dict:
         meta["doc_type"] = "template"
     elif "samples" in parts:
         meta["doc_type"] = "sample"
+    elif "BRD" in parts or "PRD" in parts:
+        # kb/<PROJECT>/BRD/<page_id>.md — written by tools.fetch_confluence
+        meta["doc_type"] = "BRD"
     elif "glossary" in path.stem.lower():
         meta["doc_type"] = "glossary"
     else:
