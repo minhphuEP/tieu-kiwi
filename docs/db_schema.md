@@ -91,7 +91,7 @@ Sau migration `002_migration.sql`:
   - `Component[PROJ_AUTH] --dependsOn--> Component[PROJ_NOTIF]`
 - Query filter theo project ở caller site (JOIN qua `nodes.project_id` của src/dst).
 
-⚠️ **Note**: 3 query đinh hiện tại (`coverage_gap`, `trace`, `bug_blast_radius`) **chưa filter theo `project_id`**. Trong hackathon 1-project OK. Future work: add optional `project_id` param.
+✅ **Update (2026-07-10)**: 3 query đinh (`coverage_gap`, `trace`, `bug_blast_radius`) + `go_no_go` đều đã nhận optional `project_id` kwarg (`db.py`). Default `None` = không filter (giữ backward compat cho legacy caller). Bug blast radius vẫn count qua project boundary có chủ đích — cross-project impact là first-class semantic.
 
 ## Convention `props_json._meta` (LLM extraction)
 

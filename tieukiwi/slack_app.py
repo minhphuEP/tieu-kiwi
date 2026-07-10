@@ -16,7 +16,10 @@ import re
 import uuid
 from datetime import datetime
 
-from . import agent, config, db, memory, routing, slack_format, testcase_export, testcase_gen, tools
+from . import (
+    agent, config, db, jira_ingest, memory, routing, slack_format,
+    testcase_export, testcase_gen, tools,
+)
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
@@ -50,6 +53,21 @@ _MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 _GOLIVE_RE = re.compile(r"go[\s\-]?live|đủ điều kiện|release|go\s*/?\s*no-?go|sẵn sàng", re.I)
 # A Jira-style requirement ref, e.g. FRONT-3494.
 _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
+
+# Force-refresh intent: user asks to bypass hash-gate on pre-flight ingest.
+# Vietnamese + English phrasings; conservative enough that plain conversation
+# doesn't accidentally trigger. Matches "cập nhật", "refresh", "PRD đã update",
+# "chạy lại đi", "just updated", etc.
+_FORCE_REFRESH_RE = re.compile(
+    r"cập\s*nhật|làm\s*mới|đồng\s*bộ|refresh|resync|re-?fetch|reload|mới\s*nhất"
+    r"|(?:đã|vừa|mới|đang)(?:\s+được)?\s+(?:update|updated|sửa|chỉnh|thay\s*đổi|edit)"
+    r"|được\s+(?:update|updated)"
+    r"|(?:xem|review|check|chạy|run)\s+lại"
+    r"|(?:prd|brd|requirement|req|spec)\s+(?:mới|đã(?:\s+được)?\s*update"
+        r"|vừa(?:\s+được)?\s*update|updated|changed)"
+    r"|just\s+updated|please\s+re-?review|re-?check|re-?run",
+    re.I,
+)
 
 # Clarify-requirements intent: mimics the .claude/agents/brd-clarifier interview
 # workflow (skills/requirement-clarity.md), but driven through Slack Block Kit
@@ -795,6 +813,101 @@ def _ask_which_ticket(say, **kwargs):
     )
 
 
+def _update_or_post(client, channel_id, ts, thread_ts, text, logger=None):
+    """chat_update the progress message in place; fall back to a new post."""
+    slack_text = slack_format.to_slack(text)
+    if ts:
+        try:
+            client.chat_update(channel=channel_id, ts=ts, text=slack_text)
+            return
+        except Exception:
+            if logger is not None:
+                logger.exception("chat_update failed")
+    try:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=slack_text)
+    except Exception:
+        if logger is not None:
+            logger.exception("chat_postMessage fallback failed")
+
+
+def _ensure_ticket_fresh(client, channel_id, thread_ts, ref, project_id,
+                          force=False, logger=None):
+    """Pre-flight: make sure `ref`'s subtree is in the graph (and reasonably
+    fresh) before the agent runs its tools. Called for every question that
+    resolves to a ticket.
+
+    Deterministic (dev controls flow, not the LLM): posts progress to the
+    thread and calls `jira_ingest.ingest_jira_ticket`. The tool itself hash-
+    gates internally, so a cached ticket returns in <1s with no Confluence
+    fetch and no LLM AC pass. On BRD drift, ingest auto-elevates to full
+    re-extract of ACs (see `jira_ingest._check_brd_freshness`).
+
+    Args:
+      force: bypass hash-gate. Set true when the user's message contains a
+             refresh keyword ("cập nhật", "refresh", …).
+
+    Returns: the ingest summary dict (or None on total failure so the caller
+    can still try to answer from whatever's already in the graph).
+    """
+    if not ref or not channel_id:
+        return None
+    progress_ts = None
+    try:
+        # Lightweight progress message; will be chat_update'd once ingest returns.
+        resp = client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=slack_format.to_slack(
+                f"🔄 Đang đồng bộ *{ref}* từ Jira{' (force)' if force else ''}…"
+            ),
+        )
+        progress_ts = (resp or {}).get("ts")
+    except Exception:
+        if logger is not None:
+            logger.exception("progress post failed")
+
+    try:
+        summary = jira_ingest.ingest_jira_ticket(
+            ref, project_id=project_id, force=force,
+            # Extract ACs on every fresh ingest (first-time or force). ~5-15s
+            # only hits when the ticket is genuinely new — cached tickets
+            # short-circuit at the hash-gate before the LLM pass runs. Without
+            # this, ACs are never populated from Slack, and downstream tools
+            # (coverage_gap, go_no_go, get_ticket) report 0 ACs.
+            extract_acs=True,
+        )
+    except Exception as e:
+        if logger is not None:
+            logger.exception("ingest_jira_ticket failed")
+        _update_or_post(client, channel_id, progress_ts, thread_ts,
+                        f":warning: Không đồng bộ được *{ref}*: {e}", logger)
+        return None
+
+    status = summary.get("status")
+    if status == "cached_fresh":
+        text_line = f"✅ *{ref}* đã cached (hash không đổi)."
+    elif status == "ok":
+        n_bugs = len(summary.get("bugs") or [])
+        n_conf = len(summary.get("confluence_pages") or [])
+        n_tr = len(((summary.get("subtasks") or {}).get("testruns")) or [])
+        text_line = (f"✅ *{ref}* đã đồng bộ — "
+                     f"{n_tr} test run, {n_bugs} bug, {n_conf} BRD.")
+        # AC diff summary — only present when AC-extract actually ran.
+        ac_kept = summary.get("acs_kept")
+        if ac_kept is not None:
+            ac_created = len(summary.get("acs_extracted") or [])
+            ac_obsolete = len(summary.get("acs_obsoleted") or [])
+            if ac_created or ac_obsolete:
+                text_line += (f"\n📋 AC diff: *+{ac_created}* mới, "
+                              f"{ac_kept} giữ nguyên, *−{ac_obsolete}* obsolete.")
+            else:
+                text_line += f"\n📋 AC không đổi ({ac_kept} AC giữ nguyên)."
+    else:
+        text_line = f":warning: *{ref}* ingest status = `{status}`"
+    _update_or_post(client, channel_id, progress_ts, thread_ts, text_line, logger)
+    return summary
+
+
 def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=None):
     """Handle ONE user turn — shared by the @mention handler and non-mention thread
     replies, so behaviour is identical whether or not the bot is tagged.
@@ -829,14 +942,27 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
     if not ref:
         ref = _recall_ref(channel_id, thread_ts, logger)
 
+    project_id = _project_for_channel(channel_id, logger)
+
+    # Pre-flight ingest: sync the ticket's Jira + Confluence subtree BEFORE any
+    # downstream tool runs. Hash-gate keeps this ~500ms when nothing changed;
+    # detects PRD drift on Confluence and auto-re-extracts ACs. Users can force
+    # bypass with "cập nhật" / "refresh" / "PRD đã update" / … keywords.
+    # Skipped when there's no ref — general questions with no ticket context
+    # (e.g. "curator-test") don't need it.
+    if ref:
+        force_refresh = bool(_FORCE_REFRESH_RE.search(text))
+        _ensure_ticket_fresh(
+            client, channel_id, thread_ts, ref, project_id,
+            force=force_refresh, logger=logger,
+        )
+
     # Interim ack in-thread so users see progress.
     try:
         say(text=slack_format.to_slack("Processing…"), **kwargs)
     except Exception:
         if logger is not None:
             logger.exception("interim post failed")
-
-    project_id = _project_for_channel(channel_id, logger)
 
     # Go-live readiness.
     if _is_golive_question(text):

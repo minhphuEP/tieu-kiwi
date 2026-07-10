@@ -262,4 +262,4 @@ docker exec -i tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi -c \
 
 ---
 
-*Cập nhật lần cuối: migration 007 (2026-07-07). Khi thêm loại node mới hoặc đổi convention, update file này TRƯỚC khi merge pipeline mới.*
+*Cập nhật lần cuối: 2026-07-10 (post-merge phuong_qe ↔ master). Migrations hiện tại: `002` → `006` (migration `007` đã bị bỏ, xem STORAGE_GUIDE §6.2.6). AC node giờ có `section_anchor` + `section_title` props sau khi extract — xem `jira_ingest._diff_and_upsert_acs`. Khi thêm loại node mới hoặc đổi convention, update file này TRƯỚC khi merge pipeline mới.*

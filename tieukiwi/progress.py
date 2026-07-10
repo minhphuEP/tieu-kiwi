@@ -26,7 +26,6 @@ _TOOL_LABELS = {
     "fetch_confluence":   "📄 Đang tải Confluence page{page}…",
     "gen_testcase":       "✏️ Đang sinh testcase cho{ref}…",
     "gen_test_plan":      "📝 Đang sinh test plan cho{ref}…",
-    "gen_critic":         "🧐 Đang review nội dung…",
 }
 
 

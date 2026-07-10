@@ -1,3 +1,99 @@
+# Tieu Kiwi — Changelog
+
+## 2026-07-10 — Post-storage-refactor delta
+
+New capabilities landed since the 2026-07-03 entry below. Backward compat
+preserved throughout (every scoping param stays optional).
+
+### Ingest pipeline
+
+- ✅ `ingest_jira_ticket(issue_key, project_id=None, force=False)` orchestrator
+  in `tieukiwi/jira_ingest.py` — fetches Jira Story + subtasks + Confluence
+  PRDs → materialises Requirement / AC / TestRun / Bug nodes in one pass.
+- ✅ 2-tier content hash-gate: `_story_hash` (fields + subtask stubs) and
+  `_bug_table_hash` (per bug container). Unchanged tickets short-circuit as
+  `status='cached_fresh'`.
+- ✅ BRD-drift detection: on cached_fresh, compare stored version vs
+  Confluence `version.number` — auto-elevate to full ingest when PRD moved.
+- ✅ Regex fast-path for explicit `AC1:`/`CC1:` markers, LLM fallback for
+  free-flowing prose.
+- ✅ **Batched AC diff across pages** (fix): earlier per-page diff was
+  obsoleting AC of previously-processed pages; now accumulated then
+  reconciled once. AC ref stays `AC-{req_key}-{hash8}` (content-stable).
+- ✅ **`section_anchor` + `section_title` on AC props** — human-readable
+  section context stored alongside hash-based ref, so operators can:
+  ```sql
+  SELECT ref FROM nodes WHERE type='AcceptanceCriterion' AND project_id='CDM'
+    AND props_json->>'section_title' ILIKE '%login%';
+  ```
+  Then copy the ref into Excel `ac_refs` column.
+- ✅ VN→EN translate for bug-table cells with diacritics
+  (`_maybe_translate_bug_field`) — Postgres contract is English-only.
+- ✅ `[Bug]` subtask table parser (`parse_bug_subtask_table`): 1 row = 1 Bug
+  node, `find_by=Testcase` auto-creates `TestRun_self -finds-> Bug`.
+- ✅ TestCase Excel ingest reads `ac_refs` column → auto
+  `AC -coveredBy-> TC` edges (`scripts/ingest/testcases.py`).
+
+### Slack (Layer B)
+
+- ✅ Unified turn handler `_handle_mention_turn` for both `@mention` and
+  non-mention thread reply — same pipeline (refuse-switch → discard →
+  sticky-resolve → pre-flight ingest → intent routing).
+- ✅ Sticky Jira ticket per thread (`_save_thread_ref`, `_resolve_thread_ref`),
+  first-wins — a different ref in a follow-up message is treated as ad-hoc.
+- ✅ Refuse thread-reassignment attempts (`_SWITCH_RE`,
+  `_detect_switch_target`, `_switch_refusal_text`) — "thread này giờ là
+  CDM-500" is blocked with a message asking to open a new thread.
+- ✅ Force-refresh intent (`_FORCE_REFRESH_RE`) — "cập nhật CDM-268", "PRD đã
+  update", "chạy lại đi" → `force=True` on `ingest_jira_ticket`.
+- ✅ List-AC intent (`_LIST_AC_RE`, `_do_list_acs`) — deterministic AC dump,
+  skips LLM.
+- ✅ Clarify-BRD interview (`_CLARIFY_RE`, `_do_clarify`, modal flow) — Slack
+  Block Kit equivalent of the `brd-clarifier` interview workflow.
+- ✅ Live in-thread progress (`_make_progress_callback` + `chat_update` in
+  place) — replaces the "Processing…" ack with per-step labels then the final
+  answer, one tidy message per question.
+- ✅ Pre-flight `ingest_jira_ticket` before every question in a ticket thread
+  (`_ensure_ticket_fresh`) — costs ~500ms when cached, keeps the graph in sync
+  with Jira/Confluence for downstream tools.
+
+### Agent / tools
+
+- ✅ Polymorphic `get_ticket(ref)` — handles Requirement/Bug/TestRun/UserStory
+  /BRD in one call, agent no longer needs to guess the type.
+- ✅ `mark_reviewed` — TestCase review state machine (`draft` →
+  `qe_reviewed`).
+- ✅ `find_ambiguities` — LLM tool for the clarify flow.
+- ✅ `code_impact`, `feature_blast_radius` — code-graph impact analysis
+  (backend graph ingest via `scripts/ingest/code_graph.py`).
+- ✅ `mention_for(role, project_id)` in `db.py` — single mention path
+  through users table → `ROLE_<ROLE>` env → non-crashing `@role (unconfigured)`
+  fallback.
+
+### DB / migrations
+
+- ✅ `db/005_migration.sql`, `db/006_migration.sql` — additional indexes +
+  channel_project_map fields.
+- ❌ `db/007_migration.sql` withdrawn — was data-fix for legacy `CDM_TEAM` →
+  `CDM`. Fresh installs don't need it. See STORAGE_GUIDE §6.2.6.
+
+### Config housekeeping
+
+- ✅ `.env.example` present.
+- ✅ `tieukiwi/config.py` populated (was empty in earlier snapshot).
+- ✅ Chroma collection unified to `"knowledge_base"`.
+
+### Deprecated
+
+- ❌ `scripts/seed/cdm_demo.py`, `scripts/seed/cdm_demo_import_tcs.py` —
+  removed. Real Jira via `ingest_jira_ticket` is the canonical seeding path;
+  `scripts/seed/graph.py` remains as a lightweight generic fixture.
+- ❌ `fetch_jira` tool hidden from `TOOLS[]` — LLM must go through
+  `ingest_jira_ticket` (full pull) or `get_ticket` (read cache). Function
+  itself kept for legacy scripts.
+
+---
+
 # Tieu Kiwi — Storage Layer Update (2026-07-03)
 
 > Notice for the team. Storage layer got multi-tenant scoping (Slack channel →

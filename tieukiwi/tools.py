@@ -627,8 +627,6 @@ def run_tool(name, args, context=None):
         return gen_testcase(args["requirement_ref"], project_id=project_id)
     if name == "gen_test_plan":
         return gen_test_plan(args["requirement_ref"])
-    if name == "gen_critic":
-        return gen_critic(args["text"])
     if name == "find_ambiguities":
         return find_ambiguities(args["text"], project_id=project_id)
     if name == "ingest_jira_ticket":

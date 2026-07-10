@@ -10,6 +10,19 @@
 
 **Design doc:** `docs/Gen-testcase-design.md`
 
+> **Note (2026-07-10):** references below to `scripts/seed/cdm_demo.py` and the
+> `CDM_TEAM` project fixture are OUT OF DATE. That script was deleted when the
+> demo fixture was replaced by the agent-driven flow. Today, seed graph data
+> via one of:
+>
+> - **Real Jira**: `ingest_jira_ticket("CDM-268")` — pulls Story + subtasks +
+>   Confluence PRDs into the graph. Verified end-to-end (Layer B pre-flight).
+> - **Fixture**: `python scripts/seed/graph.py` for a generic 17-node sample.
+>
+> Canonical project code is `CDM` (not `CDM_TEAM`) — see the memory
+> `project_cdm_project_id.md` / `db/004_migration.sql`. Anything still typing
+> `CDM_TEAM` is legacy.
+
 ---
 
 ### Task 1: `db.py` — `requirement_with_acs` and `testcases_for_requirement`

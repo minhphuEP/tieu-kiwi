@@ -8,7 +8,7 @@
 | **UserStory** | `CDM-275` / `US-101` | Story lớn (Jira Epic hoặc UserStory) chứa nhiều Requirement |
 | **Requirement** | `CDM-268` / `REQ-101-1` | Yêu cầu nghiệp vụ (thường tương ứng 1 Jira Story) |
 | **BRD** | `CFL-2541551769` | Business Requirement Document — Confluence page nguồn. Chỉ giữ metadata + preview trong Postgres; content chunks index ở Chroma. |
-| **AcceptanceCriterion** | `AC-CDM-268-1` | Tiêu chí nghiệm thu, căn cứ viết testcase |
+| **AcceptanceCriterion** | `AC-CDM-268-a3f9c2e1` | Tiêu chí nghiệm thu, ref = `AC-<req_key>-<hash8>` (hash 8 hex của desc — idempotent qua re-ingest, text đổi → node mới + node cũ mark obsolete, giữ history `Bug -violates-> AC` |
 | **TestCase** | `CDM_DupScript_002` / `TC-101-A` | Kịch bản kiểm thử |
 | **TestRun** | `CDM-270` / `RUN-101-A-1` | Lần chạy testcase (có thể tương ứng 1 Jira subtask test-env) |
 | **Bug** | `CDM-286-1` / `BUG-501` | Lỗi phát sinh (1 row của bảng markdown trong `[Bug]` subtask → 1 Bug node) |
@@ -72,6 +72,31 @@ graph LR
 - BRD content được chunk index vào Chroma với metadata `{doc_type: "BRD", page_id, section, section_anchor, project_id}`.
 - Edge `Requirement -derivedFrom-> BRD` có `props.section_anchor` để agent scope đúng section khi RAG.
 
+## `AcceptanceCriterion` node convention (LLM extraction from PRD)
+
+- `ref` format: `AC-<req_key>-<hash8>` (VD `AC-CDM-268-a3f9c2e1`)
+  - `hash8` = sha256 của `desc` (whitespace-normalised), 8 hex đầu.
+  - Cùng desc → cùng ref → idempotent upsert.
+  - PM sửa text ("Reviewer" → "Reviewers") → hash mới → **tạo AC mới** + AC cũ
+    `_meta.review_status='obsolete'`. Edge `Bug -violates-> AC_cũ` được giữ nguyên
+    để không mất history của classify_bug.
+- Key props:
+  - `desc` — nội dung AC (verbatim từ PRD hoặc LLM extract)
+  - `section_anchor` — URL fragment (URL-decoded) của section PRD gốc (VD `"15.-Assign-new-creator"`)
+  - `section_title` — heading text thực trong PRD (VD `"15. Assign new creator for a booking script"`)
+  - `_meta.source_file` — URL Confluence đầy đủ (kèm `#anchor`) để trace về PRD
+  - `_meta.review_status` — `draft` (LLM) → `verified` (human OK) → `obsolete` (PM đã sửa/xoá)
+  - `_meta.ingested_at` / `_meta.obsoleted_at` — timestamp lifecycle
+- Diff logic (2026-07): mỗi lần re-ingest ticket, extract AC từ TẤT CẢ Confluence
+  pages trong description → gom vào 1 batch → `_diff_and_upsert_acs` reconcile 1 lần
+  (không obsolete AC của page khác như bug cũ). Xem `jira_ingest._diff_and_upsert_acs`.
+- Query AC theo feature (để copy ref vào Excel `ac_refs`):
+  ```sql
+  SELECT ref, props_json->>'desc' FROM nodes
+  WHERE type='AcceptanceCriterion' AND project_id='CDM'
+    AND props_json->>'section_title' ILIKE '%login%';
+  ```
+
 ## `Question` node convention (agent-PO clarification)
 
 - `ref` format: `Q-<thread_ts>-<idx>` (thread-scoped, unique)
@@ -116,7 +141,7 @@ Trong Jira của team, `[Bug]` là subtask container có description dạng **ma
 | Question | **PO** (target của câu hỏi — thường là PO của Requirement) | @po-anh |
 | Feedback | Theo entity mà Feedback about | (hop qua edge `about`) |
 
-Fallback khi resolve owner (`kiwi_core/routing.py`):
+Fallback khi resolve owner (`tieukiwi/routing.py` + `tieukiwi/db.py::mention_for`):
 1. `node.props_json.owner_slack_id` (instance override)
 2. `users WHERE project_id = X AND role = <default>`
 3. `users WHERE project_id IS NULL AND role = <default>`
