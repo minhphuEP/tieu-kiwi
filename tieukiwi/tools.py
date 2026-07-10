@@ -319,6 +319,26 @@ TOOLS = [
     "input_schema": {"type": "object", "properties": {}},
   },
   {
+    "name": "get_ticket",
+    "description": (
+        "READ-ONLY, POLYMORPHIC lookup for ANY Jira ticket ref (CDM-199, CDM-263, "
+        "CDM-286, CDM-286-1...). Dispatches by node type: Requirement returns "
+        "AC list + BRD + coverage; Bug returns severity + violates + finds; "
+        "TestRun returns TestCase + bugs found; UserStory/Epic returns children; "
+        "BRD returns preview + downstream requirements. Smart lookup: falls back "
+        "to `TR-<ref>` when the direct key misses (test-subtasks are stored with "
+        "the TR- prefix). ALWAYS call this FIRST when user asks about a ticket. "
+        "If found=False OR warnings mention missing data, then call "
+        "ingest_jira_ticket to pull from Jira. NEVER invent data not in the "
+        "returned payload — echo `warnings` verbatim to the user."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {"ref": {"type": "string"}},
+      "required": ["ref"],
+    },
+  },
+  {
     "name": "go_no_go",
     "description": (
         "Assess whether a requirement/feature is ready to go live in production; "
@@ -366,6 +386,35 @@ TOOLS = [
       "type": "object",
       "properties": {"bug_ref": {"type": "string"}},
       "required": ["bug_ref"],
+    },
+  },
+  {
+    "name": "mark_reviewed",
+    "description": (
+        "Advance a TestCase through the review state machine. Use when a QE or "
+        "QE Lead explicitly approves/rejects a testcase in Slack (\"QE Dung "
+        "approve TC-CDM-268-A\", \"lead reject CDM_DupScript_002 vì thiếu step\"). "
+        "State transitions: draft → qe_pending → qe_reviewed → lead_pending → "
+        "lead_approved (any state → rejected). Records reviewer_slack_id and "
+        "timestamp per stage in TestCase.props for the audit trail. Do NOT call "
+        "this for questions ABOUT a testcase — only when the user is actually "
+        "signing off / rejecting."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "tc_ref": {"type": "string",
+                   "description": "TestCase ref, e.g. 'CDM_DupScript_002' or 'TC-CDM-268-A'."},
+        "decision": {"type": "string", "enum": ["approve", "reject"],
+                     "description": "'approve' advances to next state; 'reject' → 'rejected'."},
+        "reviewer_slack_id": {"type": "string",
+                              "description": "Slack user id of the reviewer (U0..). "
+                                             "The Slack layer usually fills this from event.user."},
+        "comments": {"type": "string",
+                     "description": "Optional free-text note recorded on the transition. "
+                                    "Include when the user gave a reason for rejection or a caveat."},
+      },
+      "required": ["tc_ref", "decision", "reviewer_slack_id"],
     },
   },
   {
@@ -499,6 +548,16 @@ def run_tool(name, args, context=None):
             project_id=project_id,
             role=args.get("role"),
             include_global=True,
+        )
+    if name == "get_ticket":
+        return db.get_ticket(args["ref"], project_id=project_id)
+    if name == "mark_reviewed":
+        return db.mark_reviewed(
+            args["tc_ref"],
+            decision=args["decision"],
+            reviewer_slack_id=args["reviewer_slack_id"],
+            comments=args.get("comments"),
+            project_id=project_id,
         )
     if name == "coverage_gap":
         return db.coverage_gap(project_id=project_id)
