@@ -413,6 +413,63 @@ TOOLS = [
       "required": ["issue_key"],
     },
   },
+  {
+    "name": "ingest_jira_ticket",
+    "description": (
+        "Full-fetch a Jira ticket into the graph: upsert the Story/Requirement, its "
+        "parent Epic (as UserStory), all subtasks (test-env subtasks → TestRun nodes; "
+        "[Bug]-prefixed subtasks → parse the description table into N Bug nodes per row), "
+        "and EVERY Confluence page linked in the description (BRD node + chunks in KB). "
+        "Optionally LLM-extract Acceptance Criteria from the BRD section. Idempotent: "
+        "safe to re-run on the same ticket — nodes upsert, edges dedupe. "
+        "Use this as the DEFAULT tool when the user asks to analyze / review / import a "
+        "Jira ticket (e.g. 'phân tích CDM-269', 'kéo CDM-321 vào graph', 'review ticket ABC-123')."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "issue_key": {
+          "type": "string",
+          "description": "Jira issue key of the top-level Story (or Epic), e.g. 'CDM-268'.",
+        },
+        "extract_acs": {
+          "type": "boolean",
+          "description": "If true (default), also run LLM to extract Acceptance Criteria "
+                         "from the linked Confluence PRD section. Set false to skip when "
+                         "the user just wants to sync structure without generating ACs.",
+        },
+      },
+      "required": ["issue_key"],
+    },
+  },
+  {
+    "name": "fetch_confluence",
+    "description": (
+        "Fetch ONE Confluence page by page_id, upsert a BRD node with its metadata, "
+        "and chunk-index the body into the KB (Chroma) so `search_kb` can retrieve it. "
+        "Idempotent via content_hash — a repeat call on an unchanged page returns "
+        "status='cached' and skips embedding. Use this when the user pastes a Confluence "
+        "link directly, NOT after `ingest_jira_ticket` (which already fetches every "
+        "Confluence page linked in the Jira description)."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "page_id": {
+          "type": "string",
+          "description": "Numeric Confluence page id from the URL "
+                         "(https://<site>.atlassian.net/wiki/spaces/<space>/pages/<PAGE_ID>/...).",
+        },
+        "section_anchor": {
+          "type": "string",
+          "description": "URL fragment slug from a section link "
+                         "(e.g. '15.-Assign-new-creator-...'). Stored on the BRD node so "
+                         "downstream tools can filter chunks by section. Omit if not provided.",
+        },
+      },
+      "required": ["page_id"],
+    },
+  },
 ]
 
 def run_tool(name, args, context=None):
@@ -461,4 +518,20 @@ def run_tool(name, args, context=None):
         return find_ambiguities(args["text"], project_id=project_id)
     if name == "fetch_jira":
         return fetch_jira(args["issue_key"])
+    if name == "ingest_jira_ticket":
+        from . import jira_ingest
+        on_step = ctx.get("on_step")
+        return jira_ingest.ingest_jira_ticket(
+            args["issue_key"],
+            project_id=project_id,
+            extract_acs=args.get("extract_acs", True),
+            on_step=on_step,
+        )
+    if name == "fetch_confluence":
+        from . import confluence
+        return confluence.fetch_confluence(
+            args["page_id"],
+            project_id=project_id,
+            section_anchor=args.get("section_anchor"),
+        )
     raise ValueError(f"Unknown tool: {name}")
