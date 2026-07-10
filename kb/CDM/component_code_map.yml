@@ -1,0 +1,369 @@
+# CDM Component → CodeUnit map (FE + BE)
+#
+# Format: <Component ref>: list of glob patterns (relative to repo root of samx-cdm).
+#
+# Ingest resolves each glob against graph.json source_files, creates:
+#   Component -implementedBy-> CodeUnit
+# edges for every matched file.
+#
+# Rules:
+#   - Match order = declaration order below. First-match-wins for a file.
+#     → put SPECIFIC globs BEFORE broad ones.
+#     → put SPECIFIC Components (FOOTAGE-FLOW, SAMPLE-TRACKING) BEFORE broad
+#       ones (OFFER-REVIEWER's `apps/offers/**` glob).
+#   - Test files (*.test.tsx/*.test.ts) EXCLUDED at FE ingest time.
+#     BE `**/tests/**` and `test_*.py` also excluded via excluded_globs.
+#   - Cross-cutting infra (hooks/, lib/, shared/, media/, notifications/,
+#     common/, external/, config/, migrations/, __init__.py, etc.) NOT mapped.
+#   - `overrides:` at bottom for per-file reassignment (specific > glob).
+#
+# Draft 2026-07-09 — FE + BE ingested from same commit c9e0f277.
+
+COMP-CDM-JOIN-FLOW:
+  # --- FE ---
+  - frontend/apps/creator/src/pages/auth/join-wizard/**
+  - frontend/apps/creator/src/pages/auth/sso-complete-profile-page.tsx
+  - frontend/apps/creator/src/pages/auth/components/sso-complete-profile-form.tsx
+  - frontend/apps/creator/src/pages/welcome/**
+  - frontend/apps/creator/src/app/routes/signup.*
+  - frontend/apps/creator/src/app/routes/welcome.*
+  # --- BE ---
+  - creator/apps/creator/routers/signup_wizard.py
+
+COMP-CDM-INVITATION-FLOW:
+  # --- FE ---
+  - frontend/apps/creator/src/pages/auth/invite-signup-page.tsx
+  - frontend/apps/creator/src/features/auth/invite-attach-errors.ts
+  - frontend/apps/creator/src/features/auth/use-invite-attach-success.ts
+  - frontend/apps/reviewer/src/features/invitation-manage/**
+  - frontend/apps/reviewer/src/pages/invitations/**
+  - frontend/apps/reviewer/src/app/routes/invitations.*
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/invitations.py
+  - creator/apps/creator/routers/invitations.py
+
+COMP-CDM-AUTH:
+  # --- FE ---
+  - frontend/apps/creator/src/features/auth/**
+  - frontend/apps/creator/src/pages/auth/forgot-password-page.tsx
+  - frontend/apps/creator/src/pages/auth/reset-password-page.tsx
+  - frontend/apps/creator/src/pages/auth/components/existing-account-prompt.tsx
+  - frontend/apps/creator/src/pages/auth/components/existing-password-form.tsx
+  - frontend/apps/creator/src/pages/auth/components/google-sign-in-button.tsx
+  - frontend/apps/creator/src/components/auth/**
+  - frontend/apps/creator/src/app/routes/forgot-password.tsx
+  - frontend/apps/creator/src/app/routes/reset-password.tsx
+  - frontend/apps/creator/src/app/routes/index.tsx
+  # --- BE ---
+  # accounts domain has User + AuthSession + permissions; portfolio-specific
+  # subdirs are overridden to CREATOR-PROFILE below.
+  - packages/samx-core/samx_core/apps/accounts/**
+  - reviewer/apps/reviewer/routers/auth.py
+  - creator/apps/creator/routers/auth.py
+  - reviewer/config/auth_login_view.py
+
+COMP-CDM-CREATOR-PROFILE:
+  # --- FE ---
+  - frontend/apps/creator/src/pages/profile/**
+  - frontend/apps/creator/src/pages/common/profile-completion/**
+  - frontend/apps/creator/src/app/routes/profile.tsx
+  # --- BE ---
+  - packages/samx-core/samx_core/apps/portfolio/**
+  - creator/apps/creator/routers/account.py
+  - creator/apps/creator/routers/profile_setup.py
+  - creator/apps/creator/routers/me_response.py
+  - creator/apps/creator/routers/portfolio.py
+  - creator/apps/creator/routers/persona_options.py
+  - creator/apps/creator/routers/size_details.py
+  - creator/apps/creator/routers/rates.py
+  - creator/apps/creator/routers/contact.py
+
+COMP-CDM-REVIEWER-PROFILE:
+  # --- FE ---
+  - frontend/apps/reviewer/src/pages/profile/**
+  - frontend/apps/reviewer/src/app/routes/profile.tsx
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/me.py
+
+# --- SCRIPT feature family (specific → broad) ---
+# ORDER matters (first-match-wins). Put SPECIFIC subfeatures BEFORE the broad
+# SCRIPT-EDIT so files in features/script-publish/** don't get claimed by SCRIPT-EDIT.
+
+COMP-CDM-SCRIPT-PUBLISH:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/script-publish/**
+  # --- BE ---
+  # (no dedicated BE router file — publish action likely inside scripts.py)
+
+COMP-CDM-SCRIPT-TRANSLATION:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/script-translation/**
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/script_translations.py
+  - packages/samx-ai/samx_ai/translation/**    # AI-powered translation of script content
+
+COMP-CDM-SCRIPT-DUPLICATE:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/script-duplicate/**
+  # --- BE --- (no dedicated BE router file; duplicate action likely inside scripts.py)
+
+COMP-CDM-SCRIPT-ASSIGN:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/script-assign/**
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/distribution.py   # reviewer-side: distribute/assign script to creator
+  - creator/apps/creator/routers/assignments.py      # creator-side: view/accept assignment
+
+COMP-CDM-SCRIPT-MANAGE:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/script-manage/**
+  - frontend/apps/reviewer/src/entities/script/**
+  - frontend/apps/reviewer/src/pages/scripts/scripts-list-page.tsx
+  - frontend/apps/reviewer/src/pages/share/**
+  - frontend/apps/reviewer/src/app/routes/scripts.tsx
+  - frontend/apps/reviewer/src/app/routes/scripts.index.tsx
+  - frontend/apps/reviewer/src/app/routes/share.*
+  # --- BE ---
+  # scripts.py = main CRUD/list router. Serializers for list views live here too.
+  - reviewer/apps/reviewer/routers/scripts.py
+  - reviewer/apps/reviewer/routers/script_serializers.py
+  - reviewer/apps/reviewer/routers/script_list_serializers.py
+  - reviewer/apps/reviewer/routers/script_batch_helpers.py
+  - reviewer/apps/reviewer/routers/script_share.py
+  - reviewer/apps/reviewer/routers/public_scripts.py
+  - reviewer/apps/reviewer/routers/public_script_serializers.py
+
+COMP-CDM-SCRIPT-EDIT:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/script-edit/**
+  - frontend/apps/reviewer/src/entities/scene/**
+  - frontend/apps/reviewer/src/pages/scripts/script-editor-page.tsx
+  - frontend/apps/reviewer/src/app/routes/scripts.$scriptId.tsx
+  # --- BE ---
+  # scenes = script content; script rules are in-editor annotations.
+  - reviewer/apps/reviewer/routers/scenes.py
+  - reviewer/apps/reviewer/routers/scene_serializers.py
+  - reviewer/apps/reviewer/routers/scene_references.py
+  - reviewer/apps/reviewer/routers/script_rules_serializer.py
+
+# --- OFFER-related family: SPECIFIC (footage, sample) BEFORE broad OFFER-REVIEWER ---
+# Because OFFER-REVIEWER has broad `packages/samx-core/samx_core/apps/offers/**`.
+# On FE these don't overlap; on BE they DO — hence reorder.
+
+COMP-CDM-FOOTAGE-FLOW:
+  # --- FE ---
+  - frontend/apps/reviewer/src/widgets/footage-review-sidebar/**
+  - frontend/apps/reviewer/src/entities/scene-footage/**
+  - frontend/apps/reviewer/src/pages/footage/**
+  - frontend/apps/creator/src/pages/offers/components/creator-fitting-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/fitting-upload-grid.tsx
+  - frontend/apps/creator/src/pages/offers/components/footage-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/footage-*.ts
+  - frontend/apps/creator/src/pages/offers/components/scene-footage-preview-dialog.tsx
+  - frontend/apps/creator/src/pages/offers/components/upload-queued-scene.ts
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/offers_footage.py
+  - reviewer/apps/reviewer/routers/offers_footage_comments.py
+  - reviewer/apps/reviewer/services/footage_comment_service.py
+  - creator/apps/creator/routers/offer_footage_routes.py
+
+COMP-CDM-SAMPLE-TRACKING:
+  # --- FE ---
+  - frontend/apps/creator/src/pages/offers/components/sample-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/sample-*.ts
+  - frontend/apps/creator/src/pages/offers/components/previous-sample-section.tsx
+  - frontend/apps/creator/src/pages/offers/components/size-entry-fields.tsx
+  - frontend/apps/creator/src/pages/offers/components/shipping-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/take-on-offer-modal.tsx
+  - frontend/apps/creator/src/components/shipping-address-form.tsx
+  - frontend/apps/creator/src/components/shipping-address-item-card.tsx
+  # --- BE ---
+  # Fitting = "creator tries sample" = SAMPLE side (physical sample flow).
+  - reviewer/apps/reviewer/routers/offers_fitting.py
+  - creator/apps/creator/routers/offer_sample_routes.py
+  - creator/apps/creator/routers/shipping_addresses.py
+
+COMP-CDM-OFFER-REVIEWER:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/offers/**
+  - frontend/apps/reviewer/src/features/reviewer-offer-filter/**
+  - frontend/apps/reviewer/src/entities/offer/**
+  - frontend/apps/reviewer/src/pages/offers/**
+  - frontend/apps/reviewer/src/app/routes/offers.*
+  # --- BE ---
+  # Reviewer-facing offer endpoints:
+  - reviewer/apps/reviewer/routers/offers_crud.py
+  - reviewer/apps/reviewer/routers/offers_reviewer_transitions.py
+  - reviewer/apps/reviewer/routers/offer_serializers.py
+  - reviewer/apps/reviewer/routers/offer_list_serializers.py
+  - reviewer/apps/reviewer/routers/offer_visibility.py
+  - reviewer/apps/reviewer/routers/offer_transition_response.py
+  - reviewer/apps/reviewer/routers/offer_translation_overlay.py
+  - reviewer/apps/reviewer/routers/offer_product_media.py
+  # Shared offer domain model — assigned to REVIEWER as primary owner
+  # (creator side depends on it via OFFER-CREATOR -dependsOn-> OFFER-REVIEWER
+  # if we later add that edge; currently they share the offer entity).
+  - packages/samx-core/samx_core/apps/offers/**
+
+COMP-CDM-OFFER-CREATOR:
+  # --- FE ---
+  - frontend/apps/creator/src/pages/offers/components/offer-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/offer-*.ts
+  - frontend/apps/creator/src/pages/offers/components/offers-*.tsx
+  - frontend/apps/creator/src/pages/offers/components/home-status-card.tsx
+  - frontend/apps/creator/src/pages/offers/components/creator-home-onboarding.tsx
+  - frontend/apps/creator/src/pages/offers/offer-detail-page.tsx
+  - frontend/apps/creator/src/pages/offers/offers-list-page.tsx
+  - frontend/apps/creator/src/app/routes/offers.*
+  # --- BE ---
+  - creator/apps/creator/routers/offers.py
+  - creator/apps/creator/routers/offer_serializers.py
+  - creator/apps/creator/routers/offer_translation_overlay.py
+  - creator/apps/creator/routers/offer_product_media.py
+
+COMP-CDM-PAYMENT:
+  # --- FE ---
+  - frontend/apps/creator/src/components/payment-*.tsx
+  - frontend/apps/creator/src/components/payment-*.ts
+  # --- BE ---
+  - packages/samx-core/samx_core/apps/billing/**
+  - reviewer/apps/reviewer/routers/creator_billing.py
+  - creator/apps/creator/routers/payment_methods.py
+
+COMP-CDM-PRODUCT-MGMT:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/product-manage/**
+  - frontend/apps/reviewer/src/entities/product/**
+  - frontend/apps/reviewer/src/pages/products/**
+  - frontend/apps/reviewer/src/app/routes/products.*
+  # --- BE ---
+  - packages/samx-core/samx_core/apps/catalog/**
+  - reviewer/apps/reviewer/routers/products.py
+  - reviewer/apps/reviewer/routers/product_serializers.py
+  - reviewer/apps/reviewer/routers/product_images.py
+  - reviewer/apps/reviewer/routers/pcm_images.py
+  - creator/apps/creator/routers/pcm_images.py
+
+COMP-CDM-CREATOR-DIRECTORY:
+  # --- FE ---
+  - frontend/apps/reviewer/src/entities/creator-summary/**
+  - frontend/apps/reviewer/src/pages/creators/**
+  - frontend/apps/reviewer/src/app/routes/creators.*
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/creators.py
+  - reviewer/apps/reviewer/routers/creator_serializers.py
+
+COMP-CDM-RULES-TEMPLATES:
+  # --- FE ---
+  - frontend/apps/reviewer/src/features/rules-templates/**
+  - frontend/apps/reviewer/src/pages/settings/rules-templates-page.tsx
+  - frontend/apps/reviewer/src/app/routes/rules-templates.*
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/script_rules_templates.py
+
+COMP-CDM-ANALYTICS:
+  # --- FE ---
+  - frontend/apps/reviewer/src/pages/analytics/**
+  - frontend/apps/reviewer/src/pages/audit/**
+  - frontend/apps/reviewer/src/pages/dashboard/**
+  - frontend/apps/reviewer/src/app/routes/analytics.*
+  - frontend/apps/reviewer/src/app/routes/audit.*
+  - frontend/apps/reviewer/src/app/routes/dashboard.*
+  - frontend/apps/reviewer/src/app/routes/reviewer.tsx
+  # --- BE ---
+  - reviewer/apps/reviewer/routers/analytics.py
+  - reviewer/apps/reviewer/routers/audit.py
+  - reviewer/apps/reviewer/admin_console/**
+
+
+# ---------------------------------------------------------------------------
+# Explicit overrides — file → Component reassignment.
+# For cases a broad glob would misclassify. Overrides ANY glob match.
+# ---------------------------------------------------------------------------
+overrides:
+  # These live under features/offers but ARE reviewer-side footage/fitting UI:
+  frontend/apps/reviewer/src/features/offers/fitting-review-dialog.tsx: COMP-CDM-FOOTAGE-FLOW
+  frontend/apps/reviewer/src/features/offers/reject-scene-footage-dialog.tsx: COMP-CDM-FOOTAGE-FLOW
+  frontend/apps/reviewer/src/features/offers/review-footage-action-bar.tsx: COMP-CDM-FOOTAGE-FLOW
+  frontend/apps/reviewer/src/features/offers/ship-sample-dialog.tsx: COMP-CDM-SAMPLE-TRACKING
+
+
+# ---------------------------------------------------------------------------
+# Files explicitly NOT mapped to any Component (cross-cutting infra).
+# Excluded to reduce dry-run "unmapped" noise. Not a hard exclude — just for
+# reporting.
+# ---------------------------------------------------------------------------
+excluded_globs:
+  # --- FE infra ---
+  - "**/hooks/**"
+  - "**/lib/**"
+  - "**/shared/**"
+  - "**/shell/**"
+  - "**/main.tsx"
+  - "**/scss.d.ts"
+  - "**/vite-env.d.ts"
+  - "**/app/routes/__root.tsx"
+  - frontend/apps/reviewer/src/app/routes/index.tsx
+  - "**/package.json"
+  - "**/tsconfig.json"
+  - "**/tsconfig.*.json"
+  - "**/vercel.json"
+  - "**/vite.config.ts"
+  - "**/vite.config.js"
+  - "**/vitest.config.ts"
+  - "**/vitest.setup.ts"
+  # Cross-cutting UI atoms — not features:
+  - frontend/apps/creator/src/components/limited-text-input.tsx
+  - frontend/apps/creator/src/components/locale/**
+  - frontend/apps/creator/src/components/location-selects.tsx
+  - frontend/apps/creator/src/components/phone-number-input.tsx
+  - frontend/apps/creator/src/components/searchable-select.tsx
+
+  # --- BE infra ---
+  - "**/migrations/**"
+  - "**/tests/**"
+  - "**/test_*.py"
+  - "**/conftest.py"
+  - "**/manage.py"
+  - "**/config/settings/**"
+  - "**/config/celery.py"
+  - "**/config/urls.py"
+  - "**/config/api.py"
+  - "**/config/asgi.py"
+  - "**/config/wsgi.py"
+  - "**/config/__init__.py"
+  - "**/__init__.py"
+  - "**/apps.py"
+  - "**/router.py"
+  - "**/admin.py"
+  - "**/factories.py"
+  - "**/exceptions.py"
+  - "**/decorators.py"
+  - "**/forms.py"
+  - "**/roles.py"
+  - "**/idempotency.py"
+  - "**/pyproject.toml"
+  - "**/scripts/audit_*.py"
+  - "**/scripts/smoke_*.py"
+  - "**/scripts/compile_mjml.py"
+  - "**/scripts/dump-*.sh"
+  # BE cross-cutting shared modules:
+  - packages/samx-core/samx_core/apps/media/**             # storage infra
+  - packages/samx-core/samx_core/apps/notifications/**     # email/push infra
+  - packages/samx-core/samx_core/apps/common/**            # cross-cutting utilities
+  - packages/samx-core/samx_core/apps/external/**          # 3rd-party integrations
+  - packages/samx-core/samx_core/config/**                 # Django config
+  - packages/samx-ai/samx_ai/llm/**                        # LLM client infra
+  # Router-hub .py files (generic delivery endpoints, not feature-specific):
+  - reviewer/apps/reviewer/routers/assets.py
+  - reviewer/apps/reviewer/routers/media.py
+  - reviewer/apps/reviewer/routers/media_asset_serializers.py
+  - creator/apps/creator/routers/assets.py
+  - creator/apps/creator/routers/media.py
+  # samx-ai top-level config + operational scripts:
+  - packages/samx-ai/samx_ai/config.py
+  - scripts/audit_module_structure.py
+  - scripts/audit_shared_boundaries.py
+  - scripts/compile_mjml.py
+  - scripts/dump-pcm-es-to-local.sh
+  - scripts/smoke_s3_storage.py
