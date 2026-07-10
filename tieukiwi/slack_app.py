@@ -13,11 +13,12 @@ ANTHROPIC_API_KEY for the agent). Importing this module does NOT require the tok
 
 import json
 import re
+import time
 import uuid
 from datetime import datetime
 
 from . import (
-    agent, config, db, jira_ingest, memory, routing, slack_format,
+    agent, config, db, jira_ingest, memory, progress, routing, slack_format,
     testcase_export, testcase_gen, tools,
 )
 
@@ -68,6 +69,27 @@ _FORCE_REFRESH_RE = re.compile(
     r"|just\s+updated|please\s+re-?review|re-?check|re-?run",
     re.I,
 )
+
+# "List ACs" — a pure data query the LLM tends to summarise/drop titles from.
+# Route it to a deterministic renderer instead so QE sees every AC verbatim.
+_LIST_AC_RE = re.compile(
+    r"(?:danh\s*sách|list|liệt\s*kê|show(?:\s+me)?|xem|các|những|all)"
+    r"\s+(?:the\s+)?ac"
+    r"|ac[^\n]{0,20}(?:là\s*gì|nào|có\s*gì|of\b)"
+    r"|acceptance\s+criteri",
+    re.I,
+)
+
+
+def _list_ac_intent(text, fallback_ref=None):
+    # Return the requirement ref if the message is asking for the AC list,
+    # else None. Sticky ticket kicks in when the message doesn't repeat the ref.
+    if not text or not _LIST_AC_RE.search(text):
+        return None
+    m = _REQ_RE.search(text)
+    if m:
+        return m.group(1).upper()
+    return fallback_ref
 
 # Clarify-requirements intent: mimics the .claude/agents/brd-clarifier interview
 # workflow (skills/requirement-clarity.md), but driven through Slack Block Kit
@@ -246,12 +268,14 @@ def _strip_mention(text):
     return _MENTION_RE.sub("", text or "")
 
 
-def handle_question(text, logger=None):
+def handle_question(text, logger=None, on_step=None, channel_id=None):
     # Shared logic for both entry points: run the Layer A agent and return a
     # Slack-friendly answer string. Never raises — a failure comes back as an error message.
     # The agent returns GitHub Markdown; convert it to the canonical Slack format.
+    # on_step is an optional callback that fires as the agent thinks / calls tools,
+    # so the Slack layer can chat_update a progress message in-place.
     try:
-        answer = agent.ask(text)
+        answer = agent.ask(text, on_step=on_step)
     except Exception as e:
         if logger is not None:
             logger.exception("agent.ask failed")
@@ -646,6 +670,45 @@ def _is_stale_draft_click(body, state):
     return current_ts is not None and clicked_ts != current_ts
 
 
+def _do_list_acs(say, requirement_ref, project_id=None, thread_ts=None,
+                 channel_id=None, logger=None):
+    """Deterministic 'list ACs' — bypasses the LLM. Prevents Claude from
+    silently rephrasing/dropping AC titles when the user just wants to see
+    every AC of a ticket."""
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    try:
+        res = db.get_ticket(requirement_ref, project_id=project_id)
+        trace = db.trace(requirement_ref, project_id=project_id)
+    except Exception as e:
+        if logger is not None:
+            logger.exception("list_acs failed")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(f":warning: Error: {e}")),
+            text="Error", **kwargs)
+        return
+    if not res or not res.get("found"):
+        text = (f":information_source: *{requirement_ref}* chưa có trong graph. "
+                f"Chạy `ingest_jira_ticket({requirement_ref})` để pull từ Jira trước.")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
+        return
+    acs = (trace or {}).get("acceptance_criteria") or []
+    if not acs:
+        text = (f":information_source: *{requirement_ref}* có 0 Acceptance Criterion "
+                f"trong graph. BRD có thể chưa được extract — chạy "
+                f"`ingest_jira_ticket({requirement_ref}, force=True)`.")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
+        return
+    # Reuse the same report shape + line renderer used by the story report /
+    # go-live output, so formatting stays consistent across all AC listings.
+    report = slack_format.report_from_graph(requirement_ref, res.get("props") or {}, trace)
+    header = f"*{report.get('title') or requirement_ref}*"
+    summary = (f"Story này có *{len(acs)} Acceptance Criteria*. "
+               f"Danh sách đầy đủ:")
+    ac_lines = [slack_format._ac_line(a) for a in report.get("acs") or []]
+    text = "\n".join([header, "", summary] + ac_lines)
+    say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)),
+        text=f"AC list {requirement_ref}", **kwargs)
+
+
 def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     # Run go_no_go and post the analysis; add approve/reject buttons only on GO.
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
@@ -861,6 +924,37 @@ def _ask_which_ticket(say, **kwargs):
     )
 
 
+def _make_progress_callback(client, channel_id, progress_ts, logger=None,
+                            min_interval=0.8):
+    """Return an on_step callback that updates the given "Đang xử lý…" message
+    in-place via chat_update. `tool_done` events are swallowed (avoid flicker
+    between tool finish and next thinking event). Throttled to `min_interval`
+    seconds so a burst of tool calls doesn't hit Slack rate limits.
+    """
+    if not progress_ts or not channel_id:
+        return None
+    last = [0.0]
+
+    def _cb(ev):
+        if (ev or {}).get("phase") == "tool_done":
+            return
+        now = time.monotonic()
+        if now - last[0] < min_interval:
+            return
+        last[0] = now
+        label = progress.label_for(ev)
+        try:
+            client.chat_update(
+                channel=channel_id, ts=progress_ts,
+                text=slack_format.to_slack(label),
+            )
+        except Exception:
+            if logger is not None:
+                logger.exception("progress chat_update failed")
+
+    return _cb
+
+
 def _update_or_post(client, channel_id, ts, thread_ts, text, logger=None):
     """chat_update the progress message in place; fall back to a new post."""
     slack_text = slack_format.to_slack(text)
@@ -1019,12 +1113,24 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
             force=force_refresh, logger=logger,
         )
 
-    # Interim ack in-thread so users see progress.
+    # Interim ack in-thread — keep its ts so we can chat_update in place with
+    # per-step labels while the agent works, then swap it for the final answer.
+    progress_ts = None
     try:
-        say(text=slack_format.to_slack("Processing…"), **kwargs)
+        resp = say(text=slack_format.to_slack("🥝 Đang xử lý…"), **kwargs)
+        progress_ts = (resp or {}).get("ts")
     except Exception:
         if logger is not None:
             logger.exception("interim post failed")
+
+    # "List ACs" — deterministic AC dump; skips LLM to preserve every AC title verbatim.
+    # Checked BEFORE go-live so a message like "list ACs of CDM-268 to check golive"
+    # goes through the deterministic path, not the LLM.
+    ac_ref = _list_ac_intent(text, fallback_ref=ref)
+    if ac_ref:
+        _do_list_acs(say, ac_ref, project_id=project_id,
+                     thread_ts=thread_ts, channel_id=channel_id, logger=logger)
+        return
 
     # Go-live readiness.
     if _is_golive_question(text):
@@ -1055,12 +1161,29 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
 
     # General question. If the ref came from memory (not this message), scope the agent to it.
     agent_text = text if _extract_ref(text) else (_with_ref_context(ref, text) if ref else text)
-    answer = handle_question(agent_text, logger)
+    on_step = _make_progress_callback(client, channel_id, progress_ts, logger)
+    answer = handle_question(agent_text, logger, on_step=on_step, channel_id=channel_id)
     # Bug / failing-test question -> route to the Dev owner after listing the issues.
     if _is_bug_question(text):
         dev = db.mention_for(routing.approver_role_for("bug"), project_id)  # "bug" -> "dev"
         answer = answer + "\n\n" + slack_format.to_slack(f":bust_in_silhouette: *Dev owner:* {dev}")
-    say(blocks=_mrkdwn_blocks(answer), text=answer, **kwargs)
+
+    # Replace the interim "Đang xử lý…" message with the final answer in-place
+    # (single tidy message per question). Fall back to a new post if the update
+    # fails so the user always gets a reply.
+    posted = False
+    if progress_ts:
+        try:
+            client.chat_update(
+                channel=channel_id, ts=progress_ts,
+                blocks=_mrkdwn_blocks(answer), text=answer,
+            )
+            posted = True
+        except Exception:
+            if logger is not None:
+                logger.exception("final chat_update failed")
+    if not posted:
+        say(blocks=_mrkdwn_blocks(answer), text=answer, **kwargs)
 
 
 def build_app():
