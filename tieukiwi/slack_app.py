@@ -115,6 +115,43 @@ def _clarify_intent(text):
     return bool(text) and bool(_CLARIFY_RE.search(text))
 
 
+# Free-text rule teaching -> curator approval flow. Requires an explicit "rule" trigger
+# (VN+EN) so it never swallows go-live / gen-testcase / clarify / bug / curator-test.
+_RULE_TEACH_RE = re.compile(
+    r"(học\s*rule(?:\s*mới)?|thêm\s*rule|dạy\s*rule|add\s*rule|remember\s*this\s*rule)",
+    re.I,
+)
+# Optional trailing "for <domain>" / "cho <domain>" — only honored for known domains
+# so it can't accidentally chop a rule that merely ends in "... for X".
+_RULE_DOMAIN_RE = re.compile(r"\b(?:for|cho)\s+([A-Za-z][A-Za-z _-]{1,25})\s*$", re.I)
+_RULE_DOMAIN_MAP = {
+    "testcase": "TestCase", "test case": "TestCase", "testplan": "TestPlan",
+    "testrun": "TestRun", "requirement": "Requirement", "req": "Requirement",
+    "ac": "AcceptanceCriterion", "acceptancecriterion": "AcceptanceCriterion",
+    "acceptance criterion": "AcceptanceCriterion", "bug": "Bug",
+    "userstory": "UserStory", "user story": "UserStory", "business": "business",
+}
+
+
+def _rule_teach_intent(text):
+    return bool(text) and bool(_RULE_TEACH_RE.search(text))
+
+
+def _parse_rule_teach(text):
+    # Return (rule_text, applies_to). Strip the trigger phrase (+ a following ':') and,
+    # if the tail is "for/cho <known-domain>", use it as applies_to (default "TestCase").
+    m = _RULE_TEACH_RE.search(text)
+    remainder = (text[m.end():] if m else text).lstrip(" :–—-\t").strip()
+    applies_to = "TestCase"
+    dm = _RULE_DOMAIN_RE.search(remainder)
+    if dm:
+        cand = dm.group(1).strip().lower()
+        if cand in _RULE_DOMAIN_MAP:
+            applies_to = _RULE_DOMAIN_MAP[cand]
+            remainder = remainder[:dm.start()].strip()
+    return remainder, applies_to
+
+
 def _clarify_target(text):
     # A requirement ref wins over pasted text (same heuristic as _golive_intent).
     # Returns (requirement_ref, None) or (None, raw_text_or_None).
@@ -266,18 +303,29 @@ def _project_for_channel(channel_id, logger=None):
         return None
 
 
-def _run_curator_demo(client, channel_id, user_id, logger=None, thread_ts=None):
-    # Manual test path: enqueue a sample candidate and post it with buttons.
-    # @mentions the QE Lead (curator_role_for("TestCase") -> "qe_lead" -> resolve).
-    applies_to = "TestCase"
-    rule = "AC titles must be verifiable and unambiguous."
+def _enqueue_candidate(client, channel_id, user_id, rule_text, applies_to="TestCase",
+                       logger=None, thread_ts=None, evidence=None):
+    # ONE path for posting a candidate rule to the curator (used by the demo AND the
+    # free-text "teach a rule" command). Enqueues via db.add_candidate_rule, @mentions
+    # the approver role for applies_to (curator_role_for), and posts Approve/Edit/Reject.
     cid = db.add_candidate_rule(
-        rule, channel_id or "demo", applies_to,
-        {"evidence": "manual curator-test", "by": user_id},
+        rule_text, channel_id or "demo", applies_to,
+        evidence or {"evidence": "taught via chat", "by": user_id},
     )
     project_id = _project_for_channel(channel_id, logger)
     mention = db.mention_for(routing.curator_role_for(applies_to), project_id)
-    post_candidate_to_curator(client, channel_id, cid, rule, applies_to, mention, thread_ts=thread_ts)
+    post_candidate_to_curator(client, channel_id, cid, rule_text, applies_to, mention, thread_ts=thread_ts)
+    return cid
+
+
+def _run_curator_demo(client, channel_id, user_id, logger=None, thread_ts=None):
+    # Manual test path: enqueue a sample candidate and post it with buttons.
+    return _enqueue_candidate(
+        client, channel_id, user_id,
+        "AC titles must be verifiable and unambiguous.", "TestCase",
+        logger=logger, thread_ts=thread_ts,
+        evidence={"evidence": "manual curator-test", "by": user_id},
+    )
     return cid
 
 
@@ -816,6 +864,20 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
     # and @mentions the QE Lead. Replies in-thread.
     if "curator-test" in text.lower():
         _run_curator_demo(client, channel_id, user_id, logger, thread_ts=thread_ts)
+        return
+
+    # Teach a new quality rule from free text -> the SAME curator approval flow.
+    # Checked early (explicit "rule" trigger) so it can't swallow other intents.
+    if _rule_teach_intent(text):
+        rule_text, applies_to = _parse_rule_teach(text)
+        if not rule_text:
+            say(blocks=_mrkdwn_blocks(slack_format.to_slack(
+                "Bạn muốn dạy rule gì? Ví dụ: "
+                "`@Tieu Kiwi học rule mới: Test data must cover boundary values`")),
+                text="Usage", **kwargs)
+            return
+        _enqueue_candidate(client, channel_id, user_id, rule_text, applies_to,
+                           logger=logger, thread_ts=thread_ts)
         return
 
     # Discard command -> cancel the in-progress draft. Handle before the interim ack.
