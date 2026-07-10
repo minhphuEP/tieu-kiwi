@@ -375,6 +375,66 @@ TOOLS = [
     },
   },
   {
+    "name": "feature_blast_radius",
+    "description": (
+        "Impact analysis from a FEATURE (Component), not from a code diff. "
+        "Use when the user asks 'what could break if feature X is developed/"
+        "changed?' before code exists. Returns: (a) the target Component + "
+        "all Components that dependsOn it (transitively) — the 'features at "
+        "risk'; (b) Requirements/ACs/TestCases scoped to those Components, so "
+        "QE can plan tests. Severity: target + direct dependents = HIGH, "
+        "transitive dependents = MEDIUM. If you have a code diff instead, "
+        "use `code_impact`."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "component_ref": {
+          "type": "string",
+          "description": "Component ref, e.g. 'COMP-CDM-SCRIPT-ASSIGN' or "
+                         "'COMP-CDM-OFFER-REVIEWER'. Look up refs with "
+                         "search_kb or by listing Components in the graph.",
+        },
+      },
+      "required": ["component_ref"],
+    },
+  },
+  {
+    "name": "code_impact",
+    "description": (
+        "Impact analysis for a code change (e.g. an MR diff): given a list of "
+        "changed source files (or CodeUnit refs), returns which business "
+        "Components, Requirements, and AcceptanceCriteria might be affected. "
+        "Walks the code graph (imports/calls/references) to find transitive "
+        "consumers, then joins to Component ownership and Component dependsOn "
+        "closure. Use this to answer 'what should I re-test for this MR?'."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {"type": "string"},
+          "description": "List of changed source files (repo-relative, e.g. "
+                         "'frontend/apps/reviewer/src/pages/offers/offer-review-page.tsx') "
+                         "OR CodeUnit refs (e.g. 'CDM:reviewer_offer_review_page'). "
+                         "Both forms may be mixed.",
+        },
+        "direction": {
+          "type": "string",
+          "enum": ["downstream", "upstream"],
+          "description": "'downstream' (default) = who USES this = MR impact scope. "
+                         "'upstream' = what this USES = dependency audit.",
+        },
+        "depth": {
+          "type": "integer",
+          "description": "Max recursion depth over code edges (default 3).",
+        },
+      },
+      "required": ["files"],
+    },
+  },
+  {
     "name": "classify_bug",
     "description": (
         "Classify how a bug was detected to route it into the improvement loop. "
@@ -557,6 +617,15 @@ def run_tool(name, args, context=None):
             decision=args["decision"],
             reviewer_slack_id=args["reviewer_slack_id"],
             comments=args.get("comments"),
+            project_id=project_id,
+        )
+    if name == "feature_blast_radius":
+        return db.feature_blast_radius(args["component_ref"], project_id=project_id)
+    if name == "code_impact":
+        return db.code_impact(
+            args["files"],
+            direction=args.get("direction", "downstream"),
+            depth=args.get("depth", 3),
             project_id=project_id,
         )
     if name == "coverage_gap":

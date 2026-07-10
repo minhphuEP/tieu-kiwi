@@ -725,6 +725,480 @@ def mark_reviewed(tc_ref, decision, reviewer_slack_id, comments=None, project_id
     }
 
 
+
+# ---- Code-graph impact analysis (phuong_qe add) ----
+
+def feature_blast_radius(component_ref, project_id=None):
+    """Impact analysis starting from a Component (feature), not from a diff.
+
+    Answer: "If feature X is being developed, what OTHER features are at
+    risk of breaking?" Also lists Requirements + ACs + TestCases scoped to
+    the affected features so QE knows what to plan for.
+
+    Walk:
+      - dependents:   Components that dependsOn the target (they'd break
+                      if target breaks; ranked HIGH).
+      - target itself is the "you-are-here" (HIGH).
+      - Requirements: any Requirement impacting the target OR a dependent
+                      Component. Severity = max Component severity impacted.
+      - ACs:          under those Requirements. Inherit severity.
+      - TestCases:    coveredBy those ACs. Inherit severity.
+
+    Unlike code_impact (which walks the code closure), this is pure
+    business-graph traversal — no code awareness. Use it when you know the
+    feature but haven't cut code yet, or want to answer questions like
+    "what should QE plan for CDM-268?".
+    """
+    _sev_rank = {"high": 3, "medium": 2, "low": 1}
+    with conn() as c:
+        # Resolve target Component
+        sql = "SELECT id, ref, props_json->>'name' FROM nodes WHERE type='Component' AND ref=%s"
+        params = [component_ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"; params.append(project_id)
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            return {"target": {"ref": component_ref, "name": None},
+                    "affected_components": [], "affected_requirements": [],
+                    "affected_acs": [], "affected_testcases": [],
+                    "severity_counts": {"components": {"high":0,"medium":0,"low":0},
+                                        "requirements": {"high":0,"medium":0,"low":0},
+                                        "acs":          {"high":0,"medium":0,"low":0},
+                                        "testcases":    {"high":0,"medium":0,"low":0}},
+                    "warning": f"No Component found with ref={component_ref}"}
+        target_id, target_ref, target_name = row
+
+        # Walk dependents (Components -dependsOn-> target, transitively)
+        rows = c.execute(
+            """
+            WITH RECURSIVE dep_closure(comp_id, d) AS (
+              SELECT %s::bigint, 0
+              UNION
+              SELECT e.src_id, dc.d + 1
+                FROM dep_closure dc
+                JOIN edges e ON e.dst_id = dc.comp_id AND e.rel = 'dependsOn'
+               WHERE dc.d < 5
+            )
+            SELECT DISTINCT n.id, n.ref, n.props_json->>'name', MIN(dc.d)
+              FROM dep_closure dc
+              JOIN nodes n ON n.id = dc.comp_id
+             WHERE n.type = 'Component'
+                   """ + ("AND n.project_id = %s" if project_id else "") + """
+             GROUP BY n.id, n.ref, n.props_json->>'name'
+             ORDER BY MIN(dc.d), n.ref
+            """,
+            ([target_id, project_id] if project_id else [target_id]),
+        ).fetchall()
+        all_comp = {}
+        for cid, cref, cname, dep_d in rows:
+            all_comp[cid] = {
+                "id": cid, "ref": cref, "name": cname,
+                # Target itself and its DIRECT dependents (dep_d==1) get HIGH.
+                # More distant dependents get MEDIUM (they may or may not break).
+                "severity": ("high" if dep_d <= 1 else "medium"),
+                "via":      ("target" if dep_d == 0 else "dependsOn"),
+                "dep_depth": dep_d,
+            }
+
+        # Requirements impacting ANY affected Component
+        comp_ids = list(all_comp.keys())
+        rows = c.execute(
+            """
+            SELECT r.id, r.ref, r.props_json->>'title', e.dst_id
+              FROM nodes r
+              JOIN edges e ON e.src_id = r.id AND e.rel = 'impacts' AND e.dst_id = ANY(%s)
+             WHERE r.type = 'Requirement'
+                   """ + ("AND r.project_id = %s" if project_id else "") + """
+            """,
+            ([comp_ids, project_id] if project_id else [comp_ids]),
+        ).fetchall()
+        reqs_by_id = {}
+        for rid, rref, rtitle, comp_id in rows:
+            entry = reqs_by_id.setdefault(rid, {
+                "id": rid, "ref": rref, "title": rtitle,
+                "impacted_components": [], "severity": "low",
+            })
+            csev = all_comp[comp_id]["severity"]
+            entry["impacted_components"].append(all_comp[comp_id]["ref"])
+            if _sev_rank[csev] > _sev_rank[entry["severity"]]:
+                entry["severity"] = csev
+
+        # ACs under those Requirements
+        acs_by_id = {}
+        if reqs_by_id:
+            req_ids = list(reqs_by_id.keys())
+            sev_by_req = {r["id"]: r["severity"] for r in reqs_by_id.values()}
+            ref_by_req = {r["id"]: r["ref"]      for r in reqs_by_id.values()}
+            rows = c.execute(
+                """
+                SELECT a.id, a.ref, a.props_json->>'title', e.src_id
+                  FROM nodes a
+                  JOIN edges e ON e.dst_id = a.id AND e.rel = 'has' AND e.src_id = ANY(%s)
+                 WHERE a.type = 'AcceptanceCriterion'
+                       """ + ("AND a.project_id = %s" if project_id else "") + """
+                """,
+                ([req_ids, project_id] if project_id else [req_ids]),
+            ).fetchall()
+            for aid, aref, atitle, rid in rows:
+                acs_by_id.setdefault(aid, {
+                    "id": aid, "ref": aref, "title": atitle,
+                    "severity": sev_by_req[rid],
+                    "parent_requirement": ref_by_req[rid],
+                })
+
+        # TestCases covering those ACs
+        tcs_by_id = {}
+        if acs_by_id:
+            ac_ids = list(acs_by_id.keys())
+            sev_by_ac = {a["id"]: a["severity"] for a in acs_by_id.values()}
+            ref_by_ac = {a["id"]: a["ref"]      for a in acs_by_id.values()}
+            rows = c.execute(
+                """
+                SELECT t.id, t.ref, t.props_json->>'title', t.props_json->>'priority', e.src_id
+                  FROM nodes t
+                  JOIN edges e ON e.dst_id = t.id AND e.rel = 'coveredBy' AND e.src_id = ANY(%s)
+                 WHERE t.type = 'TestCase'
+                       """ + ("AND t.project_id = %s" if project_id else "") + """
+                """,
+                ([ac_ids, project_id] if project_id else [ac_ids]),
+            ).fetchall()
+            for tid, tref, ttitle, tprio, ac_id in rows:
+                entry = tcs_by_id.setdefault(tid, {
+                    "id": tid, "ref": tref, "title": ttitle,
+                    "priority": tprio,
+                    "severity": sev_by_ac[ac_id],
+                    "covers_acs": [],
+                })
+                entry["covers_acs"].append(ref_by_ac[ac_id])
+                asev = sev_by_ac[ac_id]
+                if _sev_rank[asev] > _sev_rank[entry["severity"]]:
+                    entry["severity"] = asev
+
+    def _sev_key(x): return (-_sev_rank[x["severity"]], x.get("ref", ""))
+    comp_list = sorted(all_comp.values(), key=_sev_key)
+    req_list  = sorted(reqs_by_id.values(), key=_sev_key)
+    ac_list   = sorted(acs_by_id.values(), key=_sev_key)
+    tc_list   = sorted(tcs_by_id.values(), key=_sev_key)
+    def _strip(x): return {k: v for k, v in x.items() if k != "id"}
+
+    return {
+        "target": {"ref": target_ref, "name": target_name},
+        "affected_components":   [_strip(v) for v in comp_list],
+        "affected_requirements": [_strip(r) for r in req_list],
+        "affected_acs":          [_strip(a) for a in ac_list],
+        "affected_testcases":    [_strip(t) for t in tc_list],
+        "severity_counts": {
+            "components":   {s: sum(1 for v in comp_list if v["severity"] == s) for s in ("high","medium","low")},
+            "requirements": {s: sum(1 for r in req_list  if r["severity"] == s) for s in ("high","medium","low")},
+            "acs":          {s: sum(1 for a in ac_list   if a["severity"] == s) for s in ("high","medium","low")},
+            "testcases":    {s: sum(1 for t in tc_list   if t["severity"] == s) for s in ("high","medium","low")},
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# code_impact — impact analysis for a code change (diff files / CodeUnit refs)
+# ---------------------------------------------------------------------------
+# Ontology walked:
+#   CodeUnit <-imports/calls/references- CodeUnit  (code closure)
+#   Component -implementedBy-> CodeUnit             (feature ownership)
+#   Component -dependsOn-> Component                (business dependency)
+#   Requirement -impacts-> Component                (feature scope)
+#   Requirement -has-> AcceptanceCriterion          (contract items)
+#
+# Given a diff (list of source files touched), returns which Requirements/ACs
+# might be affected — via the union of code-closure impact and Component
+# dependsOn closure. This is what a QE agent uses to answer "what should I
+# re-test?" for a MR.
+_CODE_EDGE_RELS = (
+    'imports', 'imports_from', 'calls', 'references', 're_exports', 'indirect_call',
+    # BE (Python) additions from graphify:
+    'uses',      # class/instance uses another class
+    'inherits',  # subclass relationship — change to parent affects children
+)
+
+
+
+def code_impact(target, direction='downstream', depth=3, project_id=None):
+    """Impact analysis for a code change.
+
+    Args:
+      target:    a file path (str), a CodeUnit ref (str), or a list of either.
+                 File paths are matched against CodeUnit.props_json->>'source_file'.
+      direction: 'downstream' (default) = "who uses THIS" — for MR impact.
+                 'upstream'              = "what does THIS use" — for dep audit.
+      depth:     max recursion depth over code edges. Default 3 (empirically
+                 the sweet spot: catches page → hook → feature helper chains
+                 without exploding to the whole app).
+      project_id: filter to a single project. Recommended.
+
+    Returns dict:
+      {
+        "seed_files":            [source_file, ...],
+        "seed_code_units":       [ref, ...],
+        "affected_code_units":   [{ref, file, label}, ...],
+        "affected_components":   [{ref, name, via}, ...],   # via: 'direct' | 'dependsOn'
+        "affected_requirements": [{ref, title}, ...],
+        "affected_acs":          [{ref, title}, ...],
+        "depth_used":            int,
+      }
+    """
+    if isinstance(target, str):
+        target = [target]
+    if not target:
+        return {"seed_files": [], "seed_code_units": [], "affected_code_units": [],
+                "affected_components": [], "affected_requirements": [],
+                "affected_acs": [], "depth_used": 0}
+    if direction not in ('downstream', 'upstream'):
+        raise ValueError(f"direction must be 'downstream' or 'upstream', got {direction!r}")
+
+    with conn() as c:
+        # 1) Resolve target → seed CodeUnit ids
+        #    Support two forms per target: a file path (contains '/') or a CodeUnit ref.
+        seed_ids = []
+        seed_files = []
+        for t in target:
+            if '/' in t and not t.startswith('CDM:') and not t.startswith(f"{project_id}:" if project_id else ''):
+                # Treat as source_file path
+                sql = "SELECT id FROM nodes WHERE type='CodeUnit' AND props_json->>'source_file' = %s"
+                params = [t]
+                if project_id is not None:
+                    sql += " AND project_id=%s"; params.append(project_id)
+                rows = c.execute(sql, params).fetchall()
+                if rows:
+                    seed_files.append(t)
+                    seed_ids.extend(r[0] for r in rows)
+            else:
+                # Treat as CodeUnit ref
+                sql = "SELECT id, props_json->>'source_file' FROM nodes WHERE type='CodeUnit' AND ref=%s"
+                params = [t]
+                if project_id is not None:
+                    sql += " AND project_id=%s"; params.append(project_id)
+                row = c.execute(sql, params).fetchone()
+                if row:
+                    seed_ids.append(row[0])
+                    if row[1]:
+                        seed_files.append(row[1])
+
+        seed_ids = list(dict.fromkeys(seed_ids))   # dedupe preserving order
+        seed_files = list(dict.fromkeys(seed_files))
+        if not seed_ids:
+            return {"seed_files": [], "seed_code_units": list(target),
+                    "affected_code_units": [], "affected_components": [],
+                    "affected_requirements": [], "affected_acs": [],
+                    "depth_used": 0, "warning": "No CodeUnit matched target"}
+
+        # 2) Recursive walk over code edges
+        # downstream = follow INCOMING edges (dst=seed → src is a consumer)
+        # upstream   = follow OUTGOING edges (src=seed → dst is a dependency)
+        if direction == 'downstream':
+            step_sql = "e.src_id AS next_id, cc.d + 1 AS d FROM code_closure cc JOIN edges e ON e.dst_id = cc.unit_id"
+        else:
+            step_sql = "e.dst_id AS next_id, cc.d + 1 AS d FROM code_closure cc JOIN edges e ON e.src_id = cc.unit_id"
+
+        code_edge_rels_tuple = _CODE_EDGE_RELS
+        rows = c.execute(
+            f"""
+            WITH RECURSIVE code_closure(unit_id, d) AS (
+              SELECT id, 0 FROM nodes WHERE id = ANY(%s)
+              UNION
+              SELECT {step_sql}
+              WHERE e.rel = ANY(%s) AND cc.d < %s
+            )
+            SELECT DISTINCT cc.unit_id, n.ref, n.props_json->>'source_file', n.props_json->>'label', MIN(cc.d)
+              FROM code_closure cc
+              JOIN nodes n ON n.id = cc.unit_id
+             WHERE n.type = 'CodeUnit'
+             GROUP BY cc.unit_id, n.ref, n.props_json->>'source_file', n.props_json->>'label'
+             ORDER BY MIN(cc.d), n.ref
+            """,
+            (seed_ids, list(code_edge_rels_tuple), depth),
+        ).fetchall()
+        affected_units = [{"id": r[0], "ref": r[1], "file": r[2], "label": r[3], "depth": r[4]} for r in rows]
+        touched_unit_ids = [r["id"] for r in affected_units]
+
+        # 3) Direct Components (via implementedBy) + min depth of touched files
+        #    Severity signal: min_depth == 0 → HIGH (change lives in this Component);
+        #                     min_depth >= 1 → MEDIUM (Component reached transitively);
+        #                     via='dependsOn' → LOW (no touched CodeUnit, only business dep).
+        unit_depth = {u["id"]: u["depth"] for u in affected_units}
+        rows = c.execute(
+            """
+            SELECT c.id, c.ref, c.props_json->>'name', e.dst_id
+              FROM nodes c
+              JOIN edges e ON e.src_id = c.id AND e.rel = 'implementedBy'
+             WHERE c.type = 'Component' AND e.dst_id = ANY(%s)
+                   """ + ("AND c.project_id = %s" if project_id else "") + """
+            """,
+            ([touched_unit_ids, project_id] if project_id else [touched_unit_ids]),
+        ).fetchall()
+        direct_comp = {}
+        for cid, cref, cname, unit_id in rows:
+            d = unit_depth.get(unit_id)
+            entry = direct_comp.setdefault(cid, {
+                "id": cid, "ref": cref, "name": cname, "via": "direct",
+                "min_depth": d if d is not None else 999,
+                "touched_units": 0,
+            })
+            entry["touched_units"] += 1
+            if d is not None and d < entry["min_depth"]:
+                entry["min_depth"] = d
+
+        # 4) Extend via dependsOn closure — Components that depend on affected ones
+        all_comp = dict(direct_comp)
+        if direct_comp:
+            direct_ids = list(direct_comp.keys())
+            rows = c.execute(
+                """
+                WITH RECURSIVE dep_closure(comp_id, d) AS (
+                  SELECT id, 0 FROM nodes WHERE id = ANY(%s)
+                  UNION
+                  SELECT e.src_id, dc.d + 1
+                    FROM dep_closure dc
+                    JOIN edges e ON e.dst_id = dc.comp_id AND e.rel = 'dependsOn'
+                   WHERE dc.d < 5
+                )
+                SELECT DISTINCT n.id, n.ref, n.props_json->>'name'
+                  FROM dep_closure dc
+                  JOIN nodes n ON n.id = dc.comp_id
+                 WHERE n.type = 'Component'
+                       """ + ("AND n.project_id = %s" if project_id else "") + """
+                """,
+                ([direct_ids, project_id] if project_id else [direct_ids]),
+            ).fetchall()
+            for cid, cref, cname in rows:
+                if cid not in all_comp:
+                    all_comp[cid] = {"id": cid, "ref": cref, "name": cname,
+                                     "via": "dependsOn", "min_depth": None,
+                                     "touched_units": 0}
+
+        # Assign severity to each Component
+        def _severity(entry):
+            if entry["via"] == "dependsOn":
+                return "low"
+            if entry["min_depth"] == 0:
+                return "high"
+            return "medium"
+
+        for v in all_comp.values():
+            v["severity"] = _severity(v)
+
+        # 5) Requirements: impacts INCOMING to affected Components. Also collect
+        #    which Components each Requirement impacts, so we can inherit the
+        #    MAX severity across those Components.
+        affected_reqs = []
+        affected_acs  = []
+        _sev_rank = {"high": 3, "medium": 2, "low": 1}
+
+        if all_comp:
+            comp_ids = list(all_comp.keys())
+            rows = c.execute(
+                """
+                SELECT r.id, r.ref, r.props_json->>'title', e.dst_id
+                  FROM nodes r
+                  JOIN edges e ON e.src_id = r.id AND e.rel = 'impacts' AND e.dst_id = ANY(%s)
+                 WHERE r.type = 'Requirement'
+                       """ + ("AND r.project_id = %s" if project_id else "") + """
+                """,
+                ([comp_ids, project_id] if project_id else [comp_ids]),
+            ).fetchall()
+            reqs_by_id = {}
+            for rid, rref, rtitle, comp_id in rows:
+                entry = reqs_by_id.setdefault(rid, {
+                    "id": rid, "ref": rref, "title": rtitle,
+                    "impacted_components": [],
+                    "severity": "low",
+                })
+                comp_ref = all_comp[comp_id]["ref"]
+                comp_sev = all_comp[comp_id]["severity"]
+                entry["impacted_components"].append(comp_ref)
+                if _sev_rank[comp_sev] > _sev_rank[entry["severity"]]:
+                    entry["severity"] = comp_sev
+            affected_reqs = list(reqs_by_id.values())
+
+            # 6) ACs: has OUTGOING from those Requirements — inherit Req severity
+            if affected_reqs:
+                req_ids = [r["id"] for r in affected_reqs]
+                sev_by_req_id = {r["id"]: r["severity"] for r in affected_reqs}
+                rows = c.execute(
+                    """
+                    SELECT a.id, a.ref, a.props_json->>'title', e.src_id
+                      FROM nodes a
+                      JOIN edges e ON e.dst_id = a.id AND e.rel = 'has' AND e.src_id = ANY(%s)
+                     WHERE a.type = 'AcceptanceCriterion'
+                           """ + ("AND a.project_id = %s" if project_id else "") + """
+                    """,
+                    ([req_ids, project_id] if project_id else [req_ids]),
+                ).fetchall()
+                acs_by_id = {}
+                for aid, aref, atitle, req_id in rows:
+                    parent_sev = sev_by_req_id.get(req_id, "low")
+                    entry = acs_by_id.setdefault(aid, {
+                        "id": aid, "ref": aref, "title": atitle,
+                        "severity": parent_sev,
+                        "parent_requirement": next(r["ref"] for r in affected_reqs if r["id"] == req_id),
+                    })
+                    if _sev_rank[parent_sev] > _sev_rank[entry["severity"]]:
+                        entry["severity"] = parent_sev
+                affected_acs = list(acs_by_id.values())
+
+        # 7) TestCases: coveredBy OUTGOING from those ACs. TestCase inherits
+        #    severity from its AC (which inherited from its parent Requirement).
+        affected_testcases = []
+        if affected_acs:
+            ac_ids = [a["id"] for a in affected_acs]
+            sev_by_ac_id = {a["id"]: a["severity"] for a in affected_acs}
+            ref_by_ac_id = {a["id"]: a["ref"] for a in affected_acs}
+            rows = c.execute(
+                """
+                SELECT t.id, t.ref, t.props_json->>'title', t.props_json->>'priority', e.src_id
+                  FROM nodes t
+                  JOIN edges e ON e.dst_id = t.id AND e.rel = 'coveredBy' AND e.src_id = ANY(%s)
+                 WHERE t.type = 'TestCase'
+                       """ + ("AND t.project_id = %s" if project_id else "") + """
+                """,
+                ([ac_ids, project_id] if project_id else [ac_ids]),
+            ).fetchall()
+            tcs_by_id = {}
+            for tid, tref, ttitle, tprio, ac_id in rows:
+                inherited_sev = sev_by_ac_id.get(ac_id, "low")
+                entry = tcs_by_id.setdefault(tid, {
+                    "id": tid, "ref": tref, "title": ttitle,
+                    "priority": tprio,           # TC's own priority (P1..P4 from Excel), if any
+                    "severity": inherited_sev,   # inherited from AC → Requirement chain
+                    "covers_acs": [],
+                })
+                entry["covers_acs"].append(ref_by_ac_id[ac_id])
+                if _sev_rank[inherited_sev] > _sev_rank[entry["severity"]]:
+                    entry["severity"] = inherited_sev
+            affected_testcases = list(tcs_by_id.values())
+
+    # Sort by severity (high → medium → low), then by ref for stability
+    def _sev_key(x): return (-_sev_rank[x["severity"]], x.get("ref", ""))
+    comp_list = sorted(all_comp.values(), key=_sev_key)
+    req_list  = sorted(affected_reqs, key=_sev_key)
+    ac_list   = sorted(affected_acs,  key=_sev_key)
+    tc_list   = sorted(affected_testcases, key=_sev_key)
+
+    # Strip internal ids from returned dicts (LLM/user doesn't need them)
+    def _strip(x): return {k: v for k, v in x.items() if k != "id"}
+    return {
+        "seed_files":            seed_files,
+        "seed_code_units":       [u["ref"] for u in affected_units if u["depth"] == 0],
+        "affected_code_units":   [_strip(u) for u in affected_units],
+        "affected_components":   [_strip(v) for v in comp_list],
+        "affected_requirements": [_strip(r) for r in req_list],
+        "affected_acs":          [_strip(a) for a in ac_list],
+        "affected_testcases":    [_strip(t) for t in tc_list],
+        "severity_counts": {
+            "components":   {s: sum(1 for v in comp_list if v["severity"] == s) for s in ("high","medium","low")},
+            "requirements": {s: sum(1 for r in req_list  if r["severity"] == s) for s in ("high","medium","low")},
+            "acs":          {s: sum(1 for a in ac_list   if a["severity"] == s) for s in ("high","medium","low")},
+            "testcases":    {s: sum(1 for t in tc_list   if t["severity"] == s) for s in ("high","medium","low")},
+        },
+        "depth_used":            depth,
+        "direction":             direction,
+    }
 def get_node_props(ref, type_=None):
     """Return props_json (dict) for the node with this ref (optionally by type), or {}."""
     sql = "SELECT props_json FROM nodes WHERE ref=%s"
