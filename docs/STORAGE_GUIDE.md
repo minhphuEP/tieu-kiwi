@@ -51,7 +51,9 @@ cd /path/to/tieu-kiwi
 docker compose up -d
 
 # 3.2 Apply schema + migrations (idempotent — chạy lại OK)
-for f in db/schema.sql db/002_migration.sql db/003_migration.sql db/004_migration.sql; do
+for f in db/schema.sql \
+         db/002_migration.sql db/003_migration.sql db/004_migration.sql \
+         db/005_migration.sql db/006_migration.sql; do
   docker exec -i tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi < "$f"
 done
 
@@ -465,7 +467,9 @@ python -c "from tieukiwi import db, routing; \
 
 ## 6. Reset / rebuild — dev only
 
-Khi cần clean state (VD demo, test lại):
+### 6.1 Soft reset — chỉ wipe graph (giữ schema)
+
+Dùng khi muốn test lại từ đầu nhưng không cần drop DB:
 
 ```bash
 # Wipe graph (nodes/edges/users)
@@ -475,11 +479,210 @@ python scripts/seed/users.py    # seed users lại
 # Wipe Chroma (KB)
 python scripts/seed/kb.py --wipe
 
-# Re-ingest tất cả
+# Re-ingest artifacts
 python scripts/ingest/requirements.py data_ingestion/requirements/<file> --project=CDM ...
 python scripts/ingest/testcases.py data_ingestion/testcases/<file> --project=CDM
 python scripts/ingest/bugs.py data_ingestion/bugs/<file> --project=CDM
 ```
+
+### 6.2 Full reset — drop DB rồi rehydrate
+
+Khi container Postgres bị hỏng / cần xoá volume / mất data:
+
+```bash
+# 6.2.1 — Drop & recreate DB (destructive, không undo được)
+docker compose down -v          # -v xoá cả volume
+docker compose up -d
+# Đợi Postgres ready (~5s)
+
+# 6.2.2 — Apply schema + migrations
+for f in db/schema.sql \
+         db/002_migration.sql db/003_migration.sql db/004_migration.sql \
+         db/005_migration.sql db/006_migration.sql; do
+  docker exec -i tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi < "$f"
+done
+
+# 6.2.3 — Team seed (users + Chroma KB + Components ontology)
+python scripts/seed/users.py               # routing target
+python scripts/seed/kb.py --wipe           # RAG (Chroma) — --wipe để clean orphan vectors
+python scripts/seed/cdm_components.py      # Component nodes từ kb/CDM/components.yml
+                                           # (BẮT BUỘC trước code_graph — implementedBy cần comp_id)
+
+# 6.2.4 — Ingest artifacts (Requirement / TC / Bug)
+python scripts/ingest/requirements.py data_ingestion/requirements/<file> --project=CDM
+python scripts/ingest/testcases.py   data_ingestion/testcases/<file>.xlsx --project=CDM
+python scripts/ingest/bugs.py        data_ingestion/bugs/<file>          --project=CDM
+
+# 6.2.5 — Ingest code graph (CodeUnit + code edges + Component→CodeUnit)
+#   Prereq: chạy graphify ở checkout code (không phải ở tieu-kiwi).
+#   Xem doc graphify riêng để build graph.json. Tag FE/BE khác nhau để stale-sweep không đá nhầm.
+python scripts/ingest/code_graph.py \
+    --graph /path/to/cdm-frontend/graphify-out/graph.json \
+    --map   kb/CDM/component_code_map.yml \
+    --project-id CDM \
+    --source-tag frontend
+
+python scripts/ingest/code_graph.py \
+    --graph /path/to/cdm-backend/graphify-out/graph.json \
+    --map   kb/CDM/component_code_map.yml \
+    --project-id CDM \
+    --source-tag backend
+
+# 6.2.6 — Slack channel binding (nếu chạy Layer B)
+python -c "from tieukiwi import db; db.bind_channel('C0123XYZ', 'CDM', note='rewired after DB drop')"
+```
+
+**Gotchas — full reset:**
+
+- **`--source-tag` bắt buộc điền** khi có ≥2 graph (FE + BE). Nếu bỏ, ingest lần 2 sẽ mark toàn bộ node lần 1 là `stale` (xem `scripts/ingest/code_graph.py:178-183`).
+- **`cdm_components.py` phải chạy TRƯỚC `code_graph.py`** — thiếu Component → `implementedBy` edges bị skip với warning `Components referenced in map but MISSING from DB`.
+- **Test files (`.test.tsx`, `test_*.py`, `/tests/`, `conftest.py`) bị SKIP** ở ingest. Muốn có phải sửa `TEST_SUFFIXES` trong `code_graph.py`.
+- **`--wipe` trên `seed/kb.py`** cần thiết khi Chroma có orphan vector (file KB đã xoá trên disk nhưng vector còn); nếu không có file nào xoá, chạy `python scripts/seed/kb.py` (không `--wipe`) là đủ.
+- **Không có file `007_migration.sql`** — đã bỏ (xưa là data-fix cho legacy `CDM_TEAM` → `CDM`). Fresh install không cần.
+
+### 6.3 Verify sau full reset
+
+```bash
+# Postgres — đếm theo type
+docker exec tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi -c \
+  "SELECT type, COUNT(*) FROM nodes WHERE project_id='CDM' GROUP BY type ORDER BY 1;"
+# Kỳ vọng: Component, Requirement, AcceptanceCriterion, TestCase, Bug, CodeUnit, ...
+
+# CodeUnit tách theo FE/BE (kiểm tra --source-tag hoạt động)
+docker exec tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi -c \
+  "SELECT props_json->'_meta'->>'source_graph' AS src, COUNT(*) FROM nodes
+   WHERE type='CodeUnit' AND project_id='CDM' GROUP BY 1;"
+
+# implementedBy edges per Component
+docker exec tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi -c \
+  "SELECT c.ref, COUNT(*) FROM edges e
+   JOIN nodes c ON c.id=e.src_id AND c.type='Component'
+   WHERE e.rel='implementedBy' AND c.project_id='CDM'
+   GROUP BY c.ref ORDER BY 2 DESC;"
+
+# Stale sweep — bao nhiêu node đang stale
+docker exec tieu-kiwi-postgres-1 psql -U tieukiwi_app -d tieukiwi -c \
+  "SELECT props_json->'_meta'->>'review_status' AS status, COUNT(*)
+   FROM nodes WHERE type='CodeUnit' AND project_id='CDM' GROUP BY 1;"
+
+# Chroma — xem section 5.2 (Chroma inspection)
+```
+
+## 6bis. Chroma inspection — không có psql, dùng Python
+
+Chroma không có CLI; mọi query đi qua Python. Cheatsheet dưới đây cover các case hay dùng.
+
+### Đếm & thống kê
+
+```bash
+# Tổng số chunk trong collection
+python -c "
+from tieukiwi.rag import _get_col
+print('total chunks:', _get_col().count())
+"
+
+# Đếm theo scope / project_id / role / doc_type
+python -c "
+from tieukiwi.rag import _get_col
+col = _get_col()
+# .get() không có query_text = dump raw metadata
+res = col.get(include=['metadatas'])
+from collections import Counter
+def by(key): return Counter(m.get(key, '<none>') for m in res['metadatas'])
+print('scope:',     dict(by('scope')))
+print('project_id:',dict(by('project_id')))
+print('role:',      dict(by('role')))
+print('doc_type:',  dict(by('doc_type')))
+"
+```
+
+### List doc — không dùng semantic search
+
+```bash
+# Tất cả chunk của 1 project
+python -c "
+from tieukiwi.rag import _get_col
+res = _get_col().get(where={'project_id': 'CDM'}, include=['metadatas', 'documents'])
+for i, (id_, meta) in enumerate(zip(res['ids'], res['metadatas'])):
+    print(f'{id_:60s} scope={meta.get(\"scope\")} role={meta.get(\"role\",\"-\")} type={meta.get(\"doc_type\")}')
+    if i > 20: print(f'... +{len(res[\"ids\"])-20} more'); break
+"
+
+# Chunk theo doc_type=template
+python -c "
+from tieukiwi.rag import _get_col
+res = _get_col().get(where={'doc_type': 'template'}, include=['metadatas'])
+for id_, m in zip(res['ids'], res['metadatas']):
+    print(id_, m.get('path'))
+"
+
+# Xem full content 1 chunk
+python -c "
+from tieukiwi.rag import _get_col
+res = _get_col().get(ids=['kb:CDM:glossary#c0'], include=['documents', 'metadatas'])
+print(res['documents'][0][:500], '...')
+print(res['metadatas'][0])
+"
+```
+
+### Semantic search — như agent gọi
+
+```bash
+# Search có filter (giống `search_kb` tool)
+python -c "
+from tieukiwi.rag import search
+for id_, text, meta in search('OTP flow', k=3, project_id='CDM', include_global=True):
+    print(f'--- {id_}  scope={meta.get(\"scope\")} role={meta.get(\"role\",\"-\")}')
+    print(text[:200], '...')
+"
+
+# Search chỉ role QE (global, không project)
+python -c "
+from tieukiwi.rag import search
+print(search('testcase login', k=5, role='QE'))
+"
+
+# Search kiểm tra kb_rules (rule đã được curator promote)
+python -c "
+from tieukiwi.rag import search
+for r in search('duplicate script rule', k=3, project_id='CDM', include_global=True):
+    print(r[0], r[2].get('applies_to'), '|', r[1][:100])
+"
+```
+
+### Debug — vector có tồn tại không?
+
+```bash
+# Chroma path trên disk
+ls -la ./chroma_db/
+
+# ID 1 file cụ thể có trong collection không?
+python -c "
+from tieukiwi.rag import _get_col
+res = _get_col().get(where={'parent_doc': 'kb:CDM:glossary'}, include=['metadatas'])
+print(f'{len(res[\"ids\"])} chunks for kb:CDM:glossary')
+for id_ in res['ids']:
+    print('  ', id_)
+"
+
+# Full wipe khi corrupt
+python -c "from tieukiwi.rag import wipe; wipe(); print('wiped')"
+python scripts/seed/kb.py    # re-index
+```
+
+### Metadata schema — nhắc lại
+
+| Field | Values | Set bởi |
+|---|---|---|
+| `scope`         | `project` / `global`             | Path (`kb/<PROJ>/*` vs `kb/_global/*`) |
+| `project_id`    | vd `CDM` (absent khi global)     | Path segment 1 |
+| `role`          | `QE` / `PO` / `BO` / `DEV`       | Path segment 2 (nếu match) |
+| `doc_type`      | `template` / `sample` / `glossary` / `BRD` / `reference` | Path keyword hoặc filename |
+| `applies_to`    | Entity type (`TestCase`, `Bug`, ...) / `General` | Hard-coded map trong `seed/kb.py` |
+| `source`        | `skills` / `kb`                  | Root folder |
+| `parent_doc`    | Doc id gốc                       | `index_docs()` tự set |
+| `chunk_index`   | Position trong parent            | `index_docs()` tự set |
+| `section`       | Nearest `## / ###` heading       | `chunk_text()` tự set |
 
 ## 7. Wire Slack channel với project
 
