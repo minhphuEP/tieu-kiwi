@@ -166,37 +166,128 @@ def mention_for(role, project_id=None):
     return f"@{role} (unconfigured)"
 
 
-def upsert_node_by_ref(type_, ref, props=None):
-    # Insert a node, or MERGE props into the existing one with this (type, ref) —
-    # never create a second node. Avoids duplicates when re-fetching the same
-    # external item (e.g. a Jira issue). If duplicates already exist, prefer the
-    # node that has 'has' edges (the one linked to ACs) so re-fetch updates the
-    # right node rather than an empty duplicate; props merge preserves existing
-    # keys (e.g. _meta provenance) and overlays the new metadata.
+def upsert_node_by_ref(type_, ref, props=None, project_id=None, merge_props=False):
+    """Insert a node, or update its props if one with the same (type, ref) exists.
+
+    Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
+    Prefer the node with 'has' edges (the one linked to ACs) when duplicates
+    exist, so re-fetch updates the AC-bearing node rather than an empty duplicate.
+
+    Args:
+      type_:       node type (e.g. 'Requirement', 'BRD').
+      ref:         external ref (e.g. 'CDM-268').
+      props:       props dict; None/omitted → empty {}.
+      project_id:  scope the upsert to a project. Nodes with the same ref in a
+                   DIFFERENT project stay separate. Default None matches ANY
+                   project — legacy behaviour.
+      merge_props: True → merge new props into existing via jsonb `||`,
+                   preserving unspecified keys. Default False → replace props
+                   wholesale (matches pre-phuong_qe behaviour of this file).
+
+    Uses the partial unique index (project_id, ref) WHERE ref IS NOT NULL from
+    migration 003 for ON CONFLICT-based idempotent upsert when project_id is
+    given; falls back to SELECT-then-INSERT/UPDATE for legacy project_id=None
+    calls (prefer-has-edges heuristic).
+    """
     props = props or {}
     with conn() as c:
+        if project_id is None:
+            # Legacy path: no project scope → prefer-has-edges SELECT then INSERT/UPDATE.
+            row = c.execute(
+                """
+                SELECT n.id FROM nodes n
+                WHERE n.type=%s AND n.ref=%s
+                ORDER BY (SELECT count(*) FROM edges e WHERE e.src_id=n.id AND e.rel='has') DESC,
+                         n.id ASC
+                LIMIT 1
+                """,
+                (type_, ref),
+            ).fetchone()
+            if row:
+                node_id = row[0]
+                if merge_props:
+                    c.execute(
+                        "UPDATE nodes SET props_json = COALESCE(props_json,'{}'::jsonb) || %s::jsonb WHERE id=%s",
+                        (psycopg.types.json.Json(props), node_id),
+                    )
+                else:
+                    c.execute(
+                        "UPDATE nodes SET props_json=%s WHERE id=%s",
+                        (psycopg.types.json.Json(props), node_id),
+                    )
+                return node_id
+            row = c.execute(
+                "INSERT INTO nodes(type, ref, props_json) VALUES (%s,%s,%s) RETURNING id",
+                (type_, ref, psycopg.types.json.Json(props)),
+            ).fetchone()
+            return row[0]
+
+        # Multi-tenant path: use ON CONFLICT with the (project_id, ref) unique index
+        conflict_expr = (
+            "props_json = nodes.props_json || EXCLUDED.props_json" if merge_props
+            else "props_json = EXCLUDED.props_json"
+        )
         row = c.execute(
-            """
-            SELECT n.id FROM nodes n
-            WHERE n.type=%s AND n.ref=%s
-            ORDER BY (SELECT count(*) FROM edges e WHERE e.src_id=n.id AND e.rel='has') DESC,
-                     n.id ASC
-            LIMIT 1
+            f"""
+            INSERT INTO nodes (type, ref, project_id, props_json)
+            VALUES (%s, %s, %s, %s::jsonb)
+            ON CONFLICT (project_id, ref) WHERE ref IS NOT NULL DO UPDATE
+              SET {conflict_expr}
+            RETURNING id
             """,
-            (type_, ref),
-        ).fetchone()
-        if row:
-            node_id = row[0]
-            c.execute(
-                "UPDATE nodes SET props_json = COALESCE(props_json,'{}'::jsonb) || %s::jsonb WHERE id=%s",
-                (psycopg.types.json.Json(props), node_id),
-            )
-            return node_id
-        row = c.execute(
-            "INSERT INTO nodes(type, ref, props_json) VALUES (%s,%s,%s) RETURNING id",
-            (type_, ref, psycopg.types.json.Json(props)),
+            (type_, ref, project_id, psycopg.types.json.Json(props)),
         ).fetchone()
         return row[0]
+
+
+def get_node_by_ref(type_, ref, project_id=None):
+    """Return {id, props_json} for the node, or None. Used to check existing
+    content_hash before re-embedding a Confluence page, etc."""
+    with conn() as c:
+        sql = "SELECT id, props_json FROM nodes WHERE type=%s AND ref=%s"
+        params = [type_, ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"
+            params.append(project_id)
+        row = c.execute(sql + " LIMIT 1", params).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "props_json": row[1] or {}}
+
+
+def count_acs(req_node_id):
+    """Return the number of AcceptanceCriterion nodes a Requirement has.
+
+    Used by ingest to decide whether to re-run AC extraction when the linked
+    BRD's content is unchanged (status='cached') — normally we skip in that
+    case, but if AC count is 0 the previous extraction never persisted
+    anything (LLM error, section-slice miss, etc.) and we should retry.
+    """
+    with conn() as c:
+        row = c.execute(
+            "SELECT count(*) FROM nodes ac "
+            "JOIN edges e ON e.dst_id=ac.id AND e.rel='has' "
+            "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion'",
+            (req_node_id,),
+        ).fetchone()
+        return row[0] if row else 0
+
+
+def linked_brds(src_id):
+    """Return BRD nodes reachable via `src -derivedFrom-> BRD`.
+
+    Each item: {id, ref, props_json}. Used by the ingest hash-gate to check
+    whether any Confluence page a Requirement derived from has drifted
+    version-wise (i.e. the PRD was edited without touching Jira).
+    """
+    with conn() as c:
+        rows = c.execute(
+            "SELECT n.id, n.ref, n.props_json FROM nodes n "
+            "JOIN edges e ON e.dst_id=n.id AND e.rel='derivedFrom' "
+            "WHERE e.src_id=%s AND n.type='BRD'",
+            (src_id,),
+        ).fetchall()
+    return [{"id": r[0], "ref": r[1], "props_json": r[2] or {}} for r in rows]
 
 
 def get_node_props(ref, type_=None):
