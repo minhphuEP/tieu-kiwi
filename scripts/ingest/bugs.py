@@ -14,8 +14,8 @@ which returns a structured JSON. Then we create:
   - `finds` edges from a TestRun if a run ref is present (optional)
 
 Usage:
-    python scripts/ingest/bugs.py path/to/CDM-287.doc --project=CDM
-    python scripts/ingest/bugs.py path/to/export.json --project=CDM
+    python scripts/ingest/bugs.py path/to/CDM-287.doc --project=CDM_TEAM
+    python scripts/ingest/bugs.py path/to/export.json --project=CDM_TEAM
 """
 import sys
 from pathlib import Path as _P

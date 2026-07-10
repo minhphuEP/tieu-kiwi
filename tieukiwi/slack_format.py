@@ -21,9 +21,9 @@ Canonical layout:
     :test_tube: *Tình trạng Test Case*
     Story này có *3 Acceptance Criteria*, nhưng coverage *chưa đầy đủ*:
     *Test coverage (3 acceptance criteria):*
-    :white_check_mark: Entry point: TC-1 PASS
-    :x: Assign new creator modal: chưa có testcase
-    :red_circle: Confirm view: TC-3 FAIL
+    :white_check_mark: *AC-1* — :white_check_mark: Có (TC-1 → TR-1) — :large_green_circle: PASS
+    :x: *AC-2* — :x: Chưa có — :white_circle: Không có
+    :x: *AC-3* — :white_check_mark: Có (TC-3 → TR-3) — :red_circle: FAIL
 
     :warning: *Cần lưu ý*
     1. ...
@@ -373,24 +373,22 @@ def _status_value_icon(status):
 
 
 def _ac_line(ac):
-    # Prefer the AC's description over its opaque hash-ref (AC-CDM-268-0063f2af);
-    # QE reads titles, not hashes. Fall back to ref if desc is missing (legacy
-    # nodes / import from Excel without a title).
-    label = (ac.get("desc") or "").strip() or ac.get("ref") or "?"
-    label = label.replace("\n", " ").strip()
-    if len(label) > 120:
-        label = label[:117] + "…"
     result = ac.get("result")
-    if result == "PASS":
-        icon, tail = ":white_check_mark:", f"{ac.get('tc') or 'TC'} PASS"
-    elif result == "FAIL":
-        icon, tail = ":red_circle:", f"{ac.get('tc') or 'TC'} FAIL"
-    elif ac.get("covered"):
-        tc = ac.get("tc") or "TC"
-        icon, tail = ":large_blue_circle:", f"{tc} chưa chạy"
+    lead = ":white_check_mark:" if result == "PASS" else ":x:"
+    if ac.get("covered"):
+        flow = ac.get("tc") or ""
+        if ac.get("tc") and ac.get("tr"):
+            flow = f"{ac['tc']} → {ac['tr']}"
+        cov = f":white_check_mark: Có ({flow})" if flow else ":white_check_mark: Có"
     else:
-        icon, tail = ":x:", "chưa có testcase"
-    return f"{icon} {label}: {tail}"
+        cov = ":x: Chưa có"
+    if result == "PASS":
+        res = ":large_green_circle: PASS"
+    elif result == "FAIL":
+        res = ":red_circle: FAIL"
+    else:
+        res = ":white_circle: Không có"
+    return f"{lead} *{ac['ref']}* — {cov} — {res}"
 
 
 # Section builders — the single source of truth for the canonical blocks. Both the
@@ -502,7 +500,7 @@ def to_slack(answer):
 
 def report_from_graph(key, props, trace_result):
     """Build a canonical report dict from a Requirement's graph node props (as stored by
-    ingest_jira_ticket) + the output of db.trace(). Pure transformation — no DB access here."""
+    fetch_jira) + the output of db.trace(). Pure transformation — no DB access here."""
     props = props or {}
     fix = props.get("fix_versions")
     fix_str = ", ".join(fix) if isinstance(fix, list) else (fix or None)
@@ -532,8 +530,7 @@ def report_from_graph(key, props, trace_result):
             tr = run.get("ref")
             st = (run.get("status") or "").lower()
             result = "PASS" if st == "pass" else ("FAIL" if st == "fail" else None)
-        acs.append({"ref": ac.get("ref"), "desc": ac.get("desc"),
-                    "covered": ac.get("covered"),
+        acs.append({"ref": ac.get("ref"), "covered": ac.get("covered"),
                     "tc": tc, "tr": tr, "result": result})
 
     return {"title": title, "key": key, "info": info, "acs": acs,
@@ -544,23 +541,13 @@ def _golive_decision_lines(res):
     decision = res.get("decision")
     req = res.get("requirement")
     icon = ":large_green_circle:" if decision == "GO" else ":red_circle:"
-    # Split gap counts so QE sees "3 uncovered · 2 awaiting review" instead of
-    # a single number that hides how much is truly unwritten vs just unreviewed.
-    # Falls back gracefully for callers still returning the pre-split shape.
-    uncovered = res.get("coverage_uncovered")
-    awaiting = res.get("coverage_awaiting_review") or []
-    if uncovered is None:
-        uncovered = res.get("coverage_gaps") or []
+    gaps = res.get("coverage_gaps") or []
     fails = res.get("failing_tests") or []
     bugs = res.get("open_bugs") or []
-
-    gap_bits = [f"{len(uncovered)} coverage gap(s)"]
-    if awaiting:
-        gap_bits.append(f"{len(awaiting)} awaiting QE review")
     return [
         f"{icon} *Go/No-Go — {req}: {decision}*",
         "",
-        f":test_tube: {' · '.join(gap_bits)} · "
+        f":test_tube: {len(gaps)} coverage gap(s) · "
         f":x: {len(fails)} failing test(s) · "
         f":lady_beetle: {len(bugs)} open bug(s)",
     ]
