@@ -1,432 +1,295 @@
 # Tieu Kiwi 🥝
 
-**Tieu Kiwi** is an AI agent for **Quality Engineering (QE)**, built on the Anthropic Claude API.
-It reads requirements and design docs, generates test cases and test plans, critiques PRDs,
-detects test‑coverage gaps, and decides whether a feature is ready to go live — by reasoning over
-a **Postgres knowledge graph** (Requirement → AcceptanceCriterion → TestCase → TestRun → Bug) and a
-**Chroma RAG** knowledge base of team rules, glossaries, and skills.
+**Tieu Kiwi** is an AI Quality-Engineering (QE) support agent that lives in Slack and runs on the
+Anthropic Claude API. You @mention it (or use `/tieukiwi`) with a question about a ticket, and it
+answers by reasoning over **two knowledge stores**:
 
-The guiding principle of the project: **each new capability = one more tool on the same agent
-loop — never a rewrite.**
+- a **Postgres knowledge graph** — the *structured truth*: Requirements, Acceptance Criteria, Test
+  Cases, Test Runs and Bugs, plus the relationships between them (`nodes` / `edges`); and
+- a **Chroma vector store** — *semantic recall* of team rules, PRD/BRD text, glossaries and
+  templates, retrieved via RAG.
 
----
+From those it fetches Jira tickets into the graph, drafts test cases, flags requirement
+ambiguities for the PO, detects coverage gaps, and makes a **GO / NO-GO** release call — routing
+each result to the right owner (Delivery Manager / QE Lead / PO / Dev).
 
-## ⚠️ Current status
+> **Open [`architecture.html`](architecture.html) in a browser** for the visual diagram + a card
+> per demo function.
 
-Tieu Kiwi is built agent‑first, in three layers. **Layers A and B run today**:
-
-| Layer | Scope | Status |
-|-------|-------|--------|
-| **A — Agent core** | CLI tool‑use loop + graph/RAG tools (Claude API) | ✅ Working |
-| **B — Slack wrapper** | Slack app (Socket Mode), `/tieukiwi` command, Bolt handler | ✅ Working |
-| **C — Loop & learning** | Thread feedback loop, KB promotion, curator approval | 🚧 Planned |
-
-Live tools: `search_kb`, `coverage_gap`, `trace`, `bug_blast_radius`, `go_no_go`, and
-**`fetch_jira`** (reads a Jira issue and writes it into the graph). The content‑generation tools
-`gen_testcase`, `gen_test_plan` are still **skeletons with clear TODOs**. The
-remaining feedback/learning loop (Layer C) is on the roadmap — see
-[`docs/ROADMAP.md`](docs/ROADMAP.md). This README marks planned pieces explicitly so you always
-know what actually works.
+Guiding principle of the project: **each new capability = one more tool on the same agent loop —
+never a rewrite.**
 
 ---
 
-## Features
+## Why two stores?
 
-- 🤖 **Claude‑powered reasoning** — an agentic tool‑use loop on `claude-sonnet-4-6` (Anthropic Python SDK).
-- 🧠 **Postgres knowledge graph** — Requirements, Acceptance Criteria, Test Cases, Test Runs, Bugs and Components stored as `nodes`/`edges`, queried with plain parameterized SQL (no Neo4j).
-- 📚 **Chroma RAG** — team rules, glossary, and QE skills indexed into a local Chroma vector store for retrieval.
-- ✅ **QE decision tools** — coverage‑gap detection, requirement tracing, bug blast‑radius, and an aggregate **GO / NO‑GO** call with concrete next actions.
-- 🔌 **Jira integration** — the `fetch_jira` tool reads a Jira Cloud issue (REST v3) and upserts it into the graph as a `Requirement` node.
-- 💬 **Slack integration** — Socket‑Mode app with a `/tieukiwi` slash command (acks <3s, dedups, replies in Block Kit).
+The two stores answer two different *kinds* of question, and Tieu Kiwi picks the right one per task:
+
+| Question type | Example | Store | Tool(s) |
+|---|---|---|---|
+| **Structural / traceability** | "Is `CDM-268` ready to ship?", "Which ACs have no tests?", "Trace this requirement." | **Postgres graph** | `go_no_go`, `coverage_gap`, `trace`, `bug_blast_radius`, `classify_bug` |
+| **Semantic / "what does the doc/rule say?"** | "What's our test-case naming rule?", "What does the PRD say about rollout?" | **Chroma RAG** | `search_kb`, and rule/template lookups inside `find_ambiguities` / `gen_testcase` |
+
+The graph gives *exact, joinable* facts (an AC either has a covering TestCase or it doesn't). RAG
+gives *fuzzy recall* over prose where an exact key doesn't exist. `tieukiwi/rag.py` isolates the
+vector backend behind one module — it uses a **local `all-MiniLM-L6-v2` ONNX embedding (no API key,
+offline)** and the collection `"knowledge_base"`, so swapping embeddings never touches tool code.
 
 ---
 
 ## Architecture
 
-Users reach the agent via the **CLI** or the **Slack `/tieukiwi` command**; the agent reads Jira
-through the `fetch_jira` tool.
+Tieu Kiwi is built agent-first, in three layers. **All three run today.**
 
-```mermaid
-flowchart TD
-    user([User])
-    cli[CLI  python -m tieukiwi.cli]
-    slack[/Slack  /tieukiwi<br/>slack_app.py/]
-
-    user --> cli
-    user --> slack
-    slack --> agent
-
-    cli --> agent
-
-    subgraph brain [Agent core - Layer A]
-      agent[Claude tool-use loop<br/>agent.py]
-      tools[TOOLS + run_tool<br/>tools.py]
-      agent <--> tools
-    end
-
-    agent <--> claude[[Anthropic Claude API]]
-
-    tools --> rag[(Chroma RAG<br/>./chroma_db)]
-    tools --> pg[(Postgres<br/>knowledge graph)]
-    tools --> jira[[Jira REST v3]]
-```
-
-Plain‑text view:
+| Layer | What it is | Where |
+|---|---|---|
+| **A — Agent core** | Claude tool-use loop + the graph/RAG tools. Callable from the CLI with no Slack. | `agent.py`, `tools.py`, `db.py`, `rag.py`, `routing.py` |
+| **B — Slack wrapper** | Socket-Mode Slack app: `/tieukiwi` command + `@mention` + in-thread replies; acks < 3 s, dedups events. Only calls `agent.ask(...)` / the tools — it never changes the loop. | `slack_app.py` |
+| **C — Loop & learning** | Curator feedback loop: candidate rules → curator approval → **promotion** into the KB; go-live sign-off; test-case Approve/Refine; Tier-2 thread memory. | `slack_app.py`, `db.py`, `memory.py` |
 
 ```
-User ─▶ CLI ───────▶ Agent loop (Claude) ─▶ tools ─┬─▶ Chroma RAG  (rules/glossary/skills)
-     ▶ Slack /tieukiwi ▲                            ├─▶ Postgres    (Requirement→AC→TestCase→TestRun→Bug)
-       (slack_app.py) ─┘                            └─▶ Jira REST   (fetch_jira → upsert Requirement)
+User in Slack
+   │  /tieukiwi  ·  @Tieu Kiwi …  ·  thread reply
+   ▼
+Layer B — Slack wrapper (Socket Mode, slack_app.py)
+   │  resolves channel → project_id, routes intent, ack < 3s
+   ▼
+Layer A — Agent core (agent.py: Claude tool-use loop)  ◀──▶  Anthropic Claude API
+   │  run_tool(name, args, context)
+   ├────────────▶ Postgres knowledge graph   (structural truth)  ── db.py
+   ├────────────▶ Chroma RAG "knowledge_base" (semantic recall)  ── rag.py
+   └────────────▶ Jira REST v3 / Confluence   (fetch_jira → upsert Requirement)
+   ▲
+Layer C — feedback loop: candidate rule → curator Approve → kb_rules + Chroma (promotion)
+          go-live sign-off · testcase Approve/Refine · thread memory (memory.py)
 ```
 
-**Knowledge‑graph ontology** (stored relationally in `nodes`/`edges`):
+**Agent loop (Layer A) in brief** (`agent.ask`): send the user message + the `TOOLS` schema to
+Claude (`claude-sonnet-4-6`) with a strict *anti-hallucination* system prompt; while Claude returns
+`tool_use`, dispatch each call through `run_tool(name, args, context)` and feed results back;
+return the final text. `context = {project_id, role}` is injected by the caller (the Slack layer) —
+the LLM cannot spoof it.
+
+---
+
+## Data model (knowledge graph)
+
+Stored **relationally** in Postgres — `nodes(id, type, ref, project_id, props_json)` and
+`edges(id, src_id, rel, dst_id, props_json)` — and queried with plain parameterized SQL / recursive
+CTEs (no Neo4j). Ontology:
 
 ```
-Requirement          -has->        AcceptanceCriterion
-AcceptanceCriterion  -coveredBy->  TestCase
-TestCase             -executedBy-> TestRun
-TestRun              -finds->      Bug
-Bug                  -affects->    Component
-Bug                  -violates->   AcceptanceCriterion
-Requirement          -impacts->    Component
+Requirement          ─has─────────▶ AcceptanceCriterion
+AcceptanceCriterion  ─coveredBy───▶ TestCase
+TestCase             ─executedBy──▶ TestRun
+TestRun              ─finds───────▶ Bug
+Bug                  ─violates────▶ AcceptanceCriterion
+Bug                  ─affects─────▶ Component
+Requirement          ─impacts─────▶ Component        (may be cross-project)
 ```
+
+- **`project_id`** is the multi-tenant scope, defined as the **Jira key prefix** (`CDM-268` → `CDM`;
+  see `db.project_id_from_ref`). Nodes carry it; edges do **not** (cross-project edges are
+  first-class, filtered at query time via the endpoints' `project_id`).
+- LLM-generated nodes embed `props_json._meta` provenance (`extraction_source`, `confidence`,
+  `review_status`) per the `_meta` contract in `CLAUDE.md`.
+
+> ⚠️ **Known gap:** `fetch_jira` upserts the Requirement node **without** setting `project_id`
+> (it lands `NULL`). `project_id_from_ref` *is* applied when `save_testcases` writes TestCase nodes.
+> The deterministic Slack shortcuts still scope correctly because they pass the channel's
+> `project_id` explicitly.
+
+An AcceptanceCriterion with **no** `coveredBy` edge is a **coverage gap**. `go_no_go` combines
+coverage gaps + failing `TestRun`s + open critical/high `Bug`s into a single decision.
 
 ---
 
 ## Prerequisites
 
 | Requirement | Notes |
-|-------------|-------|
-| **Python 3.11+** | Developed and tested on CPython 3.11. |
-| **Docker + Docker Compose** | For the local Postgres instance (`docker-compose.yml`). |
-| **Anthropic API key** | Required — the agent won't start without it. Get one at <https://console.anthropic.com>. |
-| **Jira account + API token** | *Optional* — enables the `fetch_jira` tool. Token: <https://id.atlassian.com/manage-profile/security/api-tokens>. |
-| **Slack tokens** (`SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET`) | *Optional* — needed only to run the Slack app (`python -m tieukiwi.slack_app`); the CLI works without them. |
+|---|---|
+| **Python 3.11+** | Developed/tested on CPython 3.11. |
+| **Docker + Docker Compose** | Local Postgres (`docker-compose.yml`). |
+| **Anthropic API key** | Required — the agent won't start without it. <https://console.anthropic.com>. |
+| **Jira account + API token** | *Optional* — enables `fetch_jira` (and Confluence PRD expansion). |
+| **Slack tokens** | *Optional* — only to run the Slack app; the CLI works without them. |
+
+> **No embedding API key needed.** RAG embeds locally with `all-MiniLM-L6-v2` (downloaded once,
+> ~80 MB, cached). The `VOYAGEAI_API_KEY` line in `.env.example` is vestigial and is **not** read
+> by the code — leave it blank.
 
 ---
 
-## Installation
+## Setup
 
 ```bash
-# 1. Clone the repo
+# 1. Clone + venv
 git clone https://github.com/minhphuEP/tieu-kiwi.git
 cd tieu-kiwi
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # anthropic, chromadb, psycopg[binary], python-dotenv, httpx, slack_bolt, openpyxl
 
-# 2. Create and activate a virtual environment
-python3.11 -m venv .venv
-source .venv/bin/activate          # macOS/Linux
-# .venv\Scripts\activate           # Windows (PowerShell)
+# 2. Config
+cp .env.example .env                      # then fill ANTHROPIC_API_KEY + DATABASE_URL (Jira/Slack optional)
 
-# 3. Install dependencies
-pip install -r requirements.txt
+# 3. Postgres + schema + migrations (order matters)
+docker compose up -d
+for f in db/schema.sql db/002_migration.sql db/003_migration.sql \
+         db/004_migration.sql db/005_migration.sql db/006_migration.sql; do
+  docker compose exec -T postgres psql -U tieukiwi_app -d tieukiwi < "$f"
+done
+
+# 4. Seed (order matters)
+python scripts/seed/users_real.py         # users table — the 4 real routing targets (DM/QE Lead/PO/Dev, project CDM)
+python scripts/seed/kb.py                 # Tier-1 KB → Chroma (indexes skills/ + kb/)
+python scripts/seed/graph.py              # sample requirement graph (dev fixture; or scripts/seed/cdm_demo.py)
 ```
 
-Dependencies (`requirements.txt`): `anthropic`, `chromadb`, `psycopg[binary]`, `python-dotenv`,
-`httpx`, `slack_bolt`.
-
-> ℹ️ On first RAG use, Chroma downloads a small embedding model (`all-MiniLM-L6-v2`, ~80 MB) into
-> a local cache — this is a one‑time download.
-
----
-
-## Environment Configuration
-
-All configuration is read from a `.env` file at the repo root (loaded centrally by
-`tieukiwi/config.py`). Copy the template and fill it in:
-
-```bash
-cp .env.example .env
-```
-
-`.env.example`:
+`.env` essentials:
 
 ```dotenv
-# ── Core (required to run the agent today) ───────────────────────────────
-# Anthropic Claude API key — powers the agent's reasoning / tool-use loop.
-ANTHROPIC_API_KEY=sk-ant-xxxxxxxxxxxxxxxxxxxxxxxx
-
-# Postgres connection string for the knowledge graph.
-# Matches the credentials in docker-compose.yml for local dev.
+ANTHROPIC_API_KEY=sk-ant-...
 DATABASE_URL=postgresql://tieukiwi_app:devpass@localhost:5432/tieukiwi
+ANTHROPIC_MODEL=claude-sonnet-4-6         # default agent model
 
-# ── Jira — consumed by the fetch_jira tool ───────────────────────────────
-JIRA_BASE_URL=          # e.g. https://your-org.atlassian.net
-JIRA_EMAIL=             # Jira account email (Basic-auth username)
-JIRA_API_TOKEN=         # Jira API token
+# Jira (optional — for fetch_jira / Confluence PRD expansion)
+JIRA_BASE_URL=            # https://your-org.atlassian.net
+JIRA_EMAIL=
+JIRA_API_TOKEN=
 
-# ── Slack (Layer B, Socket Mode) — run: python -m tieukiwi.slack_app ──────
-SLACK_BOT_TOKEN=        # Bot User OAuth token (xoxb-...)
-SLACK_APP_TOKEN=        # App-level token for Socket Mode (xapp-...)
-SLACK_SIGNING_SECRET=   # Signing secret (app Basic Information page)
+# Slack (optional — Layer B/C, Socket Mode)
+SLACK_BOT_TOKEN=          # xoxb-...
+SLACK_APP_TOKEN=          # xapp-...
+SLACK_SIGNING_SECRET=
 ```
 
-| Variable | Used by | Required? |
-|----------|---------|-----------|
-| `ANTHROPIC_API_KEY` | `agent.py` (Claude client), `config.py` | ✅ Yes |
-| `DATABASE_URL` | `config.py` → `db.py` (all graph tools) | ✅ Yes (for graph tools) |
-| `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | `fetch_jira` tool | ⚙️ For Jira |
-| `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, `SLACK_SIGNING_SECRET` | `slack_app.py` (Layer B) | ⚙️ For Slack |
+> **Reproducible role routing.** `scripts/seed/users_real.py` is the *only* script that writes the
+> `users` table — it wipes leftovers and inserts the 4 real demo users (`delivery_manager` /
+> `qe_lead` / `po` / `dev`, project `CDM`). Role → Slack user is resolved by
+> `db.resolve_role_slack_id` / `db.mention_for` (users table → `ROLE_<ROLE>` env override →
+> a non-crashing `@role (unconfigured)` label). Never hardcode Slack ids elsewhere.
 
-> 🔒 `.env` is git‑ignored. Never commit real keys. Jira vars are only needed for `fetch_jira`, and
-> the Slack vars only to run the Slack app — the CLI runs with just `ANTHROPIC_API_KEY` + `DATABASE_URL`.
-
----
-
-## Running Postgres with Docker Compose
-
-The repo ships a minimal Postgres service (`docker-compose.yml`):
-
-```yaml
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_DB: tieukiwi
-      POSTGRES_USER: tieukiwi_app
-      POSTGRES_PASSWORD: devpass
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-volumes:
-  pgdata:
-```
-
-**Steps:**
+### Run it
 
 ```bash
-# 1. Start Postgres in the background
-docker compose up -d
+# CLI (Layer A only — needs ANTHROPIC_API_KEY + DATABASE_URL)
+python -m tieukiwi.cli
 
-# 2. Verify it's healthy / accepting connections
-docker compose exec postgres pg_isready -U tieukiwi_app -d tieukiwi
-
-# 3. Apply the schema (creates nodes, edges, kb_rules, promotion_queue, thread_state)
-psql "$DATABASE_URL" -f db/schema.sql
-# No psql client? Run it through the container instead:
-#   docker compose exec -T postgres psql -U tieukiwi_app -d tieukiwi < db/schema.sql
-```
-
-The connection string in `.env` (`DATABASE_URL`) must match the compose credentials above.
-
----
-
-## Running the Agent Locally
-
-With `.env` filled in, Postgres up, and the schema applied:
-
-```bash
-# (optional) load sample graph + KB so the tools have data to reason over
-python3 scripts/seed/kb.py           # index skills/ + kb/ into Chroma (RAG)
-python3 scripts/seed/graph.py        # insert a sample requirement graph (graph data only)
-
-# reset the users table to EXACTLY the 4 real demo users (routing targets).
-# This is the single source of truth for users; safe to re-run (idempotent).
-python3 scripts/seed/users_real.py
-
-# start the interactive agent
-python3 -m tieukiwi.cli
-```
-
-> **Reproducible users / role routing.** `scripts/seed/users_real.py` is the ONLY script that
-> writes the `users` table — it wipes any leftover/placeholder rows and inserts the 4 real demo
-> users (`delivery_manager` / `qe_lead` / `po` / `dev`, project `CDM`). Run it on every machine to
-> get identical routing. `graph.py` and `cdm_demo.py` seed graph data only and never touch `users`.
-
-You should see:
-
-```
-Tieu Kiwi CLI — type a question (Ctrl+C to exit)
-
->
-```
-
-Type a question and the agent will reason and call tools as needed. To **verify wiring without
-spending API calls**, import‑check the modules:
-
-```bash
-python -c "import tieukiwi.tools, tieukiwi.db, tieukiwi.memory, tieukiwi.routing; print('OK')"
-python -c "from tieukiwi.db import go_no_go; print('config OK')"
-```
-
-### Running the Slack app (Layer B)
-
-With `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN`, and `SLACK_SIGNING_SECRET` set in `.env` (and the app
-installed with Socket Mode + the `/tieukiwi` command registered):
-
-```bash
+# Slack app (Layer B/C — needs the Slack tokens too)
 python -m tieukiwi.slack_app
-# → "Tieu Kiwi Slack app starting (Socket Mode). Ctrl+C to stop."
-```
 
-Then in Slack: `/tieukiwi is JIRA-101 ready to go live?` — you'll get an immediate “Processing…”
-ack, followed by the agent's answer as a formatted message. If tokens are missing the app exits
-with a clear message listing which ones.
+# Wire a Slack channel to a project (so tool calls scope correctly)
+python -c "from tieukiwi import db; db.bind_channel('C0123XYZ', 'CDM', note='wired by me')"
+
+# Smoke-check wiring without spending API calls
+python -c "import tieukiwi.tools, tieukiwi.db, tieukiwi.rag, tieukiwi.routing; print('OK')"
+```
 
 ---
 
-## Integrations Setup
+## Demo functions
 
-### Jira
-1. Create an API token at <https://id.atlassian.com/manage-profile/security/api-tokens>.
-2. Set `JIRA_BASE_URL` (e.g. `https://your-org.atlassian.net`), `JIRA_EMAIL`, `JIRA_API_TOKEN` in `.env`.
-3. The `fetch_jira` tool calls `GET /rest/api/3/issue/{key}` with HTTP Basic auth (`email:token`)
-   over `httpx`. It parses key/summary/description/issuetype/status and **upserts** a `Requirement`
-   node into the graph (keyed by `ref`, so re‑fetching the same issue updates rather than duplicates).
-   If the Jira env vars are missing it returns a clear error instead of crashing.
+Each row is a real, demoable capability. Commands are shown as `@Tieu Kiwi …`; the same intents
+work via `/tieukiwi …`. See [`architecture.html`](architecture.html) for a card per function.
 
-### Slack (Layer B — Socket Mode)
-1. Create a Slack app and **enable Socket Mode**.
-2. Add bot scopes: `commands`, `chat:write` (plus `app_mentions:read`, `channels:history`,
-   `groups:history`, `im:history`, `files:read`, `users:read` for future features).
-3. Create the `/tieukiwi` slash command; generate an **App‑Level Token** (`connections:write`) for
-   Socket Mode.
-4. Put `SLACK_BOT_TOKEN` (xoxb‑), `SLACK_APP_TOKEN` (xapp‑), and `SLACK_SIGNING_SECRET` in `.env`.
-5. Run `python -m tieukiwi.slack_app`. The Bolt handler acks within 3 s, dedups retries/duplicate
-   invocations, calls the Layer A agent (`agent.ask`), and replies in Block Kit `mrkdwn`.
+| # | Say in Slack | What happens | Store / tool | Result |
+|---|---|---|---|---|
+| 1 | `@Tieu Kiwi fetch CDM-268` | Agent loop calls `fetch_jira`; reads the Jira issue and **upserts a Requirement node** (summary, status, issuetype, priority, assignee/reporter, story points, description). **ACs are seeded separately — not parsed from Jira.** | Graph ← Jira REST v3 (`fetch_jira`) | Requirement node with ticket metadata |
+| 2 | `@Tieu Kiwi CDM-268 đã đủ điều kiện go live chưa?` | Deterministic `go_no_go` over the graph. **GO** only if no coverage gaps **and** no failing tests **and** no open critical/high bug. On **GO** → @mentions the **Delivery Manager** with **Approve / Reject** sign-off buttons (recorded in `go_live_decisions`). On **NO-GO** → coverage %, failing tests, open bugs + `next_actions`. | **Graph** (`go_no_go`) | GO/NO-GO decision + owner routing |
+| 3 | `@Tieu Kiwi generate testcase cho CDM-268` (also *"write testcase"*) | `testcase_gen` drafts test cases covering **every AC of the requirement** (not a single AC), exports an **Excel file (Testomat.io format)**, posts a draft + **Approve / Refine** buttons and @mentions the **QE Lead**. **Approve** → saves `TestCase` nodes + `coveredBy` edges (with `_meta` provenance). **Refine** → LLM re-draft from your comment (v+1). | Graph write + RAG (template/rubric) | Excel draft → approved TestCase nodes |
+| 4 | `@Tieu Kiwi CDM-268 cần PO chốt: ...` | `find_ambiguities` reads the requirement (fetching Jira + linked Confluence PRD if needed), flags genuine ambiguities against **3 dimensions** (Behaviour & Edge Cases, Constraints, Conflicts), @mentions the **PO** and offers **"Open clarification form."** Submitted answers are written back to the Requirement node (`clarified_requirements`). | RAG rubric + LLM | PO questions → answers stored on the requirement |
+| 5 | `@Tieu Kiwi curator-test` · `@Tieu Kiwi học rule mới: <rule>` | Enqueues a **candidate rule** in `promotion_queue` and @mentions the **QE Lead** with **Approve / Edit / Reject**. **Approve = promotion**: the rule is inserted into `kb_rules` (status `active`) **and indexed into Chroma**, so `search_kb` can retrieve it from then on. | Postgres queue → **Chroma** (promotion) | New team rule, retrievable via RAG |
+| 6 | `@Tieu Kiwi CDM-268 có bug/test nào đang fail không?` | Agent answers the bug/failing-test question, then the Slack layer **@mentions the Dev owner**. (The `classify_bug` / `bug_blast_radius` tools also exist for deeper triage in free-form Q&A.) | Graph (`trace` / agent) + routing | Answer + Dev @mention |
+| — | *(underpins 2–6)* | **Role routing.** A role is mapped to a real person via the `users` table: `routing.approver_role_for(...)` → `db.resolve_role_slack_id` / `db.mention_for`. 4 roles: **Delivery Manager, QE Lead, PO, Dev.** | `users` table | `<@Uxxx>` mention (or graceful fallback) |
 
-> Note: routing action items *to specific owners* via Slack (`routing.py`) is still a Layer C TODO —
-> the `/tieukiwi` command itself is fully working.
+> **"Promotion"** = moving a candidate rule from the human-in-the-loop `promotion_queue` into the
+> live knowledge base: a row in `kb_rules` (system of record) **plus** a Chroma document (so it
+> becomes searchable). Rejected candidates are marked `rejected` and never reach `kb_rules`.
 
----
-
-## RAG / Knowledge Base
-
-Tieu Kiwi uses a **3‑tier memory** model (`tieukiwi/memory.py`); the RAG layer is Tier 1.
-
-**Chroma RAG (Tier 1 — team shared knowledge):**
-- Store: local `chromadb.PersistentClient(path="./chroma_db")`, collection `knowledge_base`
-  (see `tieukiwi/rag.py`).
-- Ingestion: `python scripts/seed/kb.py` walks every `.md` in `skills/` and `kb/`, and indexes each file as a
-  document (`id` = filename, metadata `source` + `applies_to`). The three QE rubrics in `skills/`
-  (`test-driven-development`, `code-review-and-quality`, `spec-driven-development`) are tagged to
-  `TestCase` / `Bug` / `Requirement` respectively.
-- Retrieval: the `search_kb` tool calls `rag.search(query)` (top‑k semantic search).
-
-**Postgres knowledge graph (`nodes`/`edges`):**
-- Populate manually via `tieukiwi.db.add_node` / `add_edge`, or run `python scripts/seed/graph.py` for a
-  ready‑made sample (`JIRA-101` with covered/uncovered ACs, a failing test, and an open bug).
-- The agent queries it through graph tools:
-
-| Tool | What it answers |
-|------|-----------------|
-| `coverage_gap` | Acceptance Criteria with no covering TestCase |
-| `trace` | Full Requirement → AC → TestCase → TestRun → Bug path |
-| `bug_blast_radius` | How many Requirements/ACs a bug's component impacts → priority |
-| `go_no_go` | Aggregate GO/NO‑GO decision + `next_actions` |
-
-Tables `kb_rules`, `promotion_queue`, and `thread_state` support the (planned) Layer C learning loop.
-
----
-
-## Usage Examples
-
-**Interactive CLI:**
-
-```
-$ python -m tieukiwi.cli
-Tieu Kiwi CLI — type a question (Ctrl+C to exit)
-
-> Is JIRA-101 ready to go live?
-```
-
-Behind the scenes the agent calls the `go_no_go` tool, which returns (for the seeded sample):
-
-```json
-{
-  "requirement": "JIRA-101",
-  "decision": "NO-GO",
-  "coverage_gaps": ["AC-2"],
-  "failing_tests": [{"testrun": "TR-3", "testcase": "TC-3"}],
-  "open_bugs": [{"bug": "BUG-1", "severity": "high"}],
-  "next_actions": [
-    "Write a testcase for AC-2",
-    "Fix failing testcase TC-3 (run TR-3)",
-    "Close bug BUG-1 (high)"
-  ]
-}
-```
-
-…and Tieu Kiwi replies in natural language, e.g. *“NO‑GO. AC‑2 has no test coverage, TC‑3 is
-failing, and BUG‑1 (high) is still open. Next: write a test for AC‑2, fix TC‑3, and close BUG‑1.”*
-
-**Other prompts to try:** *“Which acceptance criteria have no tests?”* (`coverage_gap`),
-*“Trace JIRA‑101”* (`trace`), *“What's the blast radius of BUG‑1?”* (`bug_blast_radius`),
-*“Fetch PROJ‑123 from Jira”* (`fetch_jira`), *“Search the KB for our code‑review standards”* (`search_kb`).
-
-**Via Slack:**
-
-```
-/tieukiwi is JIRA-101 ready to go live?
-```
-
-Slack immediately shows *“Processing…”*, then Tieu Kiwi posts the GO/NO‑GO answer back into the
-channel as a formatted message.
-
-**Pulling a requirement from Jira** (writes it into the graph as a `Requirement` node):
+### Verify without Slack
 
 ```bash
-python -c "from tieukiwi.tools import fetch_jira; print(fetch_jira('PROJ-123'))"
-# → {'tool': 'fetch_jira', 'status': 'ok',
-#    'issue': {'key': 'PROJ-123', 'summary': '...', 'issuetype': 'Story', 'status': 'In Progress'},
-#    'node_id': 42}
+python -c "from tieukiwi.db import go_no_go; print(go_no_go('CDM-268'))"
+python -c "from tieukiwi.tools import fetch_jira; print(fetch_jira('CDM-268'))"
 ```
 
 ---
 
-## Project Structure
+## Agent tools (full list)
+
+The agent decides which of these to call each turn:
+
+| Tool | Store | Purpose |
+|---|---|---|
+| `search_kb` | Chroma | Semantic KB search (rules / glossary / templates / rubrics). |
+| `coverage_gap` | Graph | ACs with no covering TestCase. |
+| `trace` | Graph | Requirement → AC → TestCase → TestRun → Bug, with pass/fail. |
+| `go_no_go` | Graph | Aggregate GO / NO-GO + `next_actions`. |
+| `bug_blast_radius` | Graph | Requirements/ACs impacted by a bug's component → P1–P4. |
+| `classify_bug` | Graph | How a bug was detected → which pipeline to improve (`caught_by_test` / `leaked_*`). |
+| `find_ambiguities` | RAG + LLM | PO clarification questions from a requirement (3 dimensions). |
+| `gen_testcase` | Graph + RAG | Draft/update test cases for a requirement (returns a draft; the interactive Approve/Refine loop is driven from Slack). |
+| `fetch_jira` | Jira → Graph | Read a Jira issue and upsert it as a Requirement node. |
+| `gen_test_plan` | — | **Skeleton (not implemented yet).** |
+
+---
+
+## 3-tier memory
+
+- **Tier 1 — Team KB (RAG):** Chroma `knowledge_base`, seeded from `skills/` + `kb/` and grown by
+  curator promotion. `tieukiwi/rag.py`.
+- **Tier 2 — Thread/artifact memory:** per-thread state keyed by `channel_id + thread_ts` in the
+  `thread_state` table — holds in-flight test-case drafts, the thread's ticket, and bot
+  participation. `tieukiwi/memory.py`. (Test-case drafts live here; there is no separate
+  `testcase_drafts` table.)
+- **Tier 3 — Per-user memory:** preferences/role/style keyed by `user_id`. **TODO / later.**
+
+---
+
+## Project structure
 
 ```
 tieu-kiwi/
-├── docker-compose.yml       # Local Postgres (postgres:16) service
-├── requirements.txt         # Python dependencies
-├── .env.example             # Template for .env (copy & fill in)
-├── seed.py                  # Index skills/ + kb/ into Chroma (RAG)
-├── scripts/seed/graph.py            # Insert a sample requirement graph for testing
+├── docker-compose.yml           # local Postgres (postgres:16)
+├── .env.example                 # copy → .env
 ├── db/
-│   └── schema.sql           # Tables: nodes, edges, kb_rules, promotion_queue, thread_state
-├── skills/                  # QE rubrics (Markdown) indexed into RAG
-│   ├── test-driven-development.md
-│   ├── code-review-and-quality.md
-│   └── spec-driven-development.md
-├── kb/                      # Extra knowledge docs to index (glossary, templates, samples)
-├── docs/
-│   └── ROADMAP.md           # Layer B (Slack) & Layer C (feedback loop) plan
-└── tieukiwi/                # The Python package
-    ├── config.py            # Loads .env; exposes ANTHROPIC/DATABASE/model/JIRA_*/SLACK_* settings
-    ├── db.py                # Postgres connection + graph tools (coverage_gap, trace, go_no_go, upsert_node_by_ref, …)
-    ├── rag.py               # Chroma: index_docs() / search()
-    ├── memory.py            # 3-tier memory (Tier 2 = thread_state; Tier 3 TODO)
-    ├── routing.py           # Entity-type → owner-role routing (Slack delivery TODO)
-    ├── tools.py             # TOOLS definitions + run_tool dispatcher (incl. fetch_jira)
-    ├── agent.py             # Claude tool-use loop (model configurable via config)
-    ├── slack_app.py         # Slack Socket-Mode app (python -m tieukiwi.slack_app)
-    └── cli.py               # CLI entry point (python -m tieukiwi.cli)
+│   ├── schema.sql               # nodes, edges, kb_rules, promotion_queue, thread_state
+│   ├── 002_migration.sql        # + nodes.project_id, users, indexes
+│   ├── 003_migration.sql        # + partial unique (project_id, ref)
+│   ├── 004_migration.sql        # + channel_project_map
+│   ├── 005_migration.sql        # reshape promotion_queue for the curator flow
+│   └── 006_migration.sql        # + go_live_decisions
+├── kb/                          # RAG docs (path-based metadata)
+├── skills/                      # QE rubrics indexed into RAG
+├── scripts/
+│   ├── seed/                    # users_real.py, kb.py, graph.py, cdm_demo.py, reset.py
+│   └── ingest/                  # requirements.py, testcases.py, bugs.py
+├── docs/                        # STORAGE_GUIDE, KB_GUIDE, ontology, Gen-testcase-design, ROADMAP…
+├── architecture.html           # ← standalone visual architecture (open in a browser)
+└── tieukiwi/
+    ├── config.py                # loads .env; model/JIRA/SLACK settings
+    ├── agent.py                 # Claude tool-use loop (Layer A)
+    ├── tools.py                 # TOOLS + run_tool (incl. fetch_jira / Confluence expand)
+    ├── db.py                    # Postgres graph + tools + role/curator/go-live helpers
+    ├── rag.py                   # Chroma (local all-MiniLM-L6-v2 embedding)
+    ├── routing.py               # role mapping (approver_role_for / route_gap / curator_role_for)
+    ├── memory.py                # 3-tier memory (Tier 2 = thread_state)
+    ├── testcase_gen.py          # LLM draft/refine/finalize test cases
+    ├── testcase_export.py       # Excel export (Testomat.io format)
+    ├── slack_app.py             # Layer B/C: Socket-Mode app, buttons, curator/go-live/gen flows
+    └── cli.py                   # CLI entry point
 ```
 
 ---
 
-## Troubleshooting
+## Conventions (from `CLAUDE.md`)
 
-| Symptom | Cause & Fix |
-|---------|-------------|
-| `RuntimeError: DATABASE_URL is not set. Add it to .env …` | `.env` missing or not at the repo root. Run `cp .env.example .env`, set `DATABASE_URL`, and run from the repo root. |
-| `KeyError: 'ANTHROPIC_API_KEY'` on startup | `ANTHROPIC_API_KEY` isn't set in `.env`. Add it and restart. |
-| `psycopg.OperationalError: connection refused` / could not connect | Postgres isn't running or the URL is wrong. `docker compose up -d`, check `docker compose ps`, and confirm `DATABASE_URL` host/port/creds match `docker-compose.yml`. |
-| `relation "nodes" does not exist` | Schema not applied. Run `psql "$DATABASE_URL" -f db/schema.sql`. |
-| First `search_kb`/`scripts/seed/kb.py` is slow or downloads a file | Chroma is fetching the `all-MiniLM-L6-v2` embedding model (~80 MB) once. Ensure network access; subsequent runs use the cache. |
-| Anthropic `RateLimitError` / `429` | You've hit API rate limits. Back off and retry, reduce request frequency, or check your plan/limits in the Anthropic console. |
-| `chromadb ... InvalidArgumentError: name ... 3-512 characters` | Chroma collection names must be ≥3 chars — this repo uses `knowledge_base` (not `kb`). Keep the name in `rag.py` as‑is. |
-| `fetch_jira` returns `{"status": "error", "error": "Jira is not configured…"}` | Set `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` in `.env`. An HTTP 401/403 means bad email/token; 404 means the issue key doesn't exist or isn't visible to that account. |
-| `SystemExit: Slack is not configured. Missing: …` | The Slack app needs `SLACK_BOT_TOKEN` + `SLACK_APP_TOKEN` (and ideally `SLACK_SIGNING_SECRET`). Add them to `.env`. |
-| `/tieukiwi` shows a Slack timeout / "failed" | The handler must ack within 3 s. It does by default; if you see this, the app process isn't running (`python -m tieukiwi.slack_app`) or Socket Mode / the slash command isn't configured in the Slack app. |
-
----
-
-## Contributing / Roadmap
-
-Layers A (agent core) and B (Slack wrapper) are in place. The next milestone is the
-**feedback/learning loop (Layer C)** — thread feedback, KB promotion with a curator approval step,
-and routing action items to owners via Slack. See [`docs/ROADMAP.md`](docs/ROADMAP.md). When adding
-a capability, follow the project convention: **add one entry to `TOOLS` + one branch in `run_tool`
-— don't rewrite the agent loop.**
+- **Don't change the architecture or the agent loop** unless asked. New capability = one `TOOLS`
+  entry + one `run_tool` branch.
+- **Never edit `db/schema.sql`** — add a numbered idempotent `db/NNN_migration.sql`.
+- **Always parameterize SQL.** Secrets live only in `.env`.
+- Agent model string: `claude-sonnet-4-6`. Chroma: collection `knowledge_base`, path `./chroma_db`.
+  Run seed & CLI from the repo root.
+- LLM-ingested nodes must embed `_meta` provenance in `props_json`.
+- Role→person resolution is ONE path (`db.resolve_role_slack_id` / `db.mention_for`); role
+  constants live only in `tieukiwi/routing.py`.

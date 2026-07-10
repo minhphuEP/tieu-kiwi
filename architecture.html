@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tieu Kiwi — Architecture</title>
+<style>
+  :root{
+    --bg:#0f1720; --panel:#151f2b; --panel2:#1b2836; --ink:#e8eef5; --muted:#9db0c4;
+    --line:#2b3a4d; --radius:14px;
+    --A:#4f8cff;  --A-bg:#132139;  /* Layer A — agent core */
+    --B:#38b98a;  --B-bg:#0f2a22;  /* Layer B — Slack */
+    --C:#e0a63c;  --C-bg:#2c2413;  /* Layer C — feedback loop */
+    --PG:#2fb3c0; --PG-bg:#0f2a2d; /* Postgres graph */
+    --RAG:#b78bff; --RAG-bg:#221a33;/* Chroma RAG */
+    --JIRA:#7a8ca0; --JIRA-bg:#1a2431;
+    font-synthesis:none;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:linear-gradient(180deg,#0c131b,#0f1720 240px);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.5;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1120px;margin:0 auto;padding:40px 22px 80px}
+  header.top{display:flex;align-items:center;gap:16px;margin-bottom:6px;flex-wrap:wrap}
+  header.top h1{font-size:30px;margin:0;letter-spacing:-.02em}
+  .kiwi{font-size:34px}
+  .sub{color:var(--muted);max-width:760px;margin:10px 0 30px}
+  h2{font-size:20px;margin:44px 0 4px;letter-spacing:-.01em}
+  h2 .num{color:var(--muted);font-weight:600;margin-right:8px}
+  .h2note{color:var(--muted);margin:2px 0 20px;font-size:14px}
+  code{background:#0c1620;border:1px solid var(--line);border-radius:6px;padding:1px 6px;
+    font-family:"SF Mono",ui-monospace,Menlo,Consolas,monospace;font-size:.86em;color:#cfe0f2}
+
+  /* legend */
+  .legend{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 8px}
+  .chip{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;color:var(--muted);
+    background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:5px 11px}
+  .dot{width:10px;height:10px;border-radius:50%}
+
+  /* high-level diagram */
+  .diagram{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:24px;overflow-x:auto}
+  .row{display:flex;flex-direction:column;align-items:center;gap:0}
+  .node{border-radius:12px;padding:14px 18px;text-align:center;min-width:230px;
+    border:1px solid var(--line);background:var(--panel2)}
+  .node .t{font-weight:700;font-size:15px}
+  .node .d{color:var(--muted);font-size:12.5px;margin-top:3px}
+  .arrow{color:var(--muted);font-size:20px;line-height:1;margin:9px 0}
+  .arrow small{display:block;font-size:11px;margin-top:2px}
+
+  .band{border-radius:14px;padding:16px 16px 18px;margin:0;width:100%;position:relative}
+  .band .tag{position:absolute;top:-11px;left:16px;font-size:11.5px;font-weight:700;
+    padding:3px 10px;border-radius:999px;letter-spacing:.02em}
+  .bandA{background:var(--A-bg);border:1px solid var(--A)}
+  .bandA .tag{background:var(--A);color:#04101f}
+  .bandB{background:var(--B-bg);border:1px solid var(--B)}
+  .bandB .tag{background:var(--B);color:#04150f}
+  .bandC{background:var(--C-bg);border:1px solid var(--C)}
+  .bandC .tag{background:var(--C);color:#1a1403}
+
+  .toolrow{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;margin-top:6px}
+  .tool{font-size:12px;background:#0c1620;border:1px solid var(--line);border-radius:8px;
+    padding:6px 10px;color:#cfe0f2;font-family:"SF Mono",ui-monospace,Menlo,monospace}
+  .stores{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin-top:4px}
+  .store{flex:1 1 240px;max-width:320px;border-radius:12px;padding:14px 16px}
+  .store.pg{background:var(--PG-bg);border:1px solid var(--PG)}
+  .store.rag{background:var(--RAG-bg);border:1px solid var(--RAG)}
+  .store.jira{background:var(--JIRA-bg);border:1px solid var(--JIRA)}
+  .store .t{font-weight:700;font-size:14px;display:flex;align-items:center;gap:8px}
+  .store .d{color:var(--muted);font-size:12.5px;margin-top:4px}
+
+  /* generic cards grid */
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:16px;margin-top:8px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
+    padding:16px 17px;display:flex;flex-direction:column}
+  .card h3{margin:0 0 4px;font-size:15px;display:flex;align-items:center;gap:8px}
+  .cmd{background:#08111a;border:1px solid var(--line);border-left:3px solid var(--A);
+    border-radius:8px;padding:9px 11px;margin:8px 0 10px;font-size:12.7px;color:#dff0ff;
+    font-family:"SF Mono",ui-monospace,Menlo,monospace;word-break:break-word}
+  .card p{margin:0 0 10px;font-size:13.4px;color:#d7e2ee}
+  .meta{margin-top:auto;display:flex;flex-direction:column;gap:6px;font-size:12.3px}
+  .meta .k{color:var(--muted);text-transform:uppercase;letter-spacing:.04em;font-size:10.5px}
+  .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 9px;border-radius:999px}
+  .badge.pg{background:var(--PG-bg);color:#8fe6ef;border:1px solid var(--PG)}
+  .badge.rag{background:var(--RAG-bg);color:#d7c2ff;border:1px solid var(--RAG)}
+  .badge.jira{background:var(--JIRA-bg);color:#c3d0dd;border:1px solid var(--JIRA)}
+  .badge.mix{background:#1a2333;color:#bcd;border:1px solid var(--line)}
+  .result{color:#a9e6c8;font-size:12.6px}
+  .owner{font-size:11.5px;color:var(--C)}
+
+  /* graph data model svg */
+  .modelbox{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px;overflow-x:auto}
+  svg{display:block;max-width:100%;height:auto}
+  .flag{background:#241a12;border:1px solid var(--C);border-radius:10px;padding:12px 15px;margin:14px 0;
+    font-size:13px;color:#f0dcb6}
+  .flag b{color:var(--C)}
+
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .two .card h3{font-size:15px}
+  .qlist{margin:6px 0 0;padding-left:18px;font-size:13px;color:#d7e2ee}
+  .qlist li{margin:5px 0}
+  footer{margin-top:56px;color:var(--muted);font-size:12.5px;border-top:1px solid var(--line);padding-top:16px}
+  @media(max-width:680px){.two{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <span class="kiwi">🥝</span>
+    <h1>Tieu Kiwi — Architecture</h1>
+  </header>
+  <p class="sub">An AI Quality-Engineering agent in Slack. It answers QE questions by reasoning over
+  <b>two knowledge stores</b> — a <b>Postgres knowledge graph</b> (structural truth) and a
+  <b>Chroma vector store</b> (semantic recall via RAG) — on the Anthropic Claude API
+  (<code>claude-sonnet-4-6</code>). This page documents what the code <i>actually</i> does.</p>
+
+  <div class="legend">
+    <span class="chip"><span class="dot" style="background:var(--A)"></span>Layer A — Agent core</span>
+    <span class="chip"><span class="dot" style="background:var(--B)"></span>Layer B — Slack wrapper</span>
+    <span class="chip"><span class="dot" style="background:var(--C)"></span>Layer C — Feedback loop</span>
+    <span class="chip"><span class="dot" style="background:var(--PG)"></span>Postgres graph</span>
+    <span class="chip"><span class="dot" style="background:var(--RAG)"></span>Chroma RAG</span>
+    <span class="chip"><span class="dot" style="background:var(--JIRA)"></span>Jira / Confluence</span>
+  </div>
+
+  <!-- ============================ HIGH LEVEL ============================ -->
+  <h2><span class="num">1</span>High-level architecture</h2>
+  <p class="h2note">User in Slack → Slack wrapper (Socket Mode) → Agent core (Claude tool-use loop)
+  → tools → two stores → results back to Slack. The three layers are grouped.</p>
+
+  <div class="diagram">
+    <div class="row">
+
+      <div class="node">
+        <div class="t">👤 User in Slack</div>
+        <div class="d"><code>/tieukiwi …</code> · <code>@Tieu Kiwi …</code> · thread reply</div>
+      </div>
+      <div class="arrow">▼</div>
+
+      <!-- Layer B -->
+      <div class="band bandB">
+        <span class="tag">LAYER B · Slack wrapper</span>
+        <div class="row" style="margin-top:8px">
+          <div class="node" style="border-color:var(--B);min-width:520px">
+            <div class="t">Slack app — Socket Mode <code>slack_app.py</code></div>
+            <div class="d">acks &lt; 3s · dedups events · resolves <code>channel_id → project_id</code>
+            · routes intent (go-live / gen-testcase / clarify / curator / bug) · replies in-thread</div>
+          </div>
+        </div>
+      </div>
+      <div class="arrow">▼<small>agent.ask(text[, project_id])</small></div>
+
+      <!-- Layer A -->
+      <div class="band bandA">
+        <span class="tag">LAYER A · Agent core</span>
+        <div class="row" style="margin-top:8px">
+          <div class="node" style="border-color:var(--A);min-width:520px">
+            <div class="t">Claude tool-use loop <code>agent.py</code> ⇄ Anthropic Claude API</div>
+            <div class="d">strict anti-hallucination system prompt · loops while <code>stop_reason=="tool_use"</code>
+            · <code>run_tool(name, args, context)</code> with injected <code>context={project_id, role}</code></div>
+          </div>
+        </div>
+        <div class="toolrow">
+          <span class="tool">search_kb</span><span class="tool">coverage_gap</span>
+          <span class="tool">trace</span><span class="tool">go_no_go</span>
+          <span class="tool">bug_blast_radius</span><span class="tool">classify_bug</span>
+          <span class="tool">find_ambiguities</span><span class="tool">gen_testcase</span>
+          <span class="tool">fetch_jira</span><span class="tool" style="opacity:.55">gen_test_plan (skeleton)</span>
+        </div>
+      </div>
+      <div class="arrow">▼<small>tools read / write</small></div>
+
+      <!-- stores -->
+      <div class="stores">
+        <div class="store pg">
+          <div class="t"><span class="dot" style="background:var(--PG)"></span>Postgres knowledge graph</div>
+          <div class="d"><code>nodes</code>/<code>edges</code> — <b>structural truth</b>.
+          Answers coverage_gap · trace · go_no_go · blast-radius. <code>db.py</code></div>
+        </div>
+        <div class="store rag">
+          <div class="t"><span class="dot" style="background:var(--RAG)"></span>Chroma RAG · <code>knowledge_base</code></div>
+          <div class="d"><b>semantic recall</b> of rules/PRDs/templates. Local
+          <code>all-MiniLM-L6-v2</code> embedding (no API key). <code>rag.py</code></div>
+        </div>
+        <div class="store jira">
+          <div class="t"><span class="dot" style="background:var(--JIRA)"></span>Jira REST v3 / Confluence</div>
+          <div class="d"><code>fetch_jira</code> upserts a Requirement node; linked PRD pages
+          expanded on demand.</div>
+        </div>
+      </div>
+
+      <!-- Layer C -->
+      <div class="arrow">▲ ▼<small>human-in-the-loop</small></div>
+      <div class="band bandC">
+        <span class="tag">LAYER C · Feedback loop &amp; learning</span>
+        <div class="d" style="color:#f0dcb6;font-size:13px;margin-top:8px">
+          Candidate rule → curator <b>Approve</b> → <code>kb_rules</code> (active) <b>+ indexed into Chroma</b>
+          (<b>promotion</b>) · go-live <b>Approve/Reject</b> sign-off (<code>go_live_decisions</code>) ·
+          test-case <b>Approve/Refine</b> · Tier-2 thread memory (<code>thread_state</code>, <code>memory.py</code>).
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ============================ DATA MODEL ============================ -->
+  <h2><span class="num">2</span>Graph data model (ontology)</h2>
+  <p class="h2note">Stored relationally in <code>nodes(id, type, ref, project_id, props_json)</code> +
+  <code>edges(id, src_id, rel, dst_id)</code>, queried with parameterized SQL — no Neo4j.
+  <code>project_id</code> = Jira key prefix (<code>CDM-268 → CDM</code>).</p>
+
+  <div class="modelbox">
+    <svg viewBox="0 0 900 300" role="img" aria-label="Knowledge graph ontology diagram">
+      <defs>
+        <marker id="arw" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="#7f93a8"/>
+        </marker>
+        <style>
+          .box{rx:10;ry:10;stroke-width:1.5}
+          .req{fill:#132139;stroke:#4f8cff}
+          .ac{fill:#0f2a2d;stroke:#2fb3c0}
+          .tc{fill:#221a33;stroke:#b78bff}
+          .tr{fill:#0f2a22;stroke:#38b98a}
+          .bug{fill:#2c1414;stroke:#e0645c}
+          .comp{fill:#2c2413;stroke:#e0a63c}
+          .lbl{fill:#e8eef5;font:600 13px -apple-system,Segoe UI,sans-serif;text-anchor:middle}
+          .rel{fill:#9db0c4;font:600 11px "SF Mono",Menlo,monospace;text-anchor:middle}
+          .edge{stroke:#7f93a8;stroke-width:1.6;fill:none}
+        </style>
+      </defs>
+
+      <!-- boxes -->
+      <rect class="box req"  x="20"  y="120" width="140" height="46"/>
+      <text class="lbl" x="90"  y="148">Requirement</text>
+
+      <rect class="box ac"   x="220" y="120" width="180" height="46"/>
+      <text class="lbl" x="310" y="143">Acceptance</text>
+      <text class="lbl" x="310" y="159" style="font-size:11px">Criterion</text>
+
+      <rect class="box tc"   x="470" y="120" width="130" height="46"/>
+      <text class="lbl" x="535" y="148">TestCase</text>
+
+      <rect class="box tr"   x="680" y="120" width="120" height="46"/>
+      <text class="lbl" x="740" y="148">TestRun</text>
+
+      <rect class="box bug"  x="680" y="230" width="120" height="46"/>
+      <text class="lbl" x="740" y="258">Bug</text>
+
+      <rect class="box comp" x="220" y="230" width="140" height="46"/>
+      <text class="lbl" x="290" y="258">Component</text>
+
+      <!-- edges -->
+      <line class="edge" x1="160" y1="143" x2="218" y2="143" marker-end="url(#arw)"/>
+      <text class="rel" x="189" y="134">has</text>
+
+      <line class="edge" x1="400" y1="143" x2="468" y2="143" marker-end="url(#arw)"/>
+      <text class="rel" x="434" y="134">coveredBy</text>
+
+      <line class="edge" x1="600" y1="143" x2="678" y2="143" marker-end="url(#arw)"/>
+      <text class="rel" x="639" y="134">executedBy</text>
+
+      <line class="edge" x1="740" y1="166" x2="740" y2="228" marker-end="url(#arw)"/>
+      <text class="rel" x="765" y="200">finds</text>
+
+      <!-- bug violates AC -->
+      <path class="edge" d="M680,253 C520,253 430,200 360,168" marker-end="url(#arw)"/>
+      <text class="rel" x="470" y="212">violates</text>
+
+      <!-- bug affects component -->
+      <line class="edge" x1="678" y1="253" x2="362" y2="253" marker-end="url(#arw)"/>
+      <text class="rel" x="520" y="245">affects</text>
+
+      <!-- requirement impacts component -->
+      <path class="edge" d="M70,166 C70,253 150,253 218,253" marker-end="url(#arw)"/>
+      <text class="rel" x="120" y="230">impacts</text>
+    </svg>
+  </div>
+  <p class="h2note" style="margin-top:10px">An <b>AcceptanceCriterion with no <code>coveredBy</code>
+  edge</b> = a coverage gap. <code>go_no_go</code> combines coverage gaps + failing
+  <code>TestRun</code>s + open critical/high <code>Bug</code>s. Edges may cross projects
+  (e.g. <code>Component dependsOn Component</code>); nodes carry <code>project_id</code>, edges don't.</p>
+
+  <div class="flag">
+    <b>⚠ Real-behaviour note:</b> <code>fetch_jira</code> upserts the Requirement node <b>without</b>
+    setting <code>project_id</code> (it lands <code>NULL</code>). The <code>project_id_from_ref</code>
+    helper (Jira-prefix) <b>is</b> applied when <code>save_testcases</code> writes TestCase nodes,
+    and the deterministic Slack shortcuts pass the channel's project explicitly — so scoping still
+    works for those flows.
+  </div>
+
+  <!-- ============================ DEMO FUNCTIONS ============================ -->
+  <h2><span class="num">3</span>Demo functions</h2>
+  <p class="h2note">One card per capability — the exact Slack command, what runs, which store/tool,
+  and the result. Commands shown as <code>@Tieu Kiwi …</code> also work via <code>/tieukiwi …</code>.</p>
+
+  <div class="grid">
+
+    <!-- fetch -->
+    <div class="card">
+      <h3>📥 Fetch ticket</h3>
+      <div class="cmd">@Tieu Kiwi fetch CDM-268</div>
+      <p>The agent loop calls <code>fetch_jira</code>, reads the Jira issue (REST v3) and
+      <b>upserts a Requirement node</b> with metadata: status, issuetype, priority,
+      assignee/reporter, story points, description. <b>ACs are seeded separately — they are
+      <u>not</u> parsed from Jira.</b></p>
+      <div class="meta">
+        <span><span class="k">Store / tool</span> <span class="badge jira">Jira REST → Graph</span> <code>fetch_jira</code></span>
+        <span class="result">→ Requirement node saved with ticket metadata</span>
+      </div>
+    </div>
+
+    <!-- go/no-go -->
+    <div class="card">
+      <h3>🚦 Go / No-Go</h3>
+      <div class="cmd">@Tieu Kiwi CDM-268 đã đủ điều kiện go live chưa?</div>
+      <p>Deterministic <code>go_no_go</code> over the graph. <b>GO</b> only if no coverage gaps
+      <b>and</b> no failing tests <b>and</b> no open <b>critical/high</b> bug. Reports coverage,
+      failing tests, open bugs + <code>next_actions</code>.</p>
+      <div class="meta">
+        <span><span class="k">Store / tool</span> <span class="badge pg">Postgres graph</span> <code>go_no_go</code></span>
+        <span class="owner">On GO → @mentions Delivery Manager + Approve / Reject sign-off</span>
+        <span class="result">→ GO / NO-GO decision recorded in <code>go_live_decisions</code></span>
+      </div>
+    </div>
+
+    <!-- gen testcase -->
+    <div class="card">
+      <h3>🧪 Coverage / gen testcase</h3>
+      <div class="cmd">@Tieu Kiwi generate testcase cho CDM-268
+@Tieu Kiwi write testcase for CDM-268</div>
+      <p>Drafts test cases covering <b>every AC of the requirement</b> (not a single AC), exports an
+      <b>Excel file (Testomat.io format)</b>, posts a draft + <b>Approve / Refine</b> buttons.
+      <b>Approve</b> → saves <code>TestCase</code> nodes + <code>coveredBy</code> edges;
+      <b>Refine</b> → LLM re-draft (v+1).</p>
+      <div class="meta">
+        <span><span class="k">Store / tool</span> <span class="badge mix">Graph write + RAG</span> <code>gen_testcase</code> · <code>testcase_gen</code></span>
+        <span class="owner">@mentions QE Lead as approver</span>
+        <span class="result">→ Excel draft → approved TestCase nodes with <code>_meta</code> provenance</span>
+      </div>
+    </div>
+
+    <!-- clarify -->
+    <div class="card">
+      <h3>❓ Clarify / PO-confirm</h3>
+      <div class="cmd">@Tieu Kiwi CDM-268 cần PO chốt: ...</div>
+      <p><code>find_ambiguities</code> reads the requirement (fetching Jira + linked Confluence PRD
+      if needed) and flags genuine ambiguities against <b>3 dimensions</b> (Behaviour &amp; Edge
+      Cases, Constraints, Conflicts), phrased as direct PO questions, with an <b>"Open clarification
+      form."</b> Submitted answers are written back onto the Requirement node.</p>
+      <div class="meta">
+        <span><span class="k">Store / tool</span> <span class="badge rag">RAG rubric + LLM</span> <code>find_ambiguities</code></span>
+        <span class="owner">@mentions PO</span>
+        <span class="result">→ answers stored as <code>clarified_requirements</code> on the requirement</span>
+      </div>
+    </div>
+
+    <!-- curator -->
+    <div class="card">
+      <h3>🎓 Curator + learn rule</h3>
+      <div class="cmd">@Tieu Kiwi curator-test
+@Tieu Kiwi học rule mới: &lt;rule&gt;</div>
+      <p>Enqueues a <b>candidate rule</b> in <code>promotion_queue</code> and shows
+      <b>Approve / Edit / Reject</b>. <b>Approve = promotion</b>: the rule is inserted into
+      <code>kb_rules</code> (status <code>active</code>) <b>and indexed into Chroma</b>, so
+      <code>search_kb</code> can retrieve it thereafter.</p>
+      <div class="meta">
+        <span><span class="k">Store / tool</span> <span class="badge mix">Queue → Chroma</span> <code>add_candidate_rule</code> · <code>approve_candidate</code></span>
+        <span class="owner">@mentions QE Lead as curator</span>
+        <span class="result">→ new team rule, retrievable via RAG</span>
+      </div>
+    </div>
+
+    <!-- bug routing -->
+    <div class="card">
+      <h3>🐞 Bug routing</h3>
+      <div class="cmd">@Tieu Kiwi CDM-268 có bug/test nào đang fail không?</div>
+      <p>The agent answers the bug / failing-test question from the graph, then the Slack layer
+      <b>appends a @mention of the Dev owner</b>. (The <code>classify_bug</code> and
+      <code>bug_blast_radius</code> tools are also available for deeper triage in free-form Q&amp;A.)</p>
+      <div class="meta">
+        <span><span class="k">Store / tool</span> <span class="badge pg">Graph</span> + routing</span>
+        <span class="owner">@mentions Dev</span>
+        <span class="result">→ answer + Dev @mention</span>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- role routing -->
+  <h2><span class="num">4</span>Role routing</h2>
+  <p class="h2note">Every @mention above resolves a <b>role → real person</b> through one path:
+  <code>routing.approver_role_for(...)</code> → <code>db.resolve_role_slack_id</code> /
+  <code>db.mention_for</code> (users table → <code>ROLE_&lt;ROLE&gt;</code> env override → a
+  non-crashing <code>@role (unconfigured)</code> label). Never hardcoded elsewhere.</p>
+  <div class="grid">
+    <div class="card"><h3>🚚 Delivery Manager</h3><p>Signs off go-live releases.</p>
+      <div class="meta"><span class="k">decision</span><code>go_live → delivery_manager</code></div></div>
+    <div class="card"><h3>🧭 QE Lead</h3><p>Approves test cases &amp; curates KB rules.</p>
+      <div class="meta"><span class="k">decision</span><code>testcase / testcase_rule → qe_lead</code></div></div>
+    <div class="card"><h3>📋 PO</h3><p>Confirms ambiguous requirements.</p>
+      <div class="meta"><span class="k">decision</span><code>po_confirm / requirement → po</code></div></div>
+    <div class="card"><h3>🛠️ Dev</h3><p>Owns bugs &amp; failing tests.</p>
+      <div class="meta"><span class="k">decision</span><code>bug / failing_test → dev</code></div></div>
+  </div>
+
+  <!-- ============================ TWO STORES ============================ -->
+  <h2><span class="num">5</span>Two stores, two question types</h2>
+  <p class="h2note">The core design choice: use the store that fits the question.</p>
+  <div class="two">
+    <div class="card" style="border-color:var(--PG)">
+      <h3><span class="dot" style="background:var(--PG)"></span>Postgres graph — <i>structural truth</i></h3>
+      <p>Exact, joinable facts and traceability. An AC either has a covering TestCase or it doesn't;
+      a TestRun passed or failed; a bug blocks release or it doesn't. Best when the answer is a
+      <b>relationship or an aggregate</b> over known entities.</p>
+      <span class="k" style="color:var(--muted);font-size:10.5px">ANSWERS QUESTIONS LIKE</span>
+      <ul class="qlist">
+        <li>Is <code>CDM-268</code> ready to ship? (<code>go_no_go</code>)</li>
+        <li>Which ACs have no tests? (<code>coverage_gap</code>)</li>
+        <li>Trace this requirement end-to-end. (<code>trace</code>)</li>
+        <li>How big is this bug's blast radius? (<code>bug_blast_radius</code>)</li>
+      </ul>
+    </div>
+    <div class="card" style="border-color:var(--RAG)">
+      <h3><span class="dot" style="background:var(--RAG)"></span>Chroma RAG — <i>semantic recall</i></h3>
+      <p>Fuzzy retrieval over prose where no exact key exists: team rules, PRD/BRD text, glossaries,
+      test-case templates &amp; rubrics. Best when the answer is <b>"what does the doc / rule say?"</b>
+      Grows over time via curator <b>promotion</b>. Isolated behind <code>rag.py</code> (local
+      <code>all-MiniLM-L6-v2</code> embedding).</p>
+      <span class="k" style="color:var(--muted);font-size:10.5px">ANSWERS QUESTIONS LIKE</span>
+      <ul class="qlist">
+        <li>What's our test-case naming rule? (<code>search_kb</code>)</li>
+        <li>What does the PRD say about rollout gating?</li>
+        <li>Which rubric applies to writing this test case? (inside <code>gen_testcase</code>)</li>
+      </ul>
+    </div>
+  </div>
+
+  <footer>
+    Tieu Kiwi · agent core <code>claude-sonnet-4-6</code> · Chroma collection
+    <code>knowledge_base</code> · Postgres <code>nodes</code>/<code>edges</code>. This page reflects
+    the actual implementation in <code>tieukiwi/</code>. See <code>README.md</code> for setup.
+  </footer>
+
+</div>
+</body>
+</html>
