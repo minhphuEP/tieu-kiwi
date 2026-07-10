@@ -43,36 +43,6 @@ def complete_json(prompt, system=None, **kw):
         return json.loads(cleaned)
 
 
-_TRANSLATE_SYSTEM = """\
-You are a translator for a QE (Quality Engineering) knowledge base.
-
-Translate the input into clear, technical English. Preserve:
-- Markdown structure (headings, bullets, tables, code fences)
-- Identifiers, code, URLs, ticket keys (e.g. CDM-287), field/API names — do NOT translate these
-- Layout / line breaks
-
-Rules:
-- If the input is already in English, return it verbatim.
-- No prose commentary, no "here is the translation:" preamble.
-- Preserve numeric formatting and units.
-- Return the translated text only.
-"""
-
-
-def translate_to_english(text, max_tokens=None):
-    """Translate arbitrary text to English via the configured LLM provider.
-
-    Idempotent for already-English input (the LLM is instructed to return it
-    verbatim). Preserves markdown / identifiers / code so it is safe to feed
-    the output into downstream extraction pipelines.
-    """
-    if not text or not text.strip():
-        return text
-    budget = max_tokens or max(1024, min(8000, len(text) // 2 + 512))
-    return complete(text, system=_TRANSLATE_SYSTEM,
-                    max_tokens=budget, temperature=0.0)
-
-
 # --- providers -------------------------------------------------------------
 
 def _anthropic_complete(prompt, system, max_tokens, temperature, json_mode):

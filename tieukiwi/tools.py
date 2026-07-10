@@ -24,7 +24,7 @@ def gen_testcase(requirement_ref, project_id=None):
     that loop is driven directly from tieukiwi/slack_app.py, see docs/Gen-testcase-design.md).
     Returns a {"tool": "gen_testcase", "status": "error", "error": ...} dict (instead of
     raising) if the requirement isn't found, the LLM leaves an AC uncovered, or the LLM
-    returns malformed/incomplete JSON — consistent with the tool error convention."""
+    returns malformed/incomplete JSON — consistent with fetch_jira's error convention."""
     try:
         return testcase_gen.generate_draft(requirement_ref, project_id=project_id)
     except (ValueError, KeyError) as e:
@@ -319,26 +319,6 @@ TOOLS = [
     "input_schema": {"type": "object", "properties": {}},
   },
   {
-    "name": "get_ticket",
-    "description": (
-        "READ-ONLY, POLYMORPHIC lookup for ANY Jira ticket ref (CDM-199, CDM-263, "
-        "CDM-286, CDM-286-1...). Dispatches by node type: Requirement returns "
-        "AC list + BRD + coverage; Bug returns severity + violates + finds; "
-        "TestRun returns TestCase + bugs found; UserStory/Epic returns children; "
-        "BRD returns preview + downstream requirements. Smart lookup: falls back "
-        "to `TR-<ref>` when the direct key misses (test-subtasks are stored with "
-        "the TR- prefix). ALWAYS call this FIRST when user asks about a ticket. "
-        "If found=False OR warnings mention missing data, then call "
-        "ingest_jira_ticket to pull from Jira. NEVER invent data not in the "
-        "returned payload — echo `warnings` verbatim to the user."
-    ),
-    "input_schema": {
-      "type": "object",
-      "properties": {"ref": {"type": "string"}},
-      "required": ["ref"],
-    },
-  },
-  {
     "name": "go_no_go",
     "description": (
         "Assess whether a requirement/feature is ready to go live in production; "
@@ -375,66 +355,6 @@ TOOLS = [
     },
   },
   {
-    "name": "feature_blast_radius",
-    "description": (
-        "Impact analysis from a FEATURE (Component), not from a code diff. "
-        "Use when the user asks 'what could break if feature X is developed/"
-        "changed?' before code exists. Returns: (a) the target Component + "
-        "all Components that dependsOn it (transitively) — the 'features at "
-        "risk'; (b) Requirements/ACs/TestCases scoped to those Components, so "
-        "QE can plan tests. Severity: target + direct dependents = HIGH, "
-        "transitive dependents = MEDIUM. If you have a code diff instead, "
-        "use `code_impact`."
-    ),
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "component_ref": {
-          "type": "string",
-          "description": "Component ref, e.g. 'COMP-CDM-SCRIPT-ASSIGN' or "
-                         "'COMP-CDM-OFFER-REVIEWER'. Look up refs with "
-                         "search_kb or by listing Components in the graph.",
-        },
-      },
-      "required": ["component_ref"],
-    },
-  },
-  {
-    "name": "code_impact",
-    "description": (
-        "Impact analysis for a code change (e.g. an MR diff): given a list of "
-        "changed source files (or CodeUnit refs), returns which business "
-        "Components, Requirements, and AcceptanceCriteria might be affected. "
-        "Walks the code graph (imports/calls/references) to find transitive "
-        "consumers, then joins to Component ownership and Component dependsOn "
-        "closure. Use this to answer 'what should I re-test for this MR?'."
-    ),
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "files": {
-          "type": "array",
-          "items": {"type": "string"},
-          "description": "List of changed source files (repo-relative, e.g. "
-                         "'frontend/apps/reviewer/src/pages/offers/offer-review-page.tsx') "
-                         "OR CodeUnit refs (e.g. 'CDM:reviewer_offer_review_page'). "
-                         "Both forms may be mixed.",
-        },
-        "direction": {
-          "type": "string",
-          "enum": ["downstream", "upstream"],
-          "description": "'downstream' (default) = who USES this = MR impact scope. "
-                         "'upstream' = what this USES = dependency audit.",
-        },
-        "depth": {
-          "type": "integer",
-          "description": "Max recursion depth over code edges (default 3).",
-        },
-      },
-      "required": ["files"],
-    },
-  },
-  {
     "name": "classify_bug",
     "description": (
         "Classify how a bug was detected to route it into the improvement loop. "
@@ -446,35 +366,6 @@ TOOLS = [
       "type": "object",
       "properties": {"bug_ref": {"type": "string"}},
       "required": ["bug_ref"],
-    },
-  },
-  {
-    "name": "mark_reviewed",
-    "description": (
-        "Advance a TestCase through the review state machine. Use when a QE or "
-        "QE Lead explicitly approves/rejects a testcase in Slack (\"QE Dung "
-        "approve TC-CDM-268-A\", \"lead reject CDM_DupScript_002 vì thiếu step\"). "
-        "State transitions: draft → qe_pending → qe_reviewed → lead_pending → "
-        "lead_approved (any state → rejected). Records reviewer_slack_id and "
-        "timestamp per stage in TestCase.props for the audit trail. Do NOT call "
-        "this for questions ABOUT a testcase — only when the user is actually "
-        "signing off / rejecting."
-    ),
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "tc_ref": {"type": "string",
-                   "description": "TestCase ref, e.g. 'CDM_DupScript_002' or 'TC-CDM-268-A'."},
-        "decision": {"type": "string", "enum": ["approve", "reject"],
-                     "description": "'approve' advances to next state; 'reject' → 'rejected'."},
-        "reviewer_slack_id": {"type": "string",
-                              "description": "Slack user id of the reviewer (U0..). "
-                                             "The Slack layer usually fills this from event.user."},
-        "comments": {"type": "string",
-                     "description": "Optional free-text note recorded on the transition. "
-                                    "Include when the user gave a reason for rejection or a caveat."},
-      },
-      "required": ["tc_ref", "decision", "reviewer_slack_id"],
     },
   },
   {
@@ -510,60 +401,16 @@ TOOLS = [
     },
   },
   {
-    "name": "ingest_jira_ticket",
+    "name": "fetch_jira",
     "description": (
-        "Full-fetch a Jira ticket into the graph: upsert the Story/Requirement, its "
-        "parent Epic (as UserStory), all subtasks (test-env subtasks → TestRun nodes; "
-        "[Bug]-prefixed subtasks → parse the description table into N Bug nodes per row), "
-        "and EVERY Confluence page linked in the description (BRD node + chunks in KB). "
-        "Optionally LLM-extract Acceptance Criteria from the BRD section. Idempotent: "
-        "safe to re-run on the same ticket — nodes upsert, edges dedupe. "
-        "Use this as the DEFAULT tool when the user asks to analyze / review / import a "
-        "Jira ticket (e.g. 'phân tích CDM-269', 'kéo CDM-321 vào graph', 'review ticket ABC-123')."
+        "Fetch a Jira issue by key (e.g. PROJ-123) from Jira Cloud and store it in the "
+        "graph as a Requirement node. Returns key, summary, issuetype, status, priority, "
+        "assignee (or 'Unassigned'), reporter (+ optional fix_versions / story_points) and node id."
     ),
     "input_schema": {
       "type": "object",
-      "properties": {
-        "issue_key": {
-          "type": "string",
-          "description": "Jira issue key of the top-level Story (or Epic), e.g. 'CDM-268'.",
-        },
-        "extract_acs": {
-          "type": "boolean",
-          "description": "If true (default), also run LLM to extract Acceptance Criteria "
-                         "from the linked Confluence PRD section. Set false to skip when "
-                         "the user just wants to sync structure without generating ACs.",
-        },
-      },
+      "properties": {"issue_key": {"type": "string"}},
       "required": ["issue_key"],
-    },
-  },
-  {
-    "name": "fetch_confluence",
-    "description": (
-        "Fetch ONE Confluence page by page_id, upsert a BRD node with its metadata, "
-        "and chunk-index the body into the KB (Chroma) so `search_kb` can retrieve it. "
-        "Idempotent via content_hash — a repeat call on an unchanged page returns "
-        "status='cached' and skips embedding. Use this when the user pastes a Confluence "
-        "link directly, NOT after `ingest_jira_ticket` (which already fetches every "
-        "Confluence page linked in the Jira description)."
-    ),
-    "input_schema": {
-      "type": "object",
-      "properties": {
-        "page_id": {
-          "type": "string",
-          "description": "Numeric Confluence page id from the URL "
-                         "(https://<site>.atlassian.net/wiki/spaces/<space>/pages/<PAGE_ID>/...).",
-        },
-        "section_anchor": {
-          "type": "string",
-          "description": "URL fragment slug from a section link "
-                         "(e.g. '15.-Assign-new-creator-...'). Stored on the BRD node so "
-                         "downstream tools can filter chunks by section. Omit if not provided.",
-        },
-      },
-      "required": ["page_id"],
     },
   },
 ]
@@ -583,7 +430,6 @@ def run_tool(name, args, context=None):
     """
     ctx = context or {}
     project_id = ctx.get("project_id")
-    on_step = ctx.get("on_step")
 
     if name == "search_kb":
         # `role` is an opt-in filter set by the LLM via args, NOT auto-injected
@@ -599,51 +445,20 @@ def run_tool(name, args, context=None):
         )
     if name == "coverage_gap":
         return db.coverage_gap(project_id=project_id)
-    if name == "get_ticket":
-        return db.get_ticket(args["ref"], project_id=project_id)
     if name == "go_no_go":
         return db.go_no_go(args["requirement_ref"], project_id=project_id)
     if name == "trace":
         return db.trace(args["requirement_ref"], project_id=project_id)
     if name == "bug_blast_radius":
         return db.bug_blast_radius(args["bug_ref"], project_id=project_id)
-    if name == "code_impact":
-        return db.code_impact(
-            args["files"],
-            direction=args.get("direction", "downstream"),
-            depth=args.get("depth", 3),
-            project_id=project_id,
-        )
-    if name == "feature_blast_radius":
-        return db.feature_blast_radius(args["component_ref"], project_id=project_id)
     if name == "classify_bug":
         return db.classify_bug(args["bug_ref"], project_id=project_id)
-    if name == "mark_reviewed":
-        return db.mark_reviewed(
-            args["tc_ref"], args["decision"], args["reviewer_slack_id"],
-            comments=args.get("comments"), project_id=project_id,
-        )
     if name == "gen_testcase":
         return gen_testcase(args["requirement_ref"], project_id=project_id)
     if name == "gen_test_plan":
         return gen_test_plan(args["requirement_ref"])
-    if name == "gen_critic":
-        return gen_critic(args["text"])
     if name == "find_ambiguities":
         return find_ambiguities(args["text"], project_id=project_id)
-    if name == "ingest_jira_ticket":
-        from . import jira_ingest
-        return jira_ingest.ingest_jira_ticket(
-            args["issue_key"],
-            project_id=project_id,
-            extract_acs=args.get("extract_acs", True),
-            on_step=on_step,
-        )
-    if name == "fetch_confluence":
-        from . import confluence
-        return confluence.fetch_confluence(
-            args["page_id"],
-            project_id=project_id,
-            section_anchor=args.get("section_anchor"),
-        )
+    if name == "fetch_jira":
+        return fetch_jira(args["issue_key"])
     raise ValueError(f"Unknown tool: {name}")

@@ -166,151 +166,37 @@ def mention_for(role, project_id=None):
     return f"@{role} (unconfigured)"
 
 
-def upsert_node_by_ref(type_, ref, props=None, project_id=None, merge_props=False):
-    """Insert a node, or update its props if one with the same (type, ref) exists.
-
-    Avoids duplicates when re-fetching the same external item (e.g. a Jira issue).
-    On legacy (project_id=None) matches, prefer the node with 'has' edges (the
-    one linked to ACs) so re-fetch updates the AC-bearing node rather than an
-    empty duplicate.
-
-    Args:
-      type_:       node type (e.g. 'Requirement', 'BRD').
-      ref:         external ref (e.g. 'CDM-268').
-      props:       props dict; None/omitted → empty {}.
-      project_id:  scope the upsert to a project. Nodes with the same ref
-                   in a DIFFERENT project stay separate. Default None keeps
-                   old callers working (matches ANY project — legacy behaviour).
-      merge_props: True → merge new props into existing (jsonb ||), preserving
-                   unspecified keys. Default False → replace props wholesale
-                   (matches old behaviour).
-
-    Uses the partial unique index (project_id, ref) WHERE ref IS NOT NULL added
-    by migration 003 for ON CONFLICT-based idempotent upsert when project_id is
-    given; falls back to SELECT-then-INSERT/UPDATE for legacy project_id=None
-    calls.
-    """
+def upsert_node_by_ref(type_, ref, props=None):
+    # Insert a node, or MERGE props into the existing one with this (type, ref) —
+    # never create a second node. Avoids duplicates when re-fetching the same
+    # external item (e.g. a Jira issue). If duplicates already exist, prefer the
+    # node that has 'has' edges (the one linked to ACs) so re-fetch updates the
+    # right node rather than an empty duplicate; props merge preserves existing
+    # keys (e.g. _meta provenance) and overlays the new metadata.
     props = props or {}
     with conn() as c:
-        if project_id is None:
-            # Legacy path: no project scope → SELECT then INSERT/UPDATE.
-            # Prefer the node with 'has' edges when duplicates exist, so re-fetch
-            # updates the AC-bearing node rather than an empty duplicate.
-            row = c.execute(
-                """
-                SELECT n.id FROM nodes n
-                WHERE n.type=%s AND n.ref=%s
-                ORDER BY (SELECT count(*) FROM edges e WHERE e.src_id=n.id AND e.rel='has') DESC,
-                         n.id ASC
-                LIMIT 1
-                """,
-                (type_, ref),
-            ).fetchone()
-            if row:
-                node_id = row[0]
-                if merge_props:
-                    c.execute(
-                        "UPDATE nodes SET props_json = COALESCE(props_json,'{}'::jsonb) || %s::jsonb WHERE id=%s",
-                        (psycopg.types.json.Json(props), node_id),
-                    )
-                else:
-                    c.execute(
-                        "UPDATE nodes SET props_json=%s WHERE id=%s",
-                        (psycopg.types.json.Json(props), node_id),
-                    )
-                return node_id
-            row = c.execute(
-                "INSERT INTO nodes(type, ref, props_json) VALUES (%s,%s,%s) RETURNING id",
-                (type_, ref, psycopg.types.json.Json(props)),
-            ).fetchone()
-            return row[0]
-
-        # Multi-tenant path: use ON CONFLICT with the (project_id, ref) unique index
-        conflict_expr = (
-            "props_json = nodes.props_json || EXCLUDED.props_json" if merge_props
-            else "props_json = EXCLUDED.props_json"
-        )
         row = c.execute(
-            f"""
-            INSERT INTO nodes (type, ref, project_id, props_json)
-            VALUES (%s, %s, %s, %s::jsonb)
-            ON CONFLICT (project_id, ref) WHERE ref IS NOT NULL DO UPDATE
-              SET {conflict_expr}
-            RETURNING id
+            """
+            SELECT n.id FROM nodes n
+            WHERE n.type=%s AND n.ref=%s
+            ORDER BY (SELECT count(*) FROM edges e WHERE e.src_id=n.id AND e.rel='has') DESC,
+                     n.id ASC
+            LIMIT 1
             """,
-            (type_, ref, project_id, psycopg.types.json.Json(props)),
+            (type_, ref),
+        ).fetchone()
+        if row:
+            node_id = row[0]
+            c.execute(
+                "UPDATE nodes SET props_json = COALESCE(props_json,'{}'::jsonb) || %s::jsonb WHERE id=%s",
+                (psycopg.types.json.Json(props), node_id),
+            )
+            return node_id
+        row = c.execute(
+            "INSERT INTO nodes(type, ref, props_json) VALUES (%s,%s,%s) RETURNING id",
+            (type_, ref, psycopg.types.json.Json(props)),
         ).fetchone()
         return row[0]
-
-
-def get_node_by_ref(type_, ref, project_id=None):
-    """Return {id, props_json} for the node, or None. Used to check existing
-    content_hash before re-embedding a Confluence page, etc."""
-    with conn() as c:
-        sql = "SELECT id, props_json FROM nodes WHERE type=%s AND ref=%s"
-        params = [type_, ref]
-        if project_id is not None:
-            sql += " AND project_id=%s"
-            params.append(project_id)
-        row = c.execute(sql + " LIMIT 1", params).fetchone()
-        if not row:
-            return None
-        return {"id": row[0], "props_json": row[1] or {}}
-
-
-def count_acs(req_node_id):
-    """Return the number of AcceptanceCriterion nodes a Requirement has.
-
-    Used by ingest to decide whether to re-run AC extraction when the linked
-    BRD's content is unchanged (status='cached') — normally we skip in that
-    case, but if AC count is 0 the previous extraction never persisted
-    anything (LLM error, section-slice miss, etc.) and we should retry.
-    """
-    with conn() as c:
-        row = c.execute(
-            "SELECT count(*) FROM nodes ac "
-            "JOIN edges e ON e.dst_id=ac.id AND e.rel='has' "
-            "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion'",
-            (req_node_id,),
-        ).fetchone()
-        return row[0] if row else 0
-
-
-def linked_brds(src_id):
-    """Return BRD nodes reachable via `src -derivedFrom-> BRD`.
-
-    Each item: {id, ref, props_json}. Used by the ingest hash-gate to check
-    whether any Confluence page a Requirement derived from has drifted
-    version-wise (i.e. the PRD was edited without touching Jira).
-    """
-    with conn() as c:
-        rows = c.execute(
-            "SELECT n.id, n.ref, n.props_json FROM nodes n "
-            "JOIN edges e ON e.dst_id=n.id AND e.rel='derivedFrom' "
-            "WHERE e.src_id=%s AND n.type='BRD'",
-            (src_id,),
-        ).fetchall()
-    return [{"id": r[0], "ref": r[1], "props_json": r[2] or {}} for r in rows]
-
-
-def ensure_edge(src_id, rel, dst_id, props=None):
-    """Idempotent edge insert (edges has no unique constraint; use WHERE NOT EXISTS).
-
-    Wraps the same pattern all ingest scripts use so runtime code doesn't
-    duplicate edges on re-fetch.
-    """
-    with conn() as c:
-        c.execute(
-            """
-            INSERT INTO edges (src_id, rel, dst_id, props_json)
-            SELECT %s, %s, %s, %s
-            WHERE NOT EXISTS (
-              SELECT 1 FROM edges WHERE src_id=%s AND rel=%s AND dst_id=%s
-            )
-            """,
-            (src_id, rel, dst_id, psycopg.types.json.Json(props or {}),
-             src_id, rel, dst_id),
-        )
 
 
 def get_node_props(ref, type_=None):
@@ -536,51 +422,21 @@ def record_golive_decision(requirement_ref, decision, approver, reason=None):
 HIGH_SEVERITIES = ("critical", "high")
 
 
-# TestCase review_status values that DO count as coverage in strict mode —
-# i.e. at least a QE has approved the TC. Drafts, "waiting-for-QE" pending
-# states, and rejected TCs do NOT count.
-#   qe_reviewed   QE has approved (waiting for lead)
-#   lead_pending  lead started reviewing (QE already approved)
-#   lead_approved fully approved
-_VERIFIED_TC_STATES = ("qe_reviewed", "lead_pending", "lead_approved")
-
-
-def _uncovered_acs(c, requirement_ref=None, project_id=None, strict=False):
+def _uncovered_acs(c, requirement_ref=None, project_id=None):
     # AcceptanceCriterion not coveredBy any TestCase → coverage gap.
     # Ontology: Requirement -has-> AcceptanceCriterion -coveredBy-> TestCase,
     # so an AC is the src of its 'coveredBy' edge.
     # - requirement_ref: scope to that requirement's ACs.
     # - project_id: restrict to ACs belonging to that project (prevents cross-tenant leak).
-    # - strict: when True, an AC counts as covered ONLY if it has a coveredBy
-    #   edge to a TestCase whose props_json.review_status is in
-    #   _VERIFIED_TC_STATES. Drafts / pending / rejected TCs don't count.
-    #   Default False preserves backward-compat with callers that want raw
-    #   "has-any-TC" gaps.
-    if strict:
-        # COALESCE(review_status, 'qe_reviewed'): legacy TC nodes ingested
-        # before the strict-mode rollout have no review_status set. Rather
-        # than force a data migration, we treat NULL as "verified enough" —
-        # only explicit values ('draft', 'qe_pending', 'rejected') exclude a
-        # TC from coverage. New gen_testcase TCs MUST set 'draft' explicitly.
-        cov_exists = """
-        SELECT 1 FROM edges cov
-        JOIN nodes tc ON tc.id = cov.dst_id AND tc.type='TestCase'
-        WHERE cov.src_id=ac.id AND cov.rel='coveredBy'
-          AND COALESCE(tc.props_json->>'review_status', 'qe_reviewed') = ANY(%s)
-        """
-    else:
-        cov_exists = """
-        SELECT 1 FROM edges cov
-        WHERE cov.src_id=ac.id AND cov.rel='coveredBy'
-        """
-    sql = f"""
+    sql = """
     SELECT ac.id, ac.ref FROM nodes ac
     WHERE ac.type='AcceptanceCriterion'
-      AND NOT EXISTS ({cov_exists})
+      AND NOT EXISTS (
+        SELECT 1 FROM edges cov
+        WHERE cov.src_id=ac.id AND cov.rel='coveredBy'
+      )
     """
     params = []
-    if strict:
-        params.append(list(_VERIFIED_TC_STATES))
     if project_id is not None:
         sql += " AND ac.project_id=%s"
         params.append(project_id)
@@ -596,370 +452,15 @@ def _uncovered_acs(c, requirement_ref=None, project_id=None, strict=False):
     return c.execute(sql, params).fetchall()
 
 
-def coverage_gap(project_id=None, strict=False):
+def coverage_gap(project_id=None):
     """List AC nodes without any coveredBy edge.
 
     Args:
       project_id: if given, restrict to ACs belonging to that project (multi-tenant
                   isolation). None (default) = global.
-      strict: when True, only TestCases in _VERIFIED_TC_STATES count as coverage —
-              drafts / pending / rejected TCs are ignored. Use for gating decisions
-              like go_no_go. Default False keeps the raw "any TC" behaviour.
     """
     with conn() as c:
-        return _uncovered_acs(c, project_id=project_id, strict=strict)
-
-
-import re as _re
-
-_JIRA_KEY_RE = _re.compile(r"^([A-Z][A-Z0-9]*)-\d+")
-
-
-def project_from_ref(ref):
-    """Derive project_id from a Jira-style ref: 'CDM-199' -> 'CDM'.
-
-    Convention (docs/GRAPH_INSERT_GUIDE.md): project_id equals the prefix before
-    the first '-' in a ref. Also matches nested refs like 'CDM-302-1' (Bug).
-    Returns None if the ref doesn't match a Jira key pattern.
-    """
-    if not ref:
-        return None
-    m = _JIRA_KEY_RE.match(ref)
-    return m.group(1) if m else None
-
-
-def _fetch_node_polymorphic(c, ref, project_id=None):
-    """Find a node by ref with a TR-<ref> fallback (migration 007 convention).
-
-    Slack users type 'CDM-263' but TestRun refs are stored as 'TR-CDM-263'.
-    """
-    def _one(target_ref):
-        sql = "SELECT id, type, ref, project_id, props_json FROM nodes WHERE ref=%s"
-        params = [target_ref]
-        if project_id is not None:
-            sql += " AND project_id=%s"
-            params.append(project_id)
-        sql += " ORDER BY id LIMIT 1"
-        return c.execute(sql, params).fetchone()
-
-    row = _one(ref)
-    if not row and _JIRA_KEY_RE.match(ref or "") and not ref.startswith("TR-"):
-        row = _one(f"TR-{ref}")
-    return row
-
-
-def _view_requirement(c, node_id, ref, props):
-    """Return AC list (with coverage), linked BRDs, parent story, warnings."""
-    us = c.execute(
-        "SELECT n.ref, n.props_json FROM nodes n "
-        "JOIN edges e ON e.src_id=n.id AND e.rel='has' "
-        "WHERE e.dst_id=%s AND n.type='UserStory' LIMIT 1",
-        (node_id,),
-    ).fetchone()
-    user_story = {"ref": us[0], "title": (us[1] or {}).get("title")} if us else None
-
-    brds = [
-        {
-            "ref": r[0], "title": (r[1] or {}).get("title"),
-            "url": (r[1] or {}).get("url") or (r[1] or {}).get("_meta", {}).get("source_file"),
-            "section_anchor": (r[1] or {}).get("section_anchor"),
-            "content_preview": (r[1] or {}).get("content_preview"),
-        }
-        for r in c.execute(
-            "SELECT n.ref, n.props_json FROM nodes n "
-            "JOIN edges e ON e.dst_id=n.id AND e.rel='derivedFrom' "
-            "WHERE e.src_id=%s AND n.type='BRD' ORDER BY n.ref",
-            (node_id,),
-        ).fetchall()
-    ]
-
-    acs = []
-    for ac_id, ac_ref, ac_props in c.execute(
-        "SELECT ac.id, ac.ref, ac.props_json FROM nodes ac "
-        "JOIN edges e ON e.dst_id=ac.id AND e.rel='has' "
-        "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion' ORDER BY ac.ref",
-        (node_id,),
-    ).fetchall():
-        # Pull the TC props alongside its ref so the caller (LLM / Slack) can
-        # render title + review_status + priority without a follow-up call.
-        # Legacy TCs without review_status get COALESCE'd to 'qe_reviewed'
-        # (same rule as strict-coverage in _uncovered_acs).
-        tc_rows = c.execute(
-            "SELECT tc.ref, tc.props_json FROM nodes tc "
-            "JOIN edges cov ON cov.dst_id=tc.id AND cov.rel='coveredBy' "
-            "WHERE cov.src_id=%s AND tc.type='TestCase' ORDER BY tc.ref",
-            (ac_id,),
-        ).fetchall()
-        testcases = []
-        for tc_ref, tc_props in tc_rows:
-            tp = tc_props or {}
-            testcases.append({
-                "ref": tc_ref,
-                "title": tp.get("title"),
-                "review_status": tp.get("review_status") or "qe_reviewed",
-                "priority": tp.get("priority"),
-            })
-        p = ac_props or {}
-        acs.append({
-            "ref": ac_ref, "title": p.get("title"),
-            "detail": p.get("detail") or p.get("desc"),
-            "coverage": {
-                "has_testcase": bool(testcases),
-                "testcases": testcases,
-                # Legacy: bare-ref list kept for any older caller that reads it.
-                "testcase_refs": [t["ref"] for t in testcases],
-            },
-        })
-
-    # TestRun subtasks of this Requirement — linked via props.jira_parent_ref
-    # (not by edge; convention in jira_ingest since the parent link is Jira-native).
-    test_runs = [
-        {
-            "ref": r[0],
-            "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
-            "environment": (r[1] or {}).get("environment"),
-            "status": (r[1] or {}).get("status"),
-        }
-        for r in c.execute(
-            "SELECT ref, props_json FROM nodes "
-            "WHERE type='TestRun' AND props_json->>'jira_parent_ref'=%s ORDER BY ref",
-            (ref,),
-        ).fetchall()
-    ]
-
-    # Bugs linked to this Requirement — via props.jira_parent_ref (covers
-    # bugs materialised from a [Bug]-subtask table under this Story).
-    linked_bugs = [
-        {
-            "ref": r[0],
-            "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
-            "severity": (r[1] or {}).get("severity"),
-            "status": (r[1] or {}).get("status"),
-            "find_by": (r[1] or {}).get("find_by"),
-        }
-        for r in c.execute(
-            "SELECT ref, props_json FROM nodes "
-            "WHERE type='Bug' AND props_json->>'jira_parent_ref'=%s ORDER BY ref",
-            (ref,),
-        ).fetchall()
-    ]
-
-    warnings = []
-    if not acs:
-        warnings.append(
-            "0 acceptance criteria trong graph. PRD chưa được extract thành AC — "
-            "gọi ingest_jira_ticket với extract_acs=True. TUYỆT ĐỐI KHÔNG bịa AC."
-        )
-    else:
-        def _ac_label(a):
-            # Prefer human-readable desc/title over the opaque hash ref
-            # (AC-CDM-268-0d2262c6). Fall back to ref if neither present.
-            txt = (a.get("detail") or a.get("title") or "").strip()
-            if not txt:
-                return a["ref"]
-            txt = txt.split("\n", 1)[0]
-            return txt if len(txt) <= 80 else txt[:77] + "…"
-
-        uncovered_items = [a for a in acs if not a["coverage"]["has_testcase"]]
-        if uncovered_items:
-            labels = [f"'{_ac_label(a)}'" for a in uncovered_items]
-            warnings.append(
-                f"{len(uncovered_items)}/{len(acs)} AC chưa có TestCase: "
-                f"{', '.join(labels)}. Attach TC lên Jira task hoặc chạy gen_testcase."
-            )
-    if not brds:
-        warnings.append("Không có BRD/PRD link. Nếu Jira desc có Confluence URL, gọi ingest_jira_ticket.")
-    if not test_runs:
-        warnings.append(
-            "Chưa có TestRun subtask nào. QE có thể chưa tạo subtask '[QE] testing on beta/prod' "
-            "trên Jira, hoặc chạy ingest_jira_ticket để pull subtree."
-        )
-    open_critical = [b for b in linked_bugs if b["status"] not in ("done", "closed") and b["severity"] in ("critical", "high")]
-    if open_critical:
-        warnings.append(
-            f"{len(open_critical)} critical/high bug đang open: "
-            f"{', '.join(b['ref'] for b in open_critical)}. Cần fix trước khi go-live."
-        )
-
-    return {
-        "ref": ref, "type": "Requirement", "found": True, "props": props,
-        "user_story": user_story, "brds": brds,
-        "acceptance_criteria": acs,
-        "test_runs": test_runs,
-        "linked_bugs": linked_bugs,
-        "warnings": warnings,
-    }
-
-
-def _view_bug(c, node_id, ref, props):
-    """Return severity, affected components, violated ACs, and which TestRun found it."""
-    affects = [r[0] for r in c.execute(
-        "SELECT n.ref FROM nodes n JOIN edges e ON e.dst_id=n.id "
-        "WHERE e.src_id=%s AND e.rel='affects' AND n.type='Component'",
-        (node_id,),
-    ).fetchall()]
-    violates = [r[0] for r in c.execute(
-        "SELECT n.ref FROM nodes n JOIN edges e ON e.dst_id=n.id "
-        "WHERE e.src_id=%s AND e.rel='violates' AND n.type='AcceptanceCriterion'",
-        (node_id,),
-    ).fetchall()]
-    found_by = [r[0] for r in c.execute(
-        "SELECT n.ref FROM nodes n JOIN edges e ON e.src_id=n.id "
-        "WHERE e.dst_id=%s AND e.rel='finds' AND n.type='TestRun'",
-        (node_id,),
-    ).fetchall()]
-    warnings = []
-    if not violates:
-        warnings.append("Bug này chưa link tới AC nào (edge `violates`). Traceability thiếu.")
-    if not found_by:
-        warnings.append("Bug chưa link tới TestRun (edge `finds`) — có thể leaked to production.")
-    return {
-        "ref": ref, "type": "Bug", "found": True, "props": props,
-        "affects_components": affects, "violates_acs": violates,
-        "found_by_testruns": found_by, "warnings": warnings,
-    }
-
-
-def _view_testrun(c, node_id, ref, props):
-    """Return linked TestCase (via executedBy) and bugs found."""
-    tc = c.execute(
-        "SELECT n.ref, n.props_json FROM nodes n JOIN edges e ON e.src_id=n.id "
-        "WHERE e.dst_id=%s AND e.rel='executedBy' AND n.type='TestCase' LIMIT 1",
-        (node_id,),
-    ).fetchone()
-    testcase = {"ref": tc[0], "title": (tc[1] or {}).get("title")} if tc else None
-    bugs = [
-        {"ref": r[0], "severity": (r[1] or {}).get("severity"), "status": (r[1] or {}).get("status")}
-        for r in c.execute(
-            "SELECT n.ref, n.props_json FROM nodes n JOIN edges e ON e.dst_id=n.id "
-            "WHERE e.src_id=%s AND e.rel='finds' AND n.type='Bug' ORDER BY n.ref",
-            (node_id,),
-        ).fetchall()
-    ]
-    warnings = []
-    if not testcase:
-        warnings.append("TestRun chưa link tới TestCase (edge `executedBy`). Đóng góp coverage = 0.")
-    return {
-        "ref": ref, "type": "TestRun", "found": True, "props": props,
-        "testcase": testcase, "bugs_found": bugs, "warnings": warnings,
-    }
-
-
-def _view_userstory_or_epic(c, node_id, ref, props):
-    """Epic/UserStory view: list linked Requirements + aggregate TestRuns/Bugs
-    across all children (via jira_parent_ref chain)."""
-    reqs = [
-        {"ref": r[0], "title": (r[1] or {}).get("title")}
-        for r in c.execute(
-            "SELECT n.ref, n.props_json FROM nodes n JOIN edges e ON e.dst_id=n.id "
-            "WHERE e.src_id=%s AND e.rel='has' AND n.type='Requirement' ORDER BY n.ref",
-            (node_id,),
-        ).fetchall()
-    ]
-
-    # Aggregate TestRuns of all child Requirements — bằng cách join qua
-    # jira_parent_ref của TestRun (parent = child Requirement.ref, không phải Epic).
-    child_refs = [r["ref"] for r in reqs]
-    test_runs = []
-    linked_bugs = []
-    if child_refs:
-        test_runs = [
-            {
-                "ref": r[0],
-                "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
-                "environment": (r[1] or {}).get("environment"),
-                "status": (r[1] or {}).get("status"),
-                "parent_story": (r[1] or {}).get("jira_parent_ref"),
-            }
-            for r in c.execute(
-                "SELECT ref, props_json FROM nodes "
-                "WHERE type='TestRun' AND props_json->>'jira_parent_ref' = ANY(%s) ORDER BY ref",
-                (child_refs,),
-            ).fetchall()
-        ]
-        linked_bugs = [
-            {
-                "ref": r[0],
-                "title": (r[1] or {}).get("title") or (r[1] or {}).get("summary"),
-                "severity": (r[1] or {}).get("severity"),
-                "status": (r[1] or {}).get("status"),
-                "parent_story": (r[1] or {}).get("jira_parent_ref"),
-            }
-            for r in c.execute(
-                "SELECT ref, props_json FROM nodes "
-                "WHERE type='Bug' AND props_json->>'jira_parent_ref' = ANY(%s) ORDER BY ref",
-                (child_refs,),
-            ).fetchall()
-        ]
-
-    warnings = [] if reqs else ["Epic/Story chưa có Requirement con nào."]
-    return {
-        "ref": ref, "type": "UserStory", "found": True, "props": props,
-        "requirements": reqs,
-        "test_runs": test_runs,
-        "linked_bugs": linked_bugs,
-        "warnings": warnings,
-    }
-
-
-def _view_brd(c, node_id, ref, props):
-    """BRD view: preview + downstream requirements."""
-    downstream = [r[0] for r in c.execute(
-        "SELECT n.ref FROM nodes n JOIN edges e ON e.src_id=n.id "
-        "WHERE e.dst_id=%s AND e.rel='derivedFrom' AND n.type='Requirement' ORDER BY n.ref",
-        (node_id,),
-    ).fetchall()]
-    return {
-        "ref": ref, "type": "BRD", "found": True, "props": props,
-        "downstream_requirements": downstream, "warnings": [],
-    }
-
-
-def get_ticket(ref, project_id=None):
-    """Polymorphic read: dispatch view by node.type. This is the READ entry point
-    the agent should call first when a user mentions a ticket key (`CDM-XXX`).
-
-    Smart lookup: falls back to `TR-<ref>` if the direct ref misses (matches the
-    convention from migration 007 for TestRun subtasks).
-
-    Returns `{ref, type, found, props, ...type-specific fields..., warnings}`.
-    When `warnings` is non-empty, the agent MUST echo each to the user — they
-    flag missing data / missing edges the user needs to know about.
-
-    See docs/GRAPH_INSERT_GUIDE.md for node type conventions.
-    """
-    with conn() as c:
-        row = _fetch_node_polymorphic(c, ref, project_id=project_id)
-        if not row:
-            return {
-                "ref": ref, "found": False,
-                "warnings": [
-                    f"Ticket {ref} không có trong graph"
-                    + (f" (project_id={project_id})" if project_id else "")
-                    + ". Gọi ingest_jira_ticket để pull từ Jira."
-                ],
-            }
-        node_id, n_type, node_ref, _, props = row
-        props = props or {}
-        # Legacy: some pipelines wrote `summary` instead of `title`. Surface both.
-        if n_type in ("Requirement", "UserStory") and not props.get("title") and props.get("summary"):
-            props = {**props, "title": props["summary"]}
-
-        if n_type == "Requirement":
-            return _view_requirement(c, node_id, node_ref, props)
-        if n_type == "UserStory":
-            return _view_userstory_or_epic(c, node_id, node_ref, props)
-        if n_type == "Bug":
-            return _view_bug(c, node_id, node_ref, props)
-        if n_type == "TestRun":
-            return _view_testrun(c, node_id, node_ref, props)
-        if n_type == "BRD":
-            return _view_brd(c, node_id, node_ref, props)
-        # Default fallback (TestCase, AC, Component, Sprint, Task, ...)
-        return {
-            "ref": node_ref, "type": n_type, "found": True, "props": props,
-            "warnings": [],
-        }
+        return _uncovered_acs(c, project_id=project_id)
 
 
 def trace(requirement_ref, project_id=None):
@@ -983,9 +484,7 @@ def trace(requirement_ref, project_id=None):
 
         acs = c.execute(
             """
-            SELECT ac.id, ac.ref,
-                   COALESCE(ac.props_json->>'desc', ac.props_json->>'title', '')
-            FROM nodes ac
+            SELECT ac.id, ac.ref FROM nodes ac
             JOIN edges h ON h.dst_id=ac.id AND h.rel='has'
             WHERE h.src_id=%s AND ac.type='AcceptanceCriterion'
             ORDER BY ac.ref
@@ -994,7 +493,7 @@ def trace(requirement_ref, project_id=None):
         ).fetchall()
 
         acceptance_criteria = []
-        for ac_id, ac_ref, ac_desc in acs:
+        for ac_id, ac_ref in acs:
             testcases = c.execute(
                 """
                 SELECT tc.id, tc.ref FROM nodes tc
@@ -1051,7 +550,6 @@ def trace(requirement_ref, project_id=None):
 
             acceptance_criteria.append({
                 "ref": ac_ref,
-                "desc": ac_desc or None,
                 "covered": bool(tc_list),
                 "test_status": test_status,
                 "testcases": tc_list,
@@ -1211,12 +709,6 @@ def go_no_go(requirement_ref, project_id=None):
       project_id: if given, all sub-queries scope to that project (multi-tenant).
                   Returns decision='NOT_FOUND' if the requirement doesn't exist
                   in that project.
-
-    Coverage semantics — STRICT: only TestCases in _VERIFIED_TC_STATES count.
-    Drafts / rejected TCs don't cover ACs for gating decisions (they would
-    inflate coverage and lead to false GO calls). ACs with only draft/pending
-    TCs surface under `coverage_awaiting_review` so QE knows what to review,
-    but the decision itself is NO-GO until those TCs advance past QE review.
     """
     with conn() as c:
         exists_sql = "SELECT id FROM nodes WHERE type='Requirement' AND ref=%s"
@@ -1230,77 +722,25 @@ def go_no_go(requirement_ref, project_id=None):
                 "requirement": requirement_ref,
                 "decision": "NOT_FOUND",
                 "coverage_gaps": [],
-                "coverage_uncovered": [],
-                "coverage_awaiting_review": [],
                 "failing_tests": [],
                 "open_bugs": [],
                 "next_actions": [f"Requirement '{requirement_ref}' not found{scope}"],
             }
 
-        # Strict gaps: AC has NO verified TC covering it.
-        strict_gaps = _uncovered_acs(c, requirement_ref,
-                                     project_id=project_id, strict=True)
-        # Loose gaps: AC has no TC at all (not even a draft).
-        loose_gaps = _uncovered_acs(c, requirement_ref,
-                                    project_id=project_id, strict=False)
-
-        # Fetch AC text for every gap ref in one round-trip so next_actions
-        # can render "AC-X — <what it says>" instead of just an opaque hash.
-        # AC titles live in different props keys depending on the ingest
-        # source: LLM diff writes `desc`, scripts/ingest/requirements.py
-        # writes `title` (+ `detail`). COALESCE picks whichever is present.
-        gap_refs = {ac_ref for _id, ac_ref in strict_gaps}
-        gap_refs |= {ac_ref for _id, ac_ref in loose_gaps}
-        ac_text = {}
-        if gap_refs:
-            title_sql = (
-                "SELECT ref, "
-                "COALESCE(props_json->>'title', "
-                "         props_json->>'desc', "
-                "         props_json->>'detail', '') AS text "
-                "FROM nodes WHERE type='AcceptanceCriterion' "
-                "AND ref = ANY(%s)"
-            )
-            title_params = [list(gap_refs)]
-            if project_id is not None:
-                title_sql += " AND project_id=%s"
-                title_params.append(project_id)
-            for r, t in c.execute(title_sql, title_params).fetchall():
-                ac_text[r] = (t or "").strip()
+        gaps = _uncovered_acs(c, requirement_ref, project_id=project_id)
     failing = failing_tests_for(requirement_ref, project_id=project_id)
     bugs = open_bugs_for(requirement_ref, project_id=project_id)
 
-    # Set arithmetic: strict-gap MINUS loose-gap = ACs that have a TC but
-    # NO verified TC → those are awaiting review, not truly uncovered.
-    loose_refs = {ac_ref for _id, ac_ref in loose_gaps}
-    strict_refs = {ac_ref for _id, ac_ref in strict_gaps}
-    truly_uncovered = sorted(loose_refs)
-    awaiting_review = sorted(strict_refs - loose_refs)
-
+    coverage_gaps = [ac_ref for _id, ac_ref in gaps]
     failing_tests = [{"testrun": tr_ref, "testcase": tc_ref} for tr_ref, tc_ref in failing]
     open_bugs = [{"bug": b_ref, "severity": sev} for b_ref, sev in bugs]
 
     has_high_bug = any((sev or "").lower() in HIGH_SEVERITIES for _b, sev in bugs)
-    # Awaiting-review ACs still block GO — reviewing draft TCs is real work,
-    # not a rubber stamp. QE gets a distinct next_action for those vs writing
-    # a TC from scratch.
-    blocks = bool(truly_uncovered or awaiting_review or failing_tests or has_high_bug)
-    decision = "NO-GO" if blocks else "GO"
-
-    def _fmt_ac(ac_ref):
-        # "AC-CDM-268-a1b2c3d4 — 'User can reset password via SMS'" when text
-        # is known; falls back to bare ref if the AC row is missing / empty.
-        text = ac_text.get(ac_ref, "")
-        if not text:
-            return ac_ref
-        snippet = text if len(text) <= 100 else text[:97].rstrip() + "…"
-        return f"{ac_ref} — “{snippet}”"
+    decision = "GO" if (not coverage_gaps and not failing_tests and not has_high_bug) else "NO-GO"
 
     next_actions = []
-    for ac_ref in truly_uncovered:
-        next_actions.append(f"Write a testcase for {_fmt_ac(ac_ref)}")
-    for ac_ref in awaiting_review:
-        next_actions.append(f"Review draft testcase(s) covering {_fmt_ac(ac_ref)}")
+    for ac_ref in coverage_gaps:
+        next_actions.append(f"Write a testcase for {ac_ref}")
     for ft in failing_tests:
         next_actions.append(f"Fix failing testcase {ft['testcase']} (run {ft['testrun']})")
     for ob in open_bugs:
@@ -1309,12 +749,7 @@ def go_no_go(requirement_ref, project_id=None):
     return {
         "requirement": requirement_ref,
         "decision": decision,
-        # Backward-compat: `coverage_gaps` is the strict set (union of truly
-        # uncovered + awaiting review) so old callers still see the total
-        # blocking count. New callers use the split fields.
-        "coverage_gaps": truly_uncovered + awaiting_review,
-        "coverage_uncovered": truly_uncovered,
-        "coverage_awaiting_review": awaiting_review,
+        "coverage_gaps": coverage_gaps,
         "failing_tests": failing_tests,
         "open_bugs": open_bugs,
         "next_actions": next_actions,
@@ -1524,112 +959,6 @@ def classify_bug(bug_ref, project_id=None):
         }
 
 
-# --- TestCase review workflow --------------------------------------------
-
-# State machine for TestCase.props.review_status:
-#
-#   draft ──approve──▶ qe_pending ──approve──▶ qe_reviewed ──approve──▶ lead_pending
-#     │                    │                        │                        │
-#     └────reject──────────┴────reject──────────────┴────reject──────────────┴───▶ rejected
-#                                                                            │
-#                                                                        approve
-#                                                                            ▼
-#                                                                     lead_approved
-#
-# `qe_pending` and `lead_pending` are "waiting for X's approval" states —
-# used by the Slack layer to know who to @-mention. `qe_reviewed` /
-# `lead_approved` are terminal-approve states.
-_REVIEW_STATE_TRANSITIONS = {
-    "draft":         {"approve": "qe_pending",   "reject": "rejected"},
-    "qe_pending":    {"approve": "qe_reviewed",  "reject": "rejected"},
-    "qe_reviewed":   {"approve": "lead_pending", "reject": "rejected"},
-    "lead_pending":  {"approve": "lead_approved","reject": "rejected"},
-    # Terminal states — no further transitions accepted.
-    "lead_approved": {},
-    "rejected":      {},
-}
-
-
-def _now_utc_iso():
-    from datetime import datetime, timezone
-    return datetime.now(timezone.utc).isoformat()
-
-
-def mark_reviewed(tc_ref, decision, reviewer_slack_id, comments=None, project_id=None):
-    """Advance a TestCase through the review state machine.
-
-    Args:
-      tc_ref:             TestCase ref (e.g. 'CDM_DupScript_002').
-      decision:           'approve' or 'reject'.
-      reviewer_slack_id:  Slack user id doing the review (recorded per stage).
-      comments:           optional free-text comment (recorded on the transition).
-      project_id:         multi-tenant guard. The TC must belong to this project.
-
-    Returns dict:
-      {status: 'ok'|'error'|'terminal', old_state, new_state, tc_ref, reasoning}
-
-    Non-destructive: on error (unknown TC, invalid transition, terminal state)
-    props stay untouched.
-    """
-    if decision not in ("approve", "reject"):
-        return {"status": "error", "tc_ref": tc_ref,
-                "reasoning": f"decision must be 'approve' or 'reject', got {decision!r}"}
-
-    tc = get_node_by_ref("TestCase", tc_ref, project_id=project_id)
-    if not tc:
-        scope = f" in project '{project_id}'" if project_id else ""
-        return {"status": "error", "tc_ref": tc_ref,
-                "reasoning": f"TestCase '{tc_ref}' not found{scope}"}
-
-    props = tc["props_json"] or {}
-    old_state = props.get("review_status") or "draft"
-    transitions = _REVIEW_STATE_TRANSITIONS.get(old_state, {})
-    if not transitions:
-        return {"status": "terminal", "tc_ref": tc_ref, "old_state": old_state,
-                "new_state": old_state,
-                "reasoning": f"TestCase already in terminal state '{old_state}'"}
-
-    new_state = transitions.get(decision)
-    if new_state is None:
-        return {"status": "error", "tc_ref": tc_ref, "old_state": old_state,
-                "reasoning": f"decision '{decision}' invalid from state '{old_state}'"}
-
-    now = _now_utc_iso()
-    # Record reviewer + timestamp on the STAGE, so the audit trail persists
-    # even after the state advances again.
-    stage_key = {
-        ("draft", "approve"):        ("qe_started_at",   "qe_started_by"),
-        ("qe_pending", "approve"):   ("qe_reviewed_at",  "reviewed_by_qe"),
-        ("qe_pending", "reject"):    ("qe_rejected_at",  "rejected_by_qe"),
-        ("qe_reviewed", "approve"):  ("lead_started_at", "lead_started_by"),
-        ("lead_pending", "approve"): ("lead_approved_at","reviewed_by_qe_lead"),
-        ("lead_pending", "reject"):  ("lead_rejected_at","rejected_by_qe_lead"),
-        ("draft", "reject"):         ("draft_rejected_at", "rejected_by"),
-        ("qe_reviewed", "reject"):   ("qe_rejected_at",    "rejected_by"),
-    }.get((old_state, decision))
-    delta = {"review_status": new_state}
-    if stage_key:
-        delta[stage_key[0]] = now
-        delta[stage_key[1]] = reviewer_slack_id
-    if comments:
-        history = list(props.get("review_history") or [])
-        history.append({
-            "at": now, "from": old_state, "to": new_state,
-            "by": reviewer_slack_id, "comment": comments,
-        })
-        delta["review_history"] = history
-
-    upsert_node_by_ref("TestCase", tc_ref, delta,
-                        project_id=project_id, merge_props=True)
-
-    return {
-        "status": "ok", "tc_ref": tc_ref,
-        "old_state": old_state, "new_state": new_state,
-        "reviewer": reviewer_slack_id,
-        "reasoning": f"TestCase {tc_ref}: {old_state} → {new_state}",
-    }
-
-
 def requirement_with_acs(ref, project_id=None):
     """Return the Requirement's PRD content plus its AcceptanceCriteria.
 
@@ -1807,475 +1136,4 @@ def save_testcases(requirement_ref, testcases, approved_by, project_id=None):
                         "INSERT INTO edges(src_id, rel, dst_id, props_json) VALUES (%s,'coveredBy',%s,%s)",
                         (ac_id, tc_id, psycopg.types.json.Json({})),
                     )
-
-
-def feature_blast_radius(component_ref, project_id=None):
-    """Impact analysis starting from a Component (feature), not from a diff.
-
-    Answer: "If feature X is being developed, what OTHER features are at
-    risk of breaking?" Also lists Requirements + ACs + TestCases scoped to
-    the affected features so QE knows what to plan for.
-
-    Walk:
-      - dependents:   Components that dependsOn the target (they'd break
-                      if target breaks; ranked HIGH).
-      - target itself is the "you-are-here" (HIGH).
-      - Requirements: any Requirement impacting the target OR a dependent
-                      Component. Severity = max Component severity impacted.
-      - ACs:          under those Requirements. Inherit severity.
-      - TestCases:    coveredBy those ACs. Inherit severity.
-
-    Unlike code_impact (which walks the code closure), this is pure
-    business-graph traversal — no code awareness. Use it when you know the
-    feature but haven't cut code yet, or want to answer questions like
-    "what should QE plan for CDM-268?".
-    """
-    _sev_rank = {"high": 3, "medium": 2, "low": 1}
-    with conn() as c:
-        # Resolve target Component
-        sql = "SELECT id, ref, props_json->>'name' FROM nodes WHERE type='Component' AND ref=%s"
-        params = [component_ref]
-        if project_id is not None:
-            sql += " AND project_id=%s"; params.append(project_id)
-        row = c.execute(sql, params).fetchone()
-        if not row:
-            return {"target": {"ref": component_ref, "name": None},
-                    "affected_components": [], "affected_requirements": [],
-                    "affected_acs": [], "affected_testcases": [],
-                    "severity_counts": {"components": {"high":0,"medium":0,"low":0},
-                                        "requirements": {"high":0,"medium":0,"low":0},
-                                        "acs":          {"high":0,"medium":0,"low":0},
-                                        "testcases":    {"high":0,"medium":0,"low":0}},
-                    "warning": f"No Component found with ref={component_ref}"}
-        target_id, target_ref, target_name = row
-
-        # Walk dependents (Components -dependsOn-> target, transitively)
-        rows = c.execute(
-            """
-            WITH RECURSIVE dep_closure(comp_id, d) AS (
-              SELECT %s::bigint, 0
-              UNION
-              SELECT e.src_id, dc.d + 1
-                FROM dep_closure dc
-                JOIN edges e ON e.dst_id = dc.comp_id AND e.rel = 'dependsOn'
-               WHERE dc.d < 5
-            )
-            SELECT DISTINCT n.id, n.ref, n.props_json->>'name', MIN(dc.d)
-              FROM dep_closure dc
-              JOIN nodes n ON n.id = dc.comp_id
-             WHERE n.type = 'Component'
-                   """ + ("AND n.project_id = %s" if project_id else "") + """
-             GROUP BY n.id, n.ref, n.props_json->>'name'
-             ORDER BY MIN(dc.d), n.ref
-            """,
-            ([target_id, project_id] if project_id else [target_id]),
-        ).fetchall()
-        all_comp = {}
-        for cid, cref, cname, dep_d in rows:
-            all_comp[cid] = {
-                "id": cid, "ref": cref, "name": cname,
-                # Target itself and its DIRECT dependents (dep_d==1) get HIGH.
-                # More distant dependents get MEDIUM (they may or may not break).
-                "severity": ("high" if dep_d <= 1 else "medium"),
-                "via":      ("target" if dep_d == 0 else "dependsOn"),
-                "dep_depth": dep_d,
-            }
-
-        # Requirements impacting ANY affected Component
-        comp_ids = list(all_comp.keys())
-        rows = c.execute(
-            """
-            SELECT r.id, r.ref, r.props_json->>'title', e.dst_id
-              FROM nodes r
-              JOIN edges e ON e.src_id = r.id AND e.rel = 'impacts' AND e.dst_id = ANY(%s)
-             WHERE r.type = 'Requirement'
-                   """ + ("AND r.project_id = %s" if project_id else "") + """
-            """,
-            ([comp_ids, project_id] if project_id else [comp_ids]),
-        ).fetchall()
-        reqs_by_id = {}
-        for rid, rref, rtitle, comp_id in rows:
-            entry = reqs_by_id.setdefault(rid, {
-                "id": rid, "ref": rref, "title": rtitle,
-                "impacted_components": [], "severity": "low",
-            })
-            csev = all_comp[comp_id]["severity"]
-            entry["impacted_components"].append(all_comp[comp_id]["ref"])
-            if _sev_rank[csev] > _sev_rank[entry["severity"]]:
-                entry["severity"] = csev
-
-        # ACs under those Requirements
-        acs_by_id = {}
-        if reqs_by_id:
-            req_ids = list(reqs_by_id.keys())
-            sev_by_req = {r["id"]: r["severity"] for r in reqs_by_id.values()}
-            ref_by_req = {r["id"]: r["ref"]      for r in reqs_by_id.values()}
-            rows = c.execute(
-                """
-                SELECT a.id, a.ref, a.props_json->>'title', e.src_id
-                  FROM nodes a
-                  JOIN edges e ON e.dst_id = a.id AND e.rel = 'has' AND e.src_id = ANY(%s)
-                 WHERE a.type = 'AcceptanceCriterion'
-                       """ + ("AND a.project_id = %s" if project_id else "") + """
-                """,
-                ([req_ids, project_id] if project_id else [req_ids]),
-            ).fetchall()
-            for aid, aref, atitle, rid in rows:
-                acs_by_id.setdefault(aid, {
-                    "id": aid, "ref": aref, "title": atitle,
-                    "severity": sev_by_req[rid],
-                    "parent_requirement": ref_by_req[rid],
-                })
-
-        # TestCases covering those ACs
-        tcs_by_id = {}
-        if acs_by_id:
-            ac_ids = list(acs_by_id.keys())
-            sev_by_ac = {a["id"]: a["severity"] for a in acs_by_id.values()}
-            ref_by_ac = {a["id"]: a["ref"]      for a in acs_by_id.values()}
-            rows = c.execute(
-                """
-                SELECT t.id, t.ref, t.props_json->>'title', t.props_json->>'priority', e.src_id
-                  FROM nodes t
-                  JOIN edges e ON e.dst_id = t.id AND e.rel = 'coveredBy' AND e.src_id = ANY(%s)
-                 WHERE t.type = 'TestCase'
-                       """ + ("AND t.project_id = %s" if project_id else "") + """
-                """,
-                ([ac_ids, project_id] if project_id else [ac_ids]),
-            ).fetchall()
-            for tid, tref, ttitle, tprio, ac_id in rows:
-                entry = tcs_by_id.setdefault(tid, {
-                    "id": tid, "ref": tref, "title": ttitle,
-                    "priority": tprio,
-                    "severity": sev_by_ac[ac_id],
-                    "covers_acs": [],
-                })
-                entry["covers_acs"].append(ref_by_ac[ac_id])
-                asev = sev_by_ac[ac_id]
-                if _sev_rank[asev] > _sev_rank[entry["severity"]]:
-                    entry["severity"] = asev
-
-    def _sev_key(x): return (-_sev_rank[x["severity"]], x.get("ref", ""))
-    comp_list = sorted(all_comp.values(), key=_sev_key)
-    req_list  = sorted(reqs_by_id.values(), key=_sev_key)
-    ac_list   = sorted(acs_by_id.values(), key=_sev_key)
-    tc_list   = sorted(tcs_by_id.values(), key=_sev_key)
-    def _strip(x): return {k: v for k, v in x.items() if k != "id"}
-
-    return {
-        "target": {"ref": target_ref, "name": target_name},
-        "affected_components":   [_strip(v) for v in comp_list],
-        "affected_requirements": [_strip(r) for r in req_list],
-        "affected_acs":          [_strip(a) for a in ac_list],
-        "affected_testcases":    [_strip(t) for t in tc_list],
-        "severity_counts": {
-            "components":   {s: sum(1 for v in comp_list if v["severity"] == s) for s in ("high","medium","low")},
-            "requirements": {s: sum(1 for r in req_list  if r["severity"] == s) for s in ("high","medium","low")},
-            "acs":          {s: sum(1 for a in ac_list   if a["severity"] == s) for s in ("high","medium","low")},
-            "testcases":    {s: sum(1 for t in tc_list   if t["severity"] == s) for s in ("high","medium","low")},
-        },
-    }
-
-
-# ---------------------------------------------------------------------------
-# code_impact — impact analysis for a code change (diff files / CodeUnit refs)
-# ---------------------------------------------------------------------------
-# Ontology walked:
-#   CodeUnit <-imports/calls/references- CodeUnit  (code closure)
-#   Component -implementedBy-> CodeUnit             (feature ownership)
-#   Component -dependsOn-> Component                (business dependency)
-#   Requirement -impacts-> Component                (feature scope)
-#   Requirement -has-> AcceptanceCriterion          (contract items)
-#
-# Given a diff (list of source files touched), returns which Requirements/ACs
-# might be affected — via the union of code-closure impact and Component
-# dependsOn closure. This is what a QE agent uses to answer "what should I
-# re-test?" for a MR.
-_CODE_EDGE_RELS = (
-    'imports', 'imports_from', 'calls', 'references', 're_exports', 'indirect_call',
-    # BE (Python) additions from graphify:
-    'uses',      # class/instance uses another class
-    'inherits',  # subclass relationship — change to parent affects children
-)
-
-
-def code_impact(target, direction='downstream', depth=3, project_id=None):
-    """Impact analysis for a code change.
-
-    Args:
-      target:    a file path (str), a CodeUnit ref (str), or a list of either.
-                 File paths are matched against CodeUnit.props_json->>'source_file'.
-      direction: 'downstream' (default) = "who uses THIS" — for MR impact.
-                 'upstream'              = "what does THIS use" — for dep audit.
-      depth:     max recursion depth over code edges. Default 3 (empirically
-                 the sweet spot: catches page → hook → feature helper chains
-                 without exploding to the whole app).
-      project_id: filter to a single project. Recommended.
-
-    Returns dict:
-      {
-        "seed_files":            [source_file, ...],
-        "seed_code_units":       [ref, ...],
-        "affected_code_units":   [{ref, file, label}, ...],
-        "affected_components":   [{ref, name, via}, ...],   # via: 'direct' | 'dependsOn'
-        "affected_requirements": [{ref, title}, ...],
-        "affected_acs":          [{ref, title}, ...],
-        "depth_used":            int,
-      }
-    """
-    if isinstance(target, str):
-        target = [target]
-    if not target:
-        return {"seed_files": [], "seed_code_units": [], "affected_code_units": [],
-                "affected_components": [], "affected_requirements": [],
-                "affected_acs": [], "depth_used": 0}
-    if direction not in ('downstream', 'upstream'):
-        raise ValueError(f"direction must be 'downstream' or 'upstream', got {direction!r}")
-
-    with conn() as c:
-        # 1) Resolve target → seed CodeUnit ids
-        #    Support two forms per target: a file path (contains '/') or a CodeUnit ref.
-        seed_ids = []
-        seed_files = []
-        for t in target:
-            if '/' in t and not t.startswith('CDM:') and not t.startswith(f"{project_id}:" if project_id else ''):
-                # Treat as source_file path
-                sql = "SELECT id FROM nodes WHERE type='CodeUnit' AND props_json->>'source_file' = %s"
-                params = [t]
-                if project_id is not None:
-                    sql += " AND project_id=%s"; params.append(project_id)
-                rows = c.execute(sql, params).fetchall()
-                if rows:
-                    seed_files.append(t)
-                    seed_ids.extend(r[0] for r in rows)
-            else:
-                # Treat as CodeUnit ref
-                sql = "SELECT id, props_json->>'source_file' FROM nodes WHERE type='CodeUnit' AND ref=%s"
-                params = [t]
-                if project_id is not None:
-                    sql += " AND project_id=%s"; params.append(project_id)
-                row = c.execute(sql, params).fetchone()
-                if row:
-                    seed_ids.append(row[0])
-                    if row[1]:
-                        seed_files.append(row[1])
-
-        seed_ids = list(dict.fromkeys(seed_ids))   # dedupe preserving order
-        seed_files = list(dict.fromkeys(seed_files))
-        if not seed_ids:
-            return {"seed_files": [], "seed_code_units": list(target),
-                    "affected_code_units": [], "affected_components": [],
-                    "affected_requirements": [], "affected_acs": [],
-                    "depth_used": 0, "warning": "No CodeUnit matched target"}
-
-        # 2) Recursive walk over code edges
-        # downstream = follow INCOMING edges (dst=seed → src is a consumer)
-        # upstream   = follow OUTGOING edges (src=seed → dst is a dependency)
-        if direction == 'downstream':
-            step_sql = "e.src_id AS next_id, cc.d + 1 AS d FROM code_closure cc JOIN edges e ON e.dst_id = cc.unit_id"
-        else:
-            step_sql = "e.dst_id AS next_id, cc.d + 1 AS d FROM code_closure cc JOIN edges e ON e.src_id = cc.unit_id"
-
-        code_edge_rels_tuple = _CODE_EDGE_RELS
-        rows = c.execute(
-            f"""
-            WITH RECURSIVE code_closure(unit_id, d) AS (
-              SELECT id, 0 FROM nodes WHERE id = ANY(%s)
-              UNION
-              SELECT {step_sql}
-              WHERE e.rel = ANY(%s) AND cc.d < %s
-            )
-            SELECT DISTINCT cc.unit_id, n.ref, n.props_json->>'source_file', n.props_json->>'label', MIN(cc.d)
-              FROM code_closure cc
-              JOIN nodes n ON n.id = cc.unit_id
-             WHERE n.type = 'CodeUnit'
-             GROUP BY cc.unit_id, n.ref, n.props_json->>'source_file', n.props_json->>'label'
-             ORDER BY MIN(cc.d), n.ref
-            """,
-            (seed_ids, list(code_edge_rels_tuple), depth),
-        ).fetchall()
-        affected_units = [{"id": r[0], "ref": r[1], "file": r[2], "label": r[3], "depth": r[4]} for r in rows]
-        touched_unit_ids = [r["id"] for r in affected_units]
-
-        # 3) Direct Components (via implementedBy) + min depth of touched files
-        #    Severity signal: min_depth == 0 → HIGH (change lives in this Component);
-        #                     min_depth >= 1 → MEDIUM (Component reached transitively);
-        #                     via='dependsOn' → LOW (no touched CodeUnit, only business dep).
-        unit_depth = {u["id"]: u["depth"] for u in affected_units}
-        rows = c.execute(
-            """
-            SELECT c.id, c.ref, c.props_json->>'name', e.dst_id
-              FROM nodes c
-              JOIN edges e ON e.src_id = c.id AND e.rel = 'implementedBy'
-             WHERE c.type = 'Component' AND e.dst_id = ANY(%s)
-                   """ + ("AND c.project_id = %s" if project_id else "") + """
-            """,
-            ([touched_unit_ids, project_id] if project_id else [touched_unit_ids]),
-        ).fetchall()
-        direct_comp = {}
-        for cid, cref, cname, unit_id in rows:
-            d = unit_depth.get(unit_id)
-            entry = direct_comp.setdefault(cid, {
-                "id": cid, "ref": cref, "name": cname, "via": "direct",
-                "min_depth": d if d is not None else 999,
-                "touched_units": 0,
-            })
-            entry["touched_units"] += 1
-            if d is not None and d < entry["min_depth"]:
-                entry["min_depth"] = d
-
-        # 4) Extend via dependsOn closure — Components that depend on affected ones
-        all_comp = dict(direct_comp)
-        if direct_comp:
-            direct_ids = list(direct_comp.keys())
-            rows = c.execute(
-                """
-                WITH RECURSIVE dep_closure(comp_id, d) AS (
-                  SELECT id, 0 FROM nodes WHERE id = ANY(%s)
-                  UNION
-                  SELECT e.src_id, dc.d + 1
-                    FROM dep_closure dc
-                    JOIN edges e ON e.dst_id = dc.comp_id AND e.rel = 'dependsOn'
-                   WHERE dc.d < 5
-                )
-                SELECT DISTINCT n.id, n.ref, n.props_json->>'name'
-                  FROM dep_closure dc
-                  JOIN nodes n ON n.id = dc.comp_id
-                 WHERE n.type = 'Component'
-                       """ + ("AND n.project_id = %s" if project_id else "") + """
-                """,
-                ([direct_ids, project_id] if project_id else [direct_ids]),
-            ).fetchall()
-            for cid, cref, cname in rows:
-                if cid not in all_comp:
-                    all_comp[cid] = {"id": cid, "ref": cref, "name": cname,
-                                     "via": "dependsOn", "min_depth": None,
-                                     "touched_units": 0}
-
-        # Assign severity to each Component
-        def _severity(entry):
-            if entry["via"] == "dependsOn":
-                return "low"
-            if entry["min_depth"] == 0:
-                return "high"
-            return "medium"
-
-        for v in all_comp.values():
-            v["severity"] = _severity(v)
-
-        # 5) Requirements: impacts INCOMING to affected Components. Also collect
-        #    which Components each Requirement impacts, so we can inherit the
-        #    MAX severity across those Components.
-        affected_reqs = []
-        affected_acs  = []
-        _sev_rank = {"high": 3, "medium": 2, "low": 1}
-
-        if all_comp:
-            comp_ids = list(all_comp.keys())
-            rows = c.execute(
-                """
-                SELECT r.id, r.ref, r.props_json->>'title', e.dst_id
-                  FROM nodes r
-                  JOIN edges e ON e.src_id = r.id AND e.rel = 'impacts' AND e.dst_id = ANY(%s)
-                 WHERE r.type = 'Requirement'
-                       """ + ("AND r.project_id = %s" if project_id else "") + """
-                """,
-                ([comp_ids, project_id] if project_id else [comp_ids]),
-            ).fetchall()
-            reqs_by_id = {}
-            for rid, rref, rtitle, comp_id in rows:
-                entry = reqs_by_id.setdefault(rid, {
-                    "id": rid, "ref": rref, "title": rtitle,
-                    "impacted_components": [],
-                    "severity": "low",
-                })
-                comp_ref = all_comp[comp_id]["ref"]
-                comp_sev = all_comp[comp_id]["severity"]
-                entry["impacted_components"].append(comp_ref)
-                if _sev_rank[comp_sev] > _sev_rank[entry["severity"]]:
-                    entry["severity"] = comp_sev
-            affected_reqs = list(reqs_by_id.values())
-
-            # 6) ACs: has OUTGOING from those Requirements — inherit Req severity
-            if affected_reqs:
-                req_ids = [r["id"] for r in affected_reqs]
-                sev_by_req_id = {r["id"]: r["severity"] for r in affected_reqs}
-                rows = c.execute(
-                    """
-                    SELECT a.id, a.ref, a.props_json->>'title', e.src_id
-                      FROM nodes a
-                      JOIN edges e ON e.dst_id = a.id AND e.rel = 'has' AND e.src_id = ANY(%s)
-                     WHERE a.type = 'AcceptanceCriterion'
-                           """ + ("AND a.project_id = %s" if project_id else "") + """
-                    """,
-                    ([req_ids, project_id] if project_id else [req_ids]),
-                ).fetchall()
-                acs_by_id = {}
-                for aid, aref, atitle, req_id in rows:
-                    parent_sev = sev_by_req_id.get(req_id, "low")
-                    entry = acs_by_id.setdefault(aid, {
-                        "id": aid, "ref": aref, "title": atitle,
-                        "severity": parent_sev,
-                        "parent_requirement": next(r["ref"] for r in affected_reqs if r["id"] == req_id),
-                    })
-                    if _sev_rank[parent_sev] > _sev_rank[entry["severity"]]:
-                        entry["severity"] = parent_sev
-                affected_acs = list(acs_by_id.values())
-
-        # 7) TestCases: coveredBy OUTGOING from those ACs. TestCase inherits
-        #    severity from its AC (which inherited from its parent Requirement).
-        affected_testcases = []
-        if affected_acs:
-            ac_ids = [a["id"] for a in affected_acs]
-            sev_by_ac_id = {a["id"]: a["severity"] for a in affected_acs}
-            ref_by_ac_id = {a["id"]: a["ref"] for a in affected_acs}
-            rows = c.execute(
-                """
-                SELECT t.id, t.ref, t.props_json->>'title', t.props_json->>'priority', e.src_id
-                  FROM nodes t
-                  JOIN edges e ON e.dst_id = t.id AND e.rel = 'coveredBy' AND e.src_id = ANY(%s)
-                 WHERE t.type = 'TestCase'
-                       """ + ("AND t.project_id = %s" if project_id else "") + """
-                """,
-                ([ac_ids, project_id] if project_id else [ac_ids]),
-            ).fetchall()
-            tcs_by_id = {}
-            for tid, tref, ttitle, tprio, ac_id in rows:
-                inherited_sev = sev_by_ac_id.get(ac_id, "low")
-                entry = tcs_by_id.setdefault(tid, {
-                    "id": tid, "ref": tref, "title": ttitle,
-                    "priority": tprio,           # TC's own priority (P1..P4 from Excel), if any
-                    "severity": inherited_sev,   # inherited from AC → Requirement chain
-                    "covers_acs": [],
-                })
-                entry["covers_acs"].append(ref_by_ac_id[ac_id])
-                if _sev_rank[inherited_sev] > _sev_rank[entry["severity"]]:
-                    entry["severity"] = inherited_sev
-            affected_testcases = list(tcs_by_id.values())
-
-    # Sort by severity (high → medium → low), then by ref for stability
-    def _sev_key(x): return (-_sev_rank[x["severity"]], x.get("ref", ""))
-    comp_list = sorted(all_comp.values(), key=_sev_key)
-    req_list  = sorted(affected_reqs, key=_sev_key)
-    ac_list   = sorted(affected_acs,  key=_sev_key)
-    tc_list   = sorted(affected_testcases, key=_sev_key)
-
-    # Strip internal ids from returned dicts (LLM/user doesn't need them)
-    def _strip(x): return {k: v for k, v in x.items() if k != "id"}
-    return {
-        "seed_files":            seed_files,
-        "seed_code_units":       [u["ref"] for u in affected_units if u["depth"] == 0],
-        "affected_code_units":   [_strip(u) for u in affected_units],
-        "affected_components":   [_strip(v) for v in comp_list],
-        "affected_requirements": [_strip(r) for r in req_list],
-        "affected_acs":          [_strip(a) for a in ac_list],
-        "affected_testcases":    [_strip(t) for t in tc_list],
-        "severity_counts": {
-            "components":   {s: sum(1 for v in comp_list if v["severity"] == s) for s in ("high","medium","low")},
-            "requirements": {s: sum(1 for r in req_list  if r["severity"] == s) for s in ("high","medium","low")},
-            "acs":          {s: sum(1 for a in ac_list   if a["severity"] == s) for s in ("high","medium","low")},
-            "testcases":    {s: sum(1 for t in tc_list   if t["severity"] == s) for s in ("high","medium","low")},
-        },
-        "depth_used":            depth,
-        "direction":             direction,
-    }
+    return node_ids

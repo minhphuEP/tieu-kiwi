@@ -13,14 +13,10 @@ ANTHROPIC_API_KEY for the agent). Importing this module does NOT require the tok
 
 import json
 import re
-import time
 import uuid
 from datetime import datetime
 
-from . import (
-    agent, config, db, jira_ingest, memory, progress, routing,
-    slack_format, testcase_export, testcase_gen, tools,
-)
+from . import agent, config, db, memory, routing, slack_format, testcase_export, testcase_gen, tools
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
@@ -54,41 +50,6 @@ _MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 _GOLIVE_RE = re.compile(r"go[\s\-]?live|đủ điều kiện|release|go\s*/?\s*no-?go|sẵn sàng", re.I)
 # A Jira-style requirement ref, e.g. FRONT-3494.
 _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
-# Force-refresh intent: user asks to update the ticket from Jira, bypassing
-# the ingest hash-gate. Matches Vietnamese + English phrasings — both the
-# explicit "refresh please" and the casual "PO đã update, xem lại đi" that
-# QE types when a PRD changes on Confluence.
-#
-# The `(?:\s+được)?` insertion tolerates the Vietnamese passive marker so
-# "PRD đã ĐƯỢC update" still matches. "chạy lại" catches the one-liner
-# "chạy lại đi" that QE uses to trigger a re-ingest.
-_FORCE_REFRESH_RE = re.compile(
-    r"cập\s*nhật|làm\s*mới|đồng\s*bộ|refresh|resync|re-?fetch|reload|mới\s*nhất"
-    r"|(?:đã|vừa|mới|đang)(?:\s+được)?\s+(?:update|updated|sửa|chỉnh|thay\s*đổi|edit)"
-    r"|được\s+(?:update|updated)"
-    r"|(?:xem|review|check|chạy|run)\s+lại"
-    r"|(?:prd|brd|requirement|req|spec)\s+(?:mới|đã(?:\s+được)?\s*update"
-        r"|vừa(?:\s+được)?\s*update|updated|changed)"
-    r"|just\s+updated|please\s+re-?review|re-?check|re-?run",
-    re.I,
-)
-
-# Attempts to reassign a thread's Jira ticket ("thread này giờ là CDM-500",
-# "thread này h trao đổi cho CDM-198", "chuyển sang FRONT-1234", "switch to ABC-1",
-# "reset thread"). Blocked — a thread's ticket is set ONCE from the first ref seen
-# and can never be changed; users must open a new thread instead.
-_SWITCH_RE = re.compile(
-    # "thread này (giờ|h|bây giờ|now)  <change-verb>"
-    #  h = shorthand for "giờ"; verbs cover Vietnamese + English reassignment phrasing.
-    r"thread\s+này\s+(?:giờ|h|bây\s*giờ|now)"
-    r"\s+(?:là|thành|sang|bàn|trao\s*đổi|về|dùng|cho|nói|dành|for|about|is|will|sẽ)"
-    # "(đổi|chuyển|reset|reassign) (thread|sang|qua|thành|to)"
-    r"|(?:đổi|chuyển|reset|reassign)\s+(?:thread|sang|qua|thành|to)"
-    # "switch (to|thread)" / "change (to|thread)"
-    r"|switch\s+(?:to|thread)"
-    r"|change\s+(?:to|thread)",
-    re.I,
-)
 
 # Clarify-requirements intent: mimics the .claude/agents/brd-clarifier interview
 # workflow (skills/requirement-clarity.md), but driven through Slack Block Kit
@@ -112,124 +73,12 @@ _CLARIFY_TRIGGER_STRIP_RE = re.compile(
 _CLARIFY_BLOCK_TEXT_MAX = 2800
 
 
-def _golive_intent(text, fallback_ref=None):
+def _golive_intent(text):
     # Return the requirement ref if this looks like a go-live question, else None.
-    # `fallback_ref` lets the thread's sticky ticket kick in when the message text
-    # itself doesn't repeat the ref ("is it ready to go live?" inside a CDM-268 thread).
     if not text or not _GOLIVE_RE.search(text):
         return None
     m = _REQ_RE.search(text)
-    if m:
-        return m.group(1).upper()
-    return fallback_ref
-
-
-# "List ACs" — a pure data query the LLM tends to summarise/drop titles from.
-# Route it to a deterministic renderer instead so QE sees every AC verbatim.
-_LIST_AC_RE = re.compile(
-    r"(?:danh\s*sách|list|liệt\s*kê|show(?:\s+me)?|xem|các|những|all)"
-    r"\s+(?:the\s+)?ac"
-    r"|ac[^\n]{0,20}(?:là\s*gì|nào|có\s*gì|of\b)"
-    r"|acceptance\s+criteri",
-    re.I,
-)
-
-
-def _list_ac_intent(text, fallback_ref=None):
-    # Return the requirement ref if the message is asking for the AC list,
-    # else None. Sticky ticket kicks in when the message doesn't repeat the ref.
-    if not text or not _LIST_AC_RE.search(text):
-        return None
-    m = _REQ_RE.search(text)
-    if m:
-        return m.group(1).upper()
-    return fallback_ref
-
-
-def _save_thread_ref(channel_id, thread_ts, ref, logger=None):
-    # Persist ticket_ref into thread_state.state_json (upsert, merges with existing keys).
-    try:
-        state = memory.get_thread_state(channel_id, thread_ts) or {}
-        if state.get("ticket_ref") == ref:
-            return
-        state["ticket_ref"] = ref
-        memory.save_thread_state(channel_id, thread_ts, state)
-    except Exception:
-        if logger is not None:
-            logger.exception("save_thread_state failed")
-
-
-def _resolve_thread_ref(client, channel_id, thread_ts, clean_text, is_reply, logger=None):
-    # Sticky Jira ticket per Slack thread. FIRST-WINS: once a thread's ticket is set,
-    # later messages CANNOT overwrite it (a different ref in a follow-up message is
-    # treated as an ad-hoc reference for that message alone). Resolution order:
-    #   1) Already in thread_state       -> return (no overwrite).
-    #   2) Ref in the current message    -> persist + return.
-    #   3) Only if this is a reply: ref in the thread parent -> persist + return
-    #      (first ref may have been a plain human message, not @kiwi).
-    if not channel_id or not thread_ts:
-        return None
-    try:
-        state = memory.get_thread_state(channel_id, thread_ts) or {}
-    except Exception:
-        if logger is not None:
-            logger.exception("get_thread_state failed")
-        state = {}
-    if state.get("ticket_ref"):
-        return state["ticket_ref"]
-    m = _REQ_RE.search(clean_text or "")
-    if m:
-        ref = m.group(1).upper()
-        _save_thread_ref(channel_id, thread_ts, ref, logger)
-        return ref
-    if not is_reply or client is None:
-        return None
-    try:
-        resp = client.conversations_replies(channel=channel_id, ts=thread_ts, limit=1)
-        msgs = resp.get("messages") or []
-        parent_text = msgs[0].get("text", "") if msgs else ""
-    except Exception:
-        if logger is not None:
-            logger.exception("conversations_replies failed")
-        return None
-    m = _REQ_RE.search(parent_text or "")
-    if not m:
-        return None
-    ref = m.group(1).upper()
-    _save_thread_ref(channel_id, thread_ts, ref, logger)
-    return ref
-
-
-def _detect_switch_target(clean_text):
-    # Return the target Jira ref if the message uses thread-reassignment language,
-    # "" if switch language is present but no ref was given, or None if not a switch
-    # attempt. Callers refuse the operation regardless of whether a sticky already
-    # exists — the language itself signals intent to change, and a thread's ticket
-    # cannot change once set.
-    if not clean_text or not _SWITCH_RE.search(clean_text):
-        return None
-    m = _REQ_RE.search(clean_text)
-    if not m:
-        return None
-    return m.group(1).upper()
-
-def _switch_refusal_text(prior_sticky, switch_target):
-    # Compose the refusal message for a thread-reassignment attempt.
-    if prior_sticky:
-        head = f":no_entry: Thread này đã gắn với **{prior_sticky}** và không đổi được."
-        if switch_target and switch_target != prior_sticky:
-            tail = f"Muốn hỏi về **{switch_target}**, vui lòng mở thread mới."
-        else:
-            tail = "Vui lòng mở thread mới cho ticket khác."
-    else:
-        head = (":no_entry: Không thể *đổi/gán* ticket theo cách này — "
-                "mỗi thread chỉ gắn với 1 ticket (set 1 lần từ ref đầu tiên).")
-        if switch_target:
-            tail = (f"Nếu muốn bắt đầu về **{switch_target}**, mở thread mới và "
-                    f"gõ thẳng câu hỏi, ví dụ: `@Tieu Kiwi cho tôi info về {switch_target}`.")
-        else:
-            tail = "Vui lòng mở thread mới và nhắc ticket ngay từ tin nhắn đầu tiên."
-    return head + " " + tail
+    return m.group(1).upper() if m else None
 
 
 # Test-case generation intent, e.g. "gen test case cho CDM-268", "write a testcase for AC-...",
@@ -379,51 +228,17 @@ def _strip_mention(text):
     return _MENTION_RE.sub("", text or "")
 
 
-def handle_question(text, logger=None, on_step=None, channel_id=None):
+def handle_question(text, logger=None):
     # Shared logic for both entry points: run the Layer A agent and return a
     # Slack-friendly answer string. Never raises — a failure comes back as an error message.
     # The agent returns GitHub Markdown; convert it to the canonical Slack format.
-    # `on_step` (optional) is forwarded to the agent for live-progress display.
-    # `channel_id` resolves the multi-tenant project scope so tool calls
-    # (coverage_gap / go_no_go / search_kb / ...) filter to the right project.
-    project_id = _project_for_channel(channel_id, logger) if channel_id else None
     try:
-        answer = agent.ask(text, project_id=project_id, role="QE", on_step=on_step)
+        answer = agent.ask(text)
     except Exception as e:
         if logger is not None:
             logger.exception("agent.ask failed")
         return slack_format.to_slack(f":warning: Error: {e}")
     return slack_format.to_slack(answer)
-
-
-def _make_progress_callback(client, channel_id, progress_ts, logger=None,
-                            min_interval=0.8):
-    # Return an on_step callback that updates the given "Processing…" message
-    # in-place via chat_update. `tool_done` events are swallowed (avoid flicker
-    # between tool finish and next thinking event). Throttled to `min_interval`
-    # seconds so a burst of tool calls doesn't hit Slack rate limits.
-    if not progress_ts or not channel_id:
-        return None
-    last = [0.0]
-
-    def _cb(ev):
-        if (ev or {}).get("phase") == "tool_done":
-            return
-        now = time.monotonic()
-        if now - last[0] < min_interval:
-            return
-        last[0] = now
-        label = progress.label_for(ev)
-        try:
-            client.chat_update(
-                channel=channel_id, ts=progress_ts,
-                text=slack_format.to_slack(label),
-            )
-        except Exception:
-            if logger is not None:
-                logger.exception("progress chat_update failed")
-
-    return _cb
 
 
 # ---------------------------------------------------------------- Layer C curator UI
@@ -476,105 +291,6 @@ def _finalize_curator_message(client, body, text):
         pass
 
 
-def _ensure_ticket_fresh(client, channel_id, thread_ts, ref, project_id,
-                          force=False, logger=None):
-    """Pre-flight: make sure `ref`'s subtree is in the graph (and reasonably
-    fresh) before the agent runs its tools. Called for every question that
-    resolves to a ticket.
-
-    Deterministic (dev controls flow, not the LLM): posts progress to the
-    thread and calls `jira_ingest.ingest_jira_ticket`. The tool itself
-    hash-gates internally, so a cached ticket returns in <1s with no
-    Confluence fetch and no LLM AC pass.
-
-    Args:
-      force: bypass hash-gate. Set true when the user's message contains a
-             refresh keyword ("cập nhật", "refresh", ...).
-
-    Returns: the ingest summary dict (or None on total failure so the caller
-    can still try to answer from whatever's already in the graph).
-    """
-    if not ref or not channel_id:
-        return None
-    progress_ts = None
-    try:
-        # Post a lightweight progress message. Cached case will overwrite it
-        # a second later; uncached case will get replaced with a final summary.
-        resp = client.chat_postMessage(
-            channel=channel_id,
-            thread_ts=thread_ts,
-            text=slack_format.to_slack(
-                f"🔄 Đang đồng bộ *{ref}* từ Jira{' (force)' if force else ''}…"
-            ),
-        )
-        progress_ts = (resp or {}).get("ts")
-    except Exception:
-        if logger is not None:
-            logger.exception("progress post failed")
-
-    try:
-        summary = jira_ingest.ingest_jira_ticket(
-            ref, project_id=project_id, force=force,
-            # Extract ACs on every fresh ingest (first-time or force). The +5-15s
-            # only hits when the ticket is genuinely new to the graph — cached
-            # tickets short-circuit at the hash-gate before Step 5 ever runs.
-            # Without this, ACs are never populated from Slack, and downstream
-            # tools (coverage_gap, go_no_go, get_ticket) report the ticket as
-            # having 0 ACs.
-            extract_acs=True,
-        )
-    except Exception as e:
-        if logger is not None:
-            logger.exception("ingest_jira_ticket failed")
-        _update_or_post(client, channel_id, progress_ts, thread_ts,
-                        f":warning: Không đồng bộ được *{ref}*: {e}", logger)
-        return None
-
-    status = summary.get("status")
-    if status == "cached_fresh":
-        text = f"✅ *{ref}* đã cached (hash không đổi)."
-    elif status == "ok":
-        n_bugs = len(summary.get("bugs") or [])
-        n_conf = len(summary.get("confluence_pages") or [])
-        n_tr = len(((summary.get("subtasks") or {}).get("testruns")) or [])
-        text = (f"✅ *{ref}* đã đồng bộ — "
-                f"{n_tr} test run, {n_bugs} bug, {n_conf} BRD.")
-        # AC diff line — only present when the AC-extract pass actually ran
-        # (summary.acs_kept is set by _diff_and_upsert_acs). Triggered by
-        # extract_acs=True OR by BRD drift auto-elevation inside
-        # ingest_jira_ticket.
-        ac_kept = summary.get("acs_kept")
-        if ac_kept is not None:
-            ac_created = len(summary.get("acs_extracted") or [])
-            ac_obsolete = len(summary.get("acs_obsoleted") or [])
-            if ac_created or ac_obsolete:
-                text += (f"\n📋 AC diff: *+{ac_created}* mới, "
-                         f"{ac_kept} giữ nguyên, *−{ac_obsolete}* obsolete.")
-            else:
-                text += f"\n📋 AC không đổi ({ac_kept} AC giữ nguyên)."
-    else:
-        text = f":warning: *{ref}* ingest status = `{status}`"
-    _update_or_post(client, channel_id, progress_ts, thread_ts, text, logger)
-    return summary
-
-
-def _update_or_post(client, channel_id, ts, thread_ts, text, logger=None):
-    """chat_update the progress message in place; fall back to a new post."""
-    slack_text = slack_format.to_slack(text)
-    if ts:
-        try:
-            client.chat_update(channel=channel_id, ts=ts, text=slack_text)
-            return
-        except Exception:
-            if logger is not None:
-                logger.exception("chat_update failed")
-    try:
-        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=slack_text)
-    except Exception:
-        if logger is not None:
-            logger.exception("chat_postMessage fallback failed")
-
-
 def _project_for_channel(channel_id, logger=None):
     # Resolve the project bound to a Slack channel (channel_project_map), or None.
     if not channel_id:
@@ -618,27 +334,22 @@ def _run_curator_demo(client, channel_id, user_id, logger=None, thread_ts=None):
 def _golive_report(requirement_ref, logger=None):
     # Assemble the structured report (ticket info + coverage) for the go-live message,
     # reusing the SAME slack_format builder as the story report. Reads the graph node
-    # props; if empty and Jira is configured, run ingest_jira_ticket to populate the
-    # full subtree (Story + subtasks + BRD), then re-read.
+    # props; if empty and Jira is configured, fetch_jira to populate, then re-read.
     props = {}
     try:
         props = db.get_node_props(requirement_ref, "Requirement")
     except Exception:
         if logger is not None:
             logger.exception("get_node_props failed")
-    has_info = any(props.get(k) for k in ("title", "summary", "assignee", "priority", "status", "issuetype"))
+    has_info = any(props.get(k) for k in ("summary", "assignee", "priority", "status", "issuetype"))
     if not has_info and config.JIRA_BASE_URL and config.JIRA_EMAIL and config.JIRA_API_TOKEN:
         try:
-            from . import jira_ingest
-            project_id = db.project_from_ref(requirement_ref)
-            res = jira_ingest.ingest_jira_ticket(
-                requirement_ref, project_id=project_id, extract_acs=False,
-            )
-            if res.get("status") != "error":
+            from .tools import fetch_jira
+            if fetch_jira(requirement_ref).get("status") == "ok":
                 props = db.get_node_props(requirement_ref, "Requirement")
         except Exception:
             if logger is not None:
-                logger.exception("ingest_jira_ticket fallback failed")
+                logger.exception("fetch_jira fallback failed")
     try:
         trace_result = db.trace(requirement_ref)
     except Exception:
@@ -917,45 +628,6 @@ def _is_stale_draft_click(body, state):
     return current_ts is not None and clicked_ts != current_ts
 
 
-def _do_list_acs(say, requirement_ref, project_id=None, thread_ts=None,
-                 channel_id=None, logger=None):
-    """Deterministic 'list ACs' — bypasses the LLM. Prevents Claude from
-    silently rephrasing/dropping AC titles when the user just wants to see
-    every AC of a ticket."""
-    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
-    try:
-        res = db.get_ticket(requirement_ref, project_id=project_id)
-        trace = db.trace(requirement_ref, project_id=project_id)
-    except Exception as e:
-        if logger is not None:
-            logger.exception("list_acs failed")
-        say(blocks=_mrkdwn_blocks(slack_format.to_slack(f":warning: Error: {e}")),
-            text="Error", **kwargs)
-        return
-    if not res or not res.get("found"):
-        text = (f":information_source: *{requirement_ref}* chưa có trong graph. "
-                f"Chạy `ingest_jira_ticket({requirement_ref})` để pull từ Jira trước.")
-        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
-        return
-    acs = (trace or {}).get("acceptance_criteria") or []
-    if not acs:
-        text = (f":information_source: *{requirement_ref}* có 0 Acceptance Criterion "
-                f"trong graph. BRD có thể chưa được extract — chạy "
-                f"`ingest_jira_ticket({requirement_ref}, force=True)`.")
-        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
-        return
-    # Reuse the same report shape + line renderer used by the story report /
-    # go-live output, so formatting stays consistent across all AC listings.
-    report = slack_format.report_from_graph(requirement_ref, res.get("props") or {}, trace)
-    header = f"*{report.get('title') or requirement_ref}*"
-    summary = (f"Story này có *{len(acs)} Acceptance Criteria*. "
-               f"Danh sách đầy đủ:")
-    ac_lines = [slack_format._ac_line(a) for a in report.get("acs") or []]
-    text = "\n".join([header, "", summary] + ac_lines)
-    say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)),
-        text=f"AC list {requirement_ref}", **kwargs)
-
-
 def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     # Run go_no_go and post the analysis; add approve/reject buttons only on GO.
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
@@ -1171,135 +843,6 @@ def _ask_which_ticket(say, **kwargs):
     )
 
 
-def _handle_mention_turn(say, client, channel_id, thread_ts, clean_text,
-                          is_reply=False, user_id=None, logger=None):
-    """Turn handler for @mention + non-mention thread reply (phuong_qe features
-    layered on top of _handle_turn).
-
-    Order (early-exits stop later steps):
-      1. Refuse thread-reassignment attempts BEFORE resolving sticky (so a
-         fresh-thread "thread này giờ là CDM-500" can't silently set the sticky).
-      2. Discard-testcase → cancel in-progress draft.
-      3. Interim "Đang xử lý…" ack; capture ts for live progress + final swap.
-      4. Sticky Jira ticket resolve (this msg / thread parent / thread state).
-      5. Pre-flight ingest_jira_ticket (force=True on "cập nhật/refresh").
-      6. Intent routing: go-live / list-ACs / clarify-ambiguities / gen-testcase.
-      7. Fallback: agent handle_question with progress + chat_update in place.
-    """
-    if not clean_text:
-        say(
-            blocks=_mrkdwn_blocks(slack_format.to_slack(
-                "Hi! Hỏi tôi về 1 ticket, ví dụ: `@Tieu Kiwi thông tin CDM-268`.")),
-            text="Usage", thread_ts=thread_ts,
-        )
-        return
-
-    # 1. Refuse thread-reassignment BEFORE touching sticky state.
-    try:
-        prior_sticky = (memory.get_thread_state(channel_id, thread_ts) or {}).get("ticket_ref")
-    except Exception:
-        if logger is not None:
-            logger.exception("get_thread_state failed")
-        prior_sticky = None
-
-    switch_target = _detect_switch_target(clean_text)
-    if switch_target is not None and not (
-        prior_sticky and switch_target and prior_sticky == switch_target
-    ):
-        say(
-            blocks=_mrkdwn_blocks(slack_format.to_slack(
-                _switch_refusal_text(prior_sticky, switch_target)
-            )),
-            text="Không thể đổi ticket của thread",
-            thread_ts=thread_ts,
-        )
-        return
-
-    # 2. Discard command — before interim ack so it stays snappy.
-    if _discard_testcase_intent(clean_text):
-        _do_discard_testcase(say, client, thread_ts, channel_id, user_id, logger)
-        return
-
-    # 3. Interim ack; keep ts for chat_update-in-place.
-    progress_ts = None
-    try:
-        resp = say(text=slack_format.to_slack("🥝 Đang xử lý…"), thread_ts=thread_ts)
-        progress_ts = (resp or {}).get("ts")
-    except Exception:
-        if logger is not None:
-            logger.exception("interim post failed")
-
-    # 4. Sticky Jira ticket per thread.
-    ticket_ref = _resolve_thread_ref(
-        client, channel_id, thread_ts, clean_text, is_reply, logger
-    )
-
-    # 5. Pre-flight ingest so downstream tools see fresh data.
-    project_id = _project_for_channel(channel_id, logger)
-    if ticket_ref:
-        force_refresh = bool(_FORCE_REFRESH_RE.search(clean_text))
-        _ensure_ticket_fresh(
-            client, channel_id, thread_ts, ticket_ref, project_id,
-            force=force_refresh, logger=logger,
-        )
-
-    # 6a. Go-live intent → deterministic go_no_go.
-    ref = _golive_intent(clean_text, fallback_ref=ticket_ref)
-    if ref:
-        _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
-        return
-
-    # 6b. "List ACs" → deterministic AC dump.
-    ac_ref = _list_ac_intent(clean_text, fallback_ref=ticket_ref)
-    if ac_ref:
-        _do_list_acs(
-            say, ac_ref, project_id=project_id,
-            thread_ts=thread_ts, channel_id=channel_id, logger=logger,
-        )
-        return
-
-    # 6c. Clarify-ambiguities → interview modal.
-    if _clarify_intent(clean_text):
-        clarify_ref, raw_text = _clarify_target(clean_text)
-        clarify_ref = clarify_ref or ticket_ref
-        source_text = _requirement_text_for_clarify(clarify_ref, logger) if clarify_ref else raw_text
-        if not source_text:
-            _ask_which_ticket(say, thread_ts=thread_ts)
-            return
-        _do_clarify(say, clarify_ref, source_text, logger,
-                    thread_ts=thread_ts, project_id=project_id)
-        return
-
-    # 6d. Generate-testcase intent.
-    tc_ref = _gen_testcase_intent(clean_text)
-    if tc_ref:
-        _do_gen_testcase(say, client, tc_ref, logger,
-                         thread_ts=thread_ts, channel_id=channel_id)
-        return
-
-    # 7. Fallback: agent handle_question with in-place progress → final swap.
-    question = clean_text
-    if ticket_ref and not _REQ_RE.search(clean_text):
-        question = f"(Context: Jira ticket {ticket_ref}) {clean_text}"
-
-    on_step = _make_progress_callback(client, channel_id, progress_ts, logger)
-    answer = handle_question(question, logger, on_step=on_step, channel_id=channel_id)
-
-    posted = False
-    if progress_ts:
-        try:
-            client.chat_update(
-                channel=channel_id, ts=progress_ts,
-                blocks=_mrkdwn_blocks(answer), text=answer,
-            )
-            posted = True
-        except Exception:
-            if logger is not None:
-                logger.exception("final chat_update failed")
-    if not posted:
-        say(blocks=_mrkdwn_blocks(answer), text=answer, thread_ts=thread_ts)
-
-
 def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=None):
     """Handle ONE user turn — shared by the @mention handler and non-mention thread
     replies, so behaviour is identical whether or not the bot is tagged.
@@ -1424,35 +967,10 @@ def build_app():
             say(blocks=_mrkdwn_blocks(usage), text="Usage")
             return
 
-        # Pre-flight ingest for any ticket mentioned in the slash command.
-        # Slash commands don't have a thread context, so post progress to the
-        # channel; hash-gate makes cached tickets return in <1s.
-        channel_id = command.get("channel_id")
-        m = _REQ_RE.search(text)
-        if m:
-            ticket_ref = m.group(1)
-            force_refresh = bool(_FORCE_REFRESH_RE.search(text))
-            project_id = _project_for_channel(channel_id, logger)
-            _ensure_ticket_fresh(
-                client, channel_id, None, ticket_ref, project_id,
-                force=force_refresh, logger=logger,
-            )
-
         # Go-live question -> deterministic go_no_go + (on GO) curator sign-off buttons.
         ref = _golive_intent(text)
         if ref:
             _do_golive(say, ref, logger, channel_id=command.get("channel_id"))
-            return
-
-        # "List ACs" -> deterministic AC dump; skips LLM (which tends to
-        # rephrase warnings and drop AC titles).
-        ac_ref = _list_ac_intent(text)
-        if ac_ref:
-            _do_list_acs(
-                say, ac_ref,
-                project_id=_project_for_channel(command.get("channel_id"), logger),
-                channel_id=command.get("channel_id"), logger=logger,
-            )
             return
 
         # Generate-testcase request -> draft + Approve/Refine buttons.
@@ -1477,7 +995,7 @@ def build_app():
             return
 
         # 3) Otherwise: call the Layer A agent (shared helper) and post the result.
-        answer = handle_question(text, logger, channel_id=command.get("channel_id"))
+        answer = handle_question(text, logger)
         say(blocks=_mrkdwn_blocks(answer), text=answer)
 
     @app.command("/tieukiwi-curator-test")
@@ -1602,14 +1120,6 @@ def build_app():
             client, body,
             slack_format.to_slack(f":x: Release rejected for *{ref}* by <@{user}>"),
         )
-
-    @app.event("message")
-    def handle_message_events(body, logger):
-        # Slack Bolt requires SOME handler for every subscribed event type;
-        # without this, every message in the channel logs an "Unhandled
-        # request" warning. We only respond to @-mentions, so a no-op is
-        # correct — this drops the log noise on purpose.
-        return
 
     @app.action("tc_approve")
     def handle_tc_approve(ack, body, client, logger):
@@ -1883,18 +1393,12 @@ def build_app():
             return
 
         # Always reply IN THREAD (Layer C reads answers from the thread later).
-        event_ts = event.get("ts")
-        parent_ts = event.get("thread_ts")
-        thread_ts = parent_ts or event_ts
-        is_reply = bool(parent_ts) and parent_ts != event_ts
-        channel_id = event.get("channel")
-
+        thread_ts = event.get("thread_ts") or event["ts"]
         clean_text = _strip_mention(event.get("text", "")).strip()
 
-        _handle_mention_turn(
-            say, client, channel_id, thread_ts, clean_text,
-            is_reply=is_reply, user_id=event.get("user"), logger=logger,
-        )
+        # Same shared turn handler used by non-mention thread replies.
+        _handle_turn(say, client, event.get("channel"), thread_ts, clean_text,
+                     logger, event.get("user"))
 
     @app.event("message")
     def handle_thread_reply(event, body, say, client, context, logger):
@@ -1935,10 +1439,7 @@ def build_app():
         if not state or not text:
             return
 
-        _handle_mention_turn(
-            say, client, channel_id, thread_ts, text,
-            is_reply=True, user_id=event.get("user"), logger=logger,
-        )
+        _handle_turn(say, client, channel_id, thread_ts, text, logger, event.get("user"))
 
     return app
 
