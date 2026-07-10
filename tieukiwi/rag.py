@@ -10,10 +10,14 @@ Interface:
   search(query, k, project_id, role, doc_type, include_global)
                     — semantic search with structural filters over metadata.
 
-Embedding: Voyage AI `voyage-3` (multilingual, 1024 dim, 32k ctx). Set
-VOYAGEAI_API_KEY in .env. Sign up at https://dash.voyageai.com/. The embedding
-function is initialised lazily on first collection access so `import tieukiwi.rag`
-works even when the key is unset (useful for unit-testing chunk_text alone).
+Embedding: the local `all-MiniLM-L6-v2` model via chromadb's ONNXMiniLM_L6_V2
+embedding function — no API key, offline, free. It is set EXPLICITLY (never
+Chroma's implicit default, which in chromadb 1.5.x routes to VoyageAI and crashes
+without the voyageai lib). ONNXMiniLM_L6_V2's registered name is exactly
+`onnx_mini_lm_l6_v2`, which MATCHES the persisted collection — so no re-index and
+no "embedding function conflict". Every code path opens the collection through
+_get_col(), so indexing and ALL tools (search_kb / find_ambiguities / gen_testcase)
+use the same embedding. Instantiated lazily so `import tieukiwi.rag` stays light.
 
 Metadata schema populated by scripts/seed/kb.py (see infer_kb_metadata there):
   scope         : "project" | "global"
@@ -27,36 +31,32 @@ Metadata schema populated by scripts/seed/kb.py (see infer_kb_metadata there):
   section       : nearest markdown heading (## / ###), or "" when none
 """
 
-import os
 import re
 
 import chromadb
-from chromadb.utils.embedding_functions import VoyageAIEmbeddingFunction
+from chromadb.utils.embedding_functions import ONNXMiniLM_L6_V2
 
 _COLLECTION_NAME = "knowledge_base"
-_VOYAGE_MODEL = "voyage-3"
 _CHUNK_TARGET_CHARS = 1200
 _CHUNK_OVERLAP_CHARS = 150
 
 _client = chromadb.PersistentClient(path="./chroma_db")
+_embedding_fn = None   # lazily built local ONNX all-MiniLM-L6-v2 (see _get_col)
 _col = None
 
 
 def _get_col():
-    """Lazily initialise the Chroma collection bound to the Voyage embedding fn."""
-    global _col
+    """Lazily bind the Chroma collection to the EXPLICIT local embedding
+    (ONNXMiniLM_L6_V2 = all-MiniLM-L6-v2, registered name 'onnx_mini_lm_l6_v2',
+    matching the persisted collection). The ONLY place the collection is opened —
+    every tool/flow goes through here, so nothing ever passes a VoyageAI (or default)
+    embedding function that would conflict with the persisted onnx vectors."""
+    global _col, _embedding_fn
     if _col is None:
-        api_key = os.environ.get("VOYAGEAI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "VOYAGEAI_API_KEY is not set. Add it to .env "
-                "(get one at https://dash.voyageai.com/) — Chroma embedding requires it."
-            )
-        embedding_fn = VoyageAIEmbeddingFunction(
-            api_key=api_key, model_name=_VOYAGE_MODEL,
-        )
+        if _embedding_fn is None:
+            _embedding_fn = ONNXMiniLM_L6_V2()
         _col = _client.get_or_create_collection(
-            _COLLECTION_NAME, embedding_function=embedding_fn,
+            _COLLECTION_NAME, embedding_function=_embedding_fn,
         )
     return _col
 

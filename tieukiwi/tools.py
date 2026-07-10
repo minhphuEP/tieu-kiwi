@@ -1,6 +1,13 @@
+import json
+import re
+from html import unescape
+
 import httpx
+from anthropic import Anthropic
 
 from . import config, db, rag, testcase_gen
+
+_client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
 
 # --- Layer A skeletons (TODO: implement) ---
@@ -32,16 +39,79 @@ def gen_test_plan(requirement_ref):
     )
 
 
-def gen_critic(text):
-    model = config.model_for("gen_critic")  # TODO: pass into the Claude call when implemented
-    # TODO: critique PRD/Design/spec text against KB review rules (rag.search) via Claude (model=model).
-    return _not_implemented(
-        "gen_critic", "Critique PRD/Design against KB review rules via Claude."
+_AMBIGUITY_SYSTEM = """You are Tieu Kiwi's requirement-clarity reviewer. Given a
+requirement/BRD/PRD/Jira story below, flag genuine ambiguities against the three
+dimensions in the KB rubric provided (Behaviour and Edge Cases, Constraints, Conflicts).
+Do not manufacture problems in a well-specified section — a requirement with zero
+findings is valid; return an empty list for it.
+
+Phrase each ambiguity as a direct question the PO can answer inline, per the rubric's
+"Turning Findings into PO Questions" guidance. If more than 3 genuine ambiguities are
+found, prioritize the rubric's "Top 3 PO Questions" first — missing/invalid data
+handling, feature-flag/rollout gating, and conflicting-requirement resolution — before
+filling remaining slots with other findings.
+
+Return ONLY valid JSON (no prose, no markdown fences), exactly this shape:
+{"ambiguities": [{"dimension": "Behaviour and Edge Cases" | "Constraints" | "Conflicts", "question": "<direct question for the PO>", "gap": "<one-sentence description of what's missing>"}]}
+
+At most 2 ambiguities per dimension (6 total), the most important ones."""
+
+# Slack modal input blocks are capped for usability; keep the interview short.
+MAX_AMBIGUITIES = 6
+
+# Claude sometimes wraps JSON output in a ```json fence even when told not to,
+# especially with a long user message (e.g. an expanded Confluence PRD). A bare
+# json.loads() on that raw text raises and silently degrades to "no ambiguities
+# found" — which looks identical to a genuinely well-specified requirement.
+_JSON_FENCE_RE = re.compile(r"^```(?:json)?\s*\n(.*)\n```$", re.S)
+
+
+def _strip_json_fence(raw):
+    raw = (raw or "").strip()
+    m = _JSON_FENCE_RE.match(raw)
+    return m.group(1).strip() if m else raw
+
+
+def find_ambiguities(text, project_id=None):
+    model = config.model_for("find_ambiguities")
+    rules = rag.search(
+        "requirement ambiguity scope behaviour constraints conflicts acceptance criteria testability",
+        k=4, project_id=project_id, include_global=True,
     )
+    rules_block = "\n\n".join(
+        f"[{meta.get('parent_doc', doc_id)}"
+        + (f" § {meta['section']}" if meta.get("section") else "")
+        + f"]\n{doc}"
+        for doc_id, doc, meta in rules
+    ) or "(no matching rubric found in the KB)"
+
+    user_msg = f"## KB rubric\n{rules_block}\n\n## Requirement text\n{text}"
+
+    resp = _client.messages.create(
+        model=model,
+        max_tokens=1500,
+        system=_AMBIGUITY_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    raw = resp.content[0].text
+    try:
+        data = json.loads(_strip_json_fence(raw))
+    except (json.JSONDecodeError, TypeError):
+        data = {"ambiguities": []}
+
+    ambiguities = [
+        a for a in (data.get("ambiguities") or [])
+        if isinstance(a, dict) and a.get("question")
+    ][:MAX_AMBIGUITIES]
+
+    return {"tool": "find_ambiguities", "status": "ok", "ambiguities": ambiguities}
 
 
 def _adf_to_text(node):
     # Best-effort flatten of Atlassian Document Format (or a plain string) to text.
+    # inlineCard/blockCard/embedCard are link previews (e.g. a linked PRD page) with
+    # no "text" or "content" of their own — without this they silently vanish, which
+    # is how a description that's *just* links (see CDM-268) flattens to "".
     if node is None:
         return None
     if isinstance(node, str):
@@ -49,6 +119,8 @@ def _adf_to_text(node):
     if isinstance(node, dict):
         if node.get("type") == "text":
             return node.get("text", "")
+        if node.get("type") in ("inlineCard", "blockCard", "embedCard"):
+            return (node.get("attrs") or {}).get("url") or ""
         return "".join(t for t in (_adf_to_text(c) for c in node.get("content", [])) if t)
     if isinstance(node, list):
         return "".join(_adf_to_text(n) or "" for n in node)
@@ -142,6 +214,69 @@ def fetch_jira(issue_key):
         issue["story_points"] = story_points
 
     return {"tool": "fetch_jira", "status": "ok", "issue": issue, "node_id": node_id}
+
+
+# --- Confluence (PRD pages linked from Jira descriptions) ------------------
+
+_CONFLUENCE_PAGE_RE = re.compile(r"/wiki/spaces/[^/\s]+/pages/(\d+)")
+
+# Cap how many linked pages we fetch per requirement — avoids unbounded fan-out
+# if a description links to several pages.
+MAX_CONFLUENCE_LINKS = 2
+
+
+def _html_to_text(html):
+    # Confluence page bodies are XHTML "storage format" — strip tags/entities for
+    # a plain-text body. Regex-based on purpose: this repo has no HTML parser dep,
+    # and a PRD body doesn't need real DOM handling, just its words.
+    text = re.sub(r"<(script|style)\b[^>]*>.*?</\1>", " ", html, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", "\n", text)
+    text = unescape(text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def fetch_confluence_page(page_id):
+    """Fetch a Confluence Cloud page's body as plain text, or None if unavailable.
+
+    Reuses the Jira email + API token (same Atlassian Cloud site convention),
+    per CLAUDE.md's Confluence auth note. Never raises — a missing page or
+    missing config is just "no extra context", not a hard error.
+    """
+    if not (config.CONFLUENCE_BASE_URL and config.JIRA_EMAIL and config.JIRA_API_TOKEN):
+        return None
+    url = f"{config.CONFLUENCE_BASE_URL.rstrip('/')}/rest/api/content/{page_id}"
+    try:
+        resp = httpx.get(
+            url, params={"expand": "body.storage"},
+            auth=(config.JIRA_EMAIL, config.JIRA_API_TOKEN),
+            headers={"Accept": "application/json"}, timeout=30,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    html = ((resp.json().get("body") or {}).get("storage") or {}).get("value") or ""
+    return _html_to_text(html) or None
+
+
+def expand_with_confluence(text):
+    """Append the body of any linked Confluence page(s) found in `text`.
+
+    Jira descriptions often link OUT to the real PRD (an inlineCard) instead of
+    containing it inline — see _adf_to_text. Without this, tools like
+    find_ambiguities only ever sees the label + URL, never the spec.
+    """
+    if not text:
+        return text
+    page_ids = list(dict.fromkeys(_CONFLUENCE_PAGE_RE.findall(text)))[:MAX_CONFLUENCE_LINKS]
+    parts = [text]
+    for page_id in page_ids:
+        try:
+            body = fetch_confluence_page(page_id)
+        except Exception:
+            body = None
+        if body:
+            parts.append(f"## Linked Confluence page ({page_id})\n{body}")
+    return "\n\n".join(parts)
 
 
 TOOLS = [
@@ -361,8 +496,13 @@ TOOLS = [
     },
   },
   {
-    "name": "gen_critic",
-    "description": "Critique a PRD/Design/spec and flag issues against KB rules. (SKELETON — TODO.)",
+    "name": "find_ambiguities",
+    "description": (
+        "Identify genuine ambiguities in a requirement/BRD/PRD/Jira story against the "
+        "four ambiguity dimensions (scope/ownership, behaviour/edge cases, constraints, "
+        "conflicts), phrased as direct questions for the PO. Returns an empty list when "
+        "the text is already sufficiently specified."
+    ),
     "input_schema": {
       "type": "object",
       "properties": {"text": {"type": "string"}},
@@ -489,6 +629,8 @@ def run_tool(name, args, context=None):
         return gen_test_plan(args["requirement_ref"])
     if name == "gen_critic":
         return gen_critic(args["text"])
+    if name == "find_ambiguities":
+        return find_ambiguities(args["text"], project_id=project_id)
     if name == "ingest_jira_ticket":
         from . import jira_ingest
         return jira_ingest.ingest_jira_ticket(

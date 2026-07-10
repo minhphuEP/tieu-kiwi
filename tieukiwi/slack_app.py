@@ -14,12 +14,38 @@ ANTHROPIC_API_KEY for the agent). Importing this module does NOT require the tok
 import json
 import re
 import time
+import uuid
+from datetime import datetime
 
-from . import agent, config, db, memory, progress, routing, slack_format, testcase_export, testcase_gen
-from . import jira_ingest
+from . import (
+    agent, config, db, jira_ingest, memory, progress, routing,
+    slack_format, testcase_export, testcase_gen, tools,
+)
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
+
+# Stamped once at process start. Surfaced on clarify replies so a stale duplicate
+# process (e.g. an old `python -m tieukiwi.slack_app` left running after a restart)
+# is immediately visible instead of silently answering with pre-fix code.
+_BOOT_TS = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+# In-flight clarify interviews, keyed by a short opaque id. Real ambiguity
+# questions (specific, PRD-derived) routinely blow past Slack's ~2000-3000 char
+# limits on action `value` / modal `private_metadata` — so those fields never
+# carry the ambiguities themselves, only this key. Single-process, like
+# _seen_ids: an interview in flight during a restart is lost, and the user just
+# re-runs the clarify command.
+_pending_clarify = {}
+_PENDING_CLARIFY_MAX = 200
+
+
+def _store_pending_clarify(payload):
+    key = uuid.uuid4().hex[:12]
+    _pending_clarify[key] = payload
+    if len(_pending_clarify) > _PENDING_CLARIFY_MAX:
+        _pending_clarify.pop(next(iter(_pending_clarify)))
+    return key
 
 # Matches a leading Slack mention like "<@U12345>" at the start of the text.
 _MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
@@ -63,6 +89,27 @@ _SWITCH_RE = re.compile(
     r"|change\s+(?:to|thread)",
     re.I,
 )
+
+# Clarify-requirements intent: mimics the .claude/agents/brd-clarifier interview
+# workflow (skills/requirement-clarity.md), but driven through Slack Block Kit
+# instead of AskUserQuestion (Slack has no blocking equivalent).
+# "ambigu" stem covers ambiguous / ambiguity / ambiguities (incl. "find ambiguities").
+# Also match explicit PO-confirm phrasings ("po chốt", "cần po", "po confirm",
+# "po xác nhận", "chốt requirement"). "po" alone is intentionally NOT a trigger.
+_CLARIFY_RE = re.compile(
+    r"clarify|làm rõ|ambigu"
+    r"|po\s*chốt|cần\s*po|po\s*confirm|po\s*xác\s*nhận|chốt\s*requirement",
+    re.I,
+)
+_CLARIFY_TRIGGER_STRIP_RE = re.compile(
+    r"^\s*(clarify|làm rõ|find\s+ambiguit\w*"
+    r"|cần\s*po\s*chốt|po\s*chốt|cần\s*po|po\s*confirm|po\s*xác\s*nhận|chốt\s*requirement)"
+    r"\b[:\s]*",
+    re.I,
+)
+
+# Section/input block `text` is capped at 3000 chars by Slack; stay well clear.
+_CLARIFY_BLOCK_TEXT_MAX = 2800
 
 
 def _golive_intent(text, fallback_ref=None):
@@ -183,8 +230,19 @@ def _switch_refusal_text(prior_sticky, switch_target):
         else:
             tail = "Vui lòng mở thread mới và nhắc ticket ngay từ tin nhắn đầu tiên."
     return head + " " + tail
-# Test-case generation intent, e.g. "gen test case cho CDM-268", "tạo test case CDM-268".
-_GEN_TC_RE = re.compile(r"gen(?:erate)?\s*test\s*case|t(ạ|a)o\s*test\s*case", re.I)
+
+
+# Test-case generation intent, e.g. "gen test case cho CDM-268", "write a testcase for AC-...",
+# "viết test case", "tạo/sinh test case". `test\s*case` matches both "test case" and "testcase".
+# Requires the words "test case" adjacent, so it never over-matches go-live/curator-test/bug.
+_GEN_TC_RE = re.compile(
+    r"gen(?:erate)?\s*test\s*case"
+    r"|write\s*(?:a\s*)?test\s*case"
+    r"|vi(?:ế|e)t\s*test\s*case"
+    r"|t(?:ạ|a)o\s*test\s*case"
+    r"|sinh\s*test\s*case",
+    re.I,
+)
 
 
 def _gen_testcase_intent(text):
@@ -202,6 +260,48 @@ _DISCARD_TC_RE = re.compile(r"(discard|cancel|h(ủ|u)y|b(ỏ|o))\s*(the\s*)?tes
 
 def _discard_testcase_intent(text):
     return bool(text) and bool(_DISCARD_TC_RE.search(text))
+
+
+def _clarify_intent(text):
+    return bool(text) and bool(_CLARIFY_RE.search(text))
+
+
+def _clarify_target(text):
+    # A requirement ref wins over pasted text (same heuristic as _golive_intent).
+    # Returns (requirement_ref, None) or (None, raw_text_or_None).
+    ref_m = _REQ_RE.search(text)
+    if ref_m:
+        return ref_m.group(1).upper(), None
+    remainder = _CLARIFY_TRIGGER_STRIP_RE.sub("", text).strip()
+    return None, (remainder or None)
+
+
+def _requirement_text_for_clarify(requirement_ref, logger=None):
+    # Best-effort: description text for a Requirement ref, fetching from Jira if the
+    # graph doesn't have it yet. Mirrors _golive_report's fetch-then-read pattern.
+    props = {}
+    try:
+        props = db.get_node_props(requirement_ref, "Requirement")
+    except Exception:
+        if logger is not None:
+            logger.exception("get_node_props failed")
+    if not props.get("description") and config.JIRA_BASE_URL and config.JIRA_EMAIL and config.JIRA_API_TOKEN:
+        try:
+            if tools.fetch_jira(requirement_ref).get("status") == "ok":
+                props = db.get_node_props(requirement_ref, "Requirement")
+        except Exception:
+            if logger is not None:
+                logger.exception("fetch_jira fallback failed")
+    parts = [p for p in (props.get("summary"), props.get("description")) if p]
+    text = "\n\n".join(parts) or None
+    if not text:
+        return None
+    try:
+        return tools.expand_with_confluence(text)
+    except Exception:
+        if logger is not None:
+            logger.exception("expand_with_confluence failed")
+        return text
 
 
 def _missing_tokens():
@@ -314,12 +414,15 @@ def _candidate_blocks(candidate_id, rule_text, applies_to, approver_hint):
     ]
 
 
-def post_candidate_to_curator(client, channel, candidate_id, rule_text, applies_to, approver_hint):
-    # Post a candidate rule with approval buttons to `channel`.
+def post_candidate_to_curator(client, channel, candidate_id, rule_text, applies_to,
+                              approver_hint, thread_ts=None):
+    # Post a candidate rule with approval buttons to `channel` (in-thread if given).
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
     return client.chat_postMessage(
         channel=channel,
         blocks=_candidate_blocks(candidate_id, rule_text, applies_to, approver_hint),
         text=f"Candidate rule #{candidate_id} awaiting approval",
+        **kwargs,
     )
 
 
@@ -447,26 +550,9 @@ def _project_for_channel(channel_id, logger=None):
         return None
 
 
-def _resolve_mention(role, project_id, logger=None, env_fallback=None):
-    # Resolve a role -> Slack mention "<@id>" via the users table (project-scoped first).
-    # Falls back to env_fallback id (last resort), then to a clear non-crashing text.
-    sid = None
-    try:
-        sid = db.resolve_role_slack_id(role, project_id)
-    except Exception:
-        if logger is not None:
-            logger.exception("resolve_role_slack_id failed")
-    if not sid and env_fallback:
-        sid = env_fallback
-    if sid:
-        return f"<@{sid}>"
-    if logger is not None:
-        logger.warning("No Slack user for role '%s' (project=%s) in users table", role, project_id)
-    return f"@{role} (chưa cấu hình user cho role này trong bảng users)"
-
-
-def _run_curator_demo(client, channel_id, user_id, logger=None):
+def _run_curator_demo(client, channel_id, user_id, logger=None, thread_ts=None):
     # Manual test path: enqueue a sample candidate and post it with buttons.
+    # @mentions the QE Lead (curator_role_for("TestCase") -> "qe_lead" -> resolve).
     applies_to = "TestCase"
     rule = "AC titles must be verifiable and unambiguous."
     cid = db.add_candidate_rule(
@@ -474,8 +560,8 @@ def _run_curator_demo(client, channel_id, user_id, logger=None):
         {"evidence": "manual curator-test", "by": user_id},
     )
     project_id = _project_for_channel(channel_id, logger)
-    mention = _resolve_mention(routing.curator_role_for(applies_to), project_id, logger)
-    post_candidate_to_curator(client, channel_id, cid, rule, applies_to, mention)
+    mention = db.mention_for(routing.curator_role_for(applies_to), project_id)
+    post_candidate_to_curator(client, channel_id, cid, rule, applies_to, mention, thread_ts=thread_ts)
     return cid
 
 
@@ -561,18 +647,40 @@ def _chunk_mrkdwn(text, limit=_SECTION_CHAR_LIMIT):
     return chunks or [""]
 
 
-def _testcase_draft_blocks(draft):
-    text = slack_format.render_testcase_draft(draft)
-    chunks = _chunk_mrkdwn(text)
+def _testcase_draft_blocks(draft, approver_mention=None):
+    # Kept intentionally light: full per-testcase detail (steps, precondition,
+    # data tables, API fields) lives in the exported Excel file only, so the
+    # Slack message stays a quick "does this look complete" scan, not a wall
+    # of text the reviewer has to read through.
+    acs = draft.get("acs") or []
+    intro = (
+        f":sparkles: Đây là bộ Draft test cases cho `{draft['requirement_ref']}` (v{draft['version']}) "
+        f"- {len(draft['testcases'])} test case cho {len(acs)} Acceptance Criteria — file Excel đầy "
+        "đủ đã được đính kèm ngay dưới đây:point_down:\n"
+        "Bạn review file Excel rồi bấm :white_check_mark: Approve nếu ok, hoặc :arrows_counterclockwise: "
+        "Refine kèm comment nếu muốn mình chỉnh sửa thêm nhé! :raised_hands:"
+    )
+    blocks = [
+        {"type": "section", "text": {"type": "mrkdwn", "text": intro}},
+        {"type": "divider"},
+    ]
+    coverage_text = slack_format.render_ac_list(acs)
+    chunks = _chunk_mrkdwn(coverage_text)
     truncated = len(chunks) > _MAX_SECTION_BLOCKS
     if truncated:
         chunks = chunks[:_MAX_SECTION_BLOCKS]
-    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in chunks]
+    blocks.extend({"type": "section", "text": {"type": "mrkdwn", "text": chunk}} for chunk in chunks)
     if truncated:
         blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                       "text": ":warning: _Draft too long to display in full — showing the first "
-                               f"{_MAX_SECTION_BLOCKS} sections. Approve to get the complete list "
-                               "in the exported Excel file._"}})
+                       "text": ":warning: _Danh sách AC dài quá giới hạn hiển thị — xem đầy đủ trong "
+                               "file Excel._"}})
+    blocks.append({"type": "divider"})
+    # Ask-routing: testcase -> qe_lead. @mention the QE Lead as the approver, near the
+    # buttons. `approver_mention` is a resolved "<@id>" (or a graceful "@qe_lead
+    # (unconfigured)" label from mention_for) — never raises.
+    if approver_mention:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": slack_format.to_slack(
+            f":raising_hand: {approver_mention} — vui lòng review file Excel và *Approve* nếu ổn.")}})
     blocks.append({
             "type": "actions",
             "block_id": f"tc_{draft['requirement_ref']}_{draft['version']}",
@@ -588,7 +696,46 @@ def _testcase_draft_blocks(draft):
     return blocks
 
 
-def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
+def _upload_draft_excel(client, channel_id, thread_ts, testcases, filename,
+                         comment, error_context, logger=None):
+    """Export testcases to the QE Excel template (tieukiwi/testcase_export.py)
+    and upload to the thread. Best-effort: failures are reported in-thread
+    rather than raised, since callers use this alongside a draft/approval
+    message that has already been posted successfully.
+
+    Returns the uploaded file's id (so a later refine/approve can retire it
+    via _delete_superseded_excel), or None if nothing was uploaded."""
+    if not testcases:
+        return None
+    try:
+        xlsx_bytes = testcase_export.export_excel(testcases)
+        result = client.files_upload_v2(channel=channel_id, thread_ts=thread_ts,
+                                         filename=filename, content=xlsx_bytes,
+                                         initial_comment=comment)
+        return (result.get("file") or {}).get("id")
+    except Exception as e:
+        if logger is not None:
+            logger.exception("export/upload failed")
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                 text=slack_format.to_slack(f":warning: {error_context}: {e}"))
+        return None
+
+
+def _delete_superseded_excel(client, file_id, logger=None):
+    # Retire the previous draft's Excel file once a newer version (refine or
+    # approve) has its own file posted, so the thread doesn't accumulate a
+    # stale file per round. Best-effort — a failure here shouldn't block the
+    # new draft/approval, which has already succeeded by the time this runs.
+    if not file_id:
+        return
+    try:
+        client.files_delete(file=file_id)
+    except Exception:
+        if logger is not None:
+            logger.exception("deleting superseded draft excel failed")
+
+
+def _do_gen_testcase(say, client, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     project_id = _project_for_channel(channel_id, logger)
     try:
         draft = testcase_gen.generate_draft(requirement_ref, project_id=project_id)
@@ -598,11 +745,81 @@ def _do_gen_testcase(say, requirement_ref, logger=None, thread_ts=None, channel_
         say(text=slack_format.to_slack(f":warning: Error: {e}"))
         return
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
-    posted = say(blocks=_testcase_draft_blocks(draft),
+    qe_lead = db.mention_for(routing.approver_role_for("testcase"), project_id)
+    posted = say(blocks=_testcase_draft_blocks(draft, qe_lead),
                  text=f"Draft test cases for {requirement_ref}", **kwargs)
     anchor_ts = thread_ts or posted["ts"]
-    memory.save_thread_state(channel_id, anchor_ts,
-                              {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **draft})
+
+    # Persist the draft FIRST — before the Excel export — so Approve can ALWAYS find
+    # it. If the export fails (e.g. missing files:write scope), the save must not be
+    # skipped: that Excel-before-save ordering was the "No draft found" bug.
+    try:
+        memory.save_thread_state(
+            channel_id, anchor_ts,
+            {"flow": "gen_testcase", "draft_message_ts": posted["ts"],
+             "excel_file_id": None, "bot_participant": True,
+             "current_ref": requirement_ref, **draft},
+        )
+    except Exception:
+        if logger is not None:
+            logger.exception("saving draft state failed")
+        say(text=slack_format.to_slack(
+            ":warning: Draft shown above, but I couldn't save it for approval "
+            "(storage error) — please regenerate."), **kwargs)
+        return
+
+    # Best-effort Excel export; a failure is reported in-thread but does NOT affect
+    # the saved draft or the Approve flow.
+    excel_file_id = _upload_draft_excel(
+        client, channel_id, anchor_ts, draft["testcases"],
+        filename=f"{requirement_ref}_testcases_v{draft['version']}.xlsx",
+        comment=f":page_facing_up: Draft test cases (v{draft['version']}) — "
+                f"{len(draft['testcases'])} testcase(s).",
+        error_context="Excel export for this draft failed", logger=logger,
+    )
+    if excel_file_id:
+        try:
+            state = memory.get_thread_state(channel_id, anchor_ts) or {}
+            state["excel_file_id"] = excel_file_id
+            memory.save_thread_state(channel_id, anchor_ts, state)
+        except Exception:
+            if logger is not None:
+                logger.exception("recording excel_file_id on draft state failed")
+
+
+def _saved_confirmation(state, user):
+    # Confirm exactly what Approve saved: TC ref -> covered AC refs. Length-capped
+    # so a huge draft can't make chat_update exceed Slack's 3000-char block limit.
+    tcs = state.get("testcases") or []
+    header = f":white_check_mark: Approved by <@{user}> (v{state.get('version')}) — saved {len(tcs)} test case(s):"
+    lines = []
+    for tc in tcs:
+        acs = ", ".join(tc.get("ac_refs") or []) or "—"
+        lines.append(f"• `{tc.get('ref')}` covering {acs}")
+    text = header + "\n" + "\n".join(lines)
+    if len(text) > 2800:
+        text = header + f"\n• {len(tcs)} test cases saved (list too long to show)."
+    return slack_format.to_slack(text)
+
+
+def _load_draft_state(channel_id, thread_ts, logger=None):
+    """Load a gen_testcase draft for (channel_id, thread_ts). Never raises.
+
+    Returns (state, status) where status is:
+      "ok"      -> state is a valid gen_testcase draft (has testcases),
+      "absent"  -> no draft here (truly missing / a non-draft thread),
+      "error"   -> a storage read error (transient).
+    Lets callers show the right message and never crash the Slack handler.
+    """
+    try:
+        state = memory.get_thread_state(channel_id, thread_ts)
+    except Exception:
+        if logger is not None:
+            logger.exception("get_thread_state failed")
+        return None, "error"
+    if not state or state.get("flow") != "gen_testcase" or "testcases" not in state:
+        return None, "absent"
+    return state, "ok"
 
 
 def _do_discard_testcase(say, client, thread_ts, channel_id, user_id, logger=None):
@@ -710,14 +927,409 @@ def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=Non
     # Block 5 (GO only): curator mention + Approve/Reject buttons.
     if res.get("decision") == "GO":
         project_id = _project_for_channel(channel_id, logger)
-        role = routing.approver_role_for("go_live")
-        mention = _resolve_mention(
-            role, project_id, logger, env_fallback=config.DELIVERY_MANAGER_SLACK_ID
-        )
+        mention = db.mention_for(routing.approver_role_for("go_live"), project_id)
         blocks = blocks + _golive_approval_blocks(
             res.get("requirement") or requirement_ref, mention
         )
     say(blocks=blocks, text=f"Go/No-Go {requirement_ref}", **kwargs)
+
+
+# ---------------------------------------------------------------- clarify-requirements interview
+
+def _trunc(s, n):
+    s = s or ""
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _clarify_summary_blocks(ambiguities, requirement_ref, project_id=None):
+    # Header + one section block PER question (not one joined block — a single
+    # mrkdwn text field is capped at 3000 chars, and real questions times 8 would
+    # blow past that if joined). The button's value is just a lookup key into
+    # _pending_clarify — see its docstring for why the data never touches a
+    # Slack length-limited field directly.
+    # Open questions are PO-confirm items -> @mention the PO (role-resolved, one path).
+    po = db.mention_for(routing.approver_role_for("po_confirm"), project_id)
+    header = slack_format.to_slack(
+        f"*Requirement clarity check*{' — ' + requirement_ref if requirement_ref else ''}\n"
+        f"Found *{len(ambiguities)}* open question(s) — {po} vui lòng xác nhận: _(build {_BOOT_TS})_"
+    )
+    blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": header}}]
+    for i, a in enumerate(ambiguities, 1):
+        line = slack_format.to_slack(f"{i}. _{a.get('dimension', '?')}_ — {a.get('question', '?')}")
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": _trunc(line, _CLARIFY_BLOCK_TEXT_MAX)}})
+
+    key = _store_pending_clarify({"ambiguities": ambiguities, "requirement_ref": requirement_ref})
+    blocks.append({
+        "type": "actions",
+        "elements": [{
+            "type": "button", "action_id": "clarify_open_modal", "style": "primary",
+            "text": {"type": "plain_text", "text": "Open clarification form"},
+            "value": key,
+        }],
+    })
+    return blocks
+
+
+def _do_clarify(say, requirement_ref, text, logger=None, thread_ts=None, project_id=None):
+    # Run find_ambiguities and post either "sufficiently specified" or the
+    # open-questions summary + "Open clarification form" button.
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    try:
+        result = tools.find_ambiguities(text, project_id=project_id)
+    except Exception as e:
+        if logger is not None:
+            logger.exception("find_ambiguities failed")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(f":warning: Error: {e}")),
+            text="Error", **kwargs)
+        return
+
+    ambiguities = result.get("ambiguities") or []
+    if not ambiguities:
+        ref_note = f" *{requirement_ref}*" if requirement_ref else ""
+        msg = slack_format.to_slack(
+            f":white_check_mark: Requirement{ref_note} looks sufficiently specified — "
+            f"no clarification needed. _(build {_BOOT_TS})_"
+        )
+        say(blocks=_mrkdwn_blocks(msg), text=msg, **kwargs)
+        return
+
+    try:
+        say(blocks=_clarify_summary_blocks(ambiguities, requirement_ref, project_id),
+            text=f"{len(ambiguities)} open question(s) found", **kwargs)
+    except Exception:
+        # A rendering/API failure here must still surface SOMETHING to the user —
+        # the alternative is silence forever (what happened before this guard existed).
+        if logger is not None:
+            logger.exception("posting clarify summary failed")
+        say(text=slack_format.to_slack(
+            f":warning: Found *{len(ambiguities)}* open question(s) but couldn't render "
+            f"the interactive form (check server logs). _(build {_BOOT_TS})_"
+        ), **kwargs)
+
+
+def _clarify_modal_blocks(ambiguities):
+    blocks = []
+    for i, a in enumerate(ambiguities):
+        text = f"*{i + 1}. [{a.get('dimension', '?')}]* {a.get('question', '?')}"
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": _trunc(text, _CLARIFY_BLOCK_TEXT_MAX)},
+        })
+        blocks.append({
+            "type": "input",
+            "block_id": f"answer_{i}",
+            "optional": True,
+            "label": {"type": "plain_text", "text": "Answer (or \"TBD\")"},
+            "element": {
+                "type": "plain_text_input",
+                "action_id": "answer_input",
+                "multiline": True,
+            },
+        })
+    return blocks
+
+
+def _clarified_requirements_text(ambiguities, values, requirement_ref):
+    # Build the "Clarified Requirements" + "Open Items" block per the rubric's
+    # Step 4 format (skills/requirement-clarity.md), in Slack mrkdwn.
+    rows, open_items = [], []
+    for i, a in enumerate(ambiguities):
+        block = values.get(f"answer_{i}", {})
+        answer = ((block.get("answer_input") or {}).get("value") or "").strip()
+        question = a.get("question", "?")
+        if not answer or answer.lower() in ("tbd", "unsure", "n/a", "?"):
+            open_items.append(question)
+        else:
+            rows.append((question, answer))
+
+    lines = ["*Clarified Requirements*" + (f" — {requirement_ref}" if requirement_ref else "")]
+    if rows:
+        lines.append("")
+        lines.extend(f"• *{q}*\n   {ans}" for q, ans in rows)
+    if open_items:
+        lines.append("")
+        lines.append(":warning: *Open Items* _(blockers before test-case writing begins)_")
+        lines.extend(f"{i}. {q}" for i, q in enumerate(open_items, 1))
+    return slack_format.to_slack("\n".join(lines)), rows, open_items
+
+
+# ---------------------------------------------------------------- shared turn handler
+
+def _extract_ref(text):
+    # First ticket ref (e.g. CDM-268) in the text, uppercased, or None.
+    m = _REQ_RE.search(text or "")
+    return m.group(1).upper() if m else None
+
+
+# Bug / failing-test question, e.g. "có bug hoặc test đang fail", "any failing tests?".
+_BUG_RE = re.compile(r"\bbug\b|fail|đang fail|lỗi|broken", re.I)
+
+
+def _is_bug_question(text):
+    return bool(text) and bool(_BUG_RE.search(text))
+
+
+def _is_golive_question(text):
+    return bool(text) and bool(_GOLIVE_RE.search(text))
+
+
+def _is_gen_testcase(text):
+    return bool(text) and bool(_GEN_TC_RE.search(text))
+
+
+def _recall_ref(channel_id, thread_ts, logger=None):
+    # Tier-2 memory: the ticket this thread is about, or None.
+    try:
+        return (memory.get_thread_state(channel_id, thread_ts) or {}).get("current_ref")
+    except Exception:
+        if logger is not None:
+            logger.exception("get_thread_state failed")
+        return None
+
+
+def _remember_thread(channel_id, thread_ts, ref=None, logger=None):
+    # Mark the bot as a participant of this thread and (if given) remember the ticket.
+    # Read-modify-write so the testcase-draft keys (flow/draft/...) are preserved.
+    if not (channel_id and thread_ts):
+        return
+    try:
+        state = memory.get_thread_state(channel_id, thread_ts) or {}
+        state["bot_participant"] = True
+        if ref:
+            state["current_ref"] = ref
+        memory.save_thread_state(channel_id, thread_ts, state)
+    except Exception:
+        if logger is not None:
+            logger.exception("save_thread_state failed")
+
+
+def _with_ref_context(ref, text):
+    # Scope the agent to the remembered ticket without changing the agent loop —
+    # only the input text is augmented.
+    return (
+        f"Current ticket in this thread: {ref}. "
+        f"If the question omits a ticket key, assume they mean this one.\n\n{text}"
+    )
+
+
+def _ask_which_ticket(say, **kwargs):
+    say(
+        blocks=_mrkdwn_blocks(slack_format.to_slack(
+            "Bạn muốn hỏi về ticket nào? (ví dụ: `CDM-268`). "
+            "Tôi chưa thấy mã ticket trong tin nhắn này hoặc trong thread."
+        )),
+        text="Which ticket?",
+        **kwargs,
+    )
+
+
+def _handle_mention_turn(say, client, channel_id, thread_ts, clean_text,
+                          is_reply=False, user_id=None, logger=None):
+    """Turn handler for @mention + non-mention thread reply (phuong_qe features
+    layered on top of _handle_turn).
+
+    Order (early-exits stop later steps):
+      1. Refuse thread-reassignment attempts BEFORE resolving sticky (so a
+         fresh-thread "thread này giờ là CDM-500" can't silently set the sticky).
+      2. Discard-testcase → cancel in-progress draft.
+      3. Interim "Đang xử lý…" ack; capture ts for live progress + final swap.
+      4. Sticky Jira ticket resolve (this msg / thread parent / thread state).
+      5. Pre-flight ingest_jira_ticket (force=True on "cập nhật/refresh").
+      6. Intent routing: go-live / list-ACs / clarify-ambiguities / gen-testcase.
+      7. Fallback: agent handle_question with progress + chat_update in place.
+    """
+    if not clean_text:
+        say(
+            blocks=_mrkdwn_blocks(slack_format.to_slack(
+                "Hi! Hỏi tôi về 1 ticket, ví dụ: `@Tieu Kiwi thông tin CDM-268`.")),
+            text="Usage", thread_ts=thread_ts,
+        )
+        return
+
+    # 1. Refuse thread-reassignment BEFORE touching sticky state.
+    try:
+        prior_sticky = (memory.get_thread_state(channel_id, thread_ts) or {}).get("ticket_ref")
+    except Exception:
+        if logger is not None:
+            logger.exception("get_thread_state failed")
+        prior_sticky = None
+
+    switch_target = _detect_switch_target(clean_text)
+    if switch_target is not None and not (
+        prior_sticky and switch_target and prior_sticky == switch_target
+    ):
+        say(
+            blocks=_mrkdwn_blocks(slack_format.to_slack(
+                _switch_refusal_text(prior_sticky, switch_target)
+            )),
+            text="Không thể đổi ticket của thread",
+            thread_ts=thread_ts,
+        )
+        return
+
+    # 2. Discard command — before interim ack so it stays snappy.
+    if _discard_testcase_intent(clean_text):
+        _do_discard_testcase(say, client, thread_ts, channel_id, user_id, logger)
+        return
+
+    # 3. Interim ack; keep ts for chat_update-in-place.
+    progress_ts = None
+    try:
+        resp = say(text=slack_format.to_slack("🥝 Đang xử lý…"), thread_ts=thread_ts)
+        progress_ts = (resp or {}).get("ts")
+    except Exception:
+        if logger is not None:
+            logger.exception("interim post failed")
+
+    # 4. Sticky Jira ticket per thread.
+    ticket_ref = _resolve_thread_ref(
+        client, channel_id, thread_ts, clean_text, is_reply, logger
+    )
+
+    # 5. Pre-flight ingest so downstream tools see fresh data.
+    project_id = _project_for_channel(channel_id, logger)
+    if ticket_ref:
+        force_refresh = bool(_FORCE_REFRESH_RE.search(clean_text))
+        _ensure_ticket_fresh(
+            client, channel_id, thread_ts, ticket_ref, project_id,
+            force=force_refresh, logger=logger,
+        )
+
+    # 6a. Go-live intent → deterministic go_no_go.
+    ref = _golive_intent(clean_text, fallback_ref=ticket_ref)
+    if ref:
+        _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+        return
+
+    # 6b. "List ACs" → deterministic AC dump.
+    ac_ref = _list_ac_intent(clean_text, fallback_ref=ticket_ref)
+    if ac_ref:
+        _do_list_acs(
+            say, ac_ref, project_id=project_id,
+            thread_ts=thread_ts, channel_id=channel_id, logger=logger,
+        )
+        return
+
+    # 6c. Clarify-ambiguities → interview modal.
+    if _clarify_intent(clean_text):
+        clarify_ref, raw_text = _clarify_target(clean_text)
+        clarify_ref = clarify_ref or ticket_ref
+        source_text = _requirement_text_for_clarify(clarify_ref, logger) if clarify_ref else raw_text
+        if not source_text:
+            _ask_which_ticket(say, thread_ts=thread_ts)
+            return
+        _do_clarify(say, clarify_ref, source_text, logger,
+                    thread_ts=thread_ts, project_id=project_id)
+        return
+
+    # 6d. Generate-testcase intent.
+    tc_ref = _gen_testcase_intent(clean_text)
+    if tc_ref:
+        _do_gen_testcase(say, client, tc_ref, logger,
+                         thread_ts=thread_ts, channel_id=channel_id)
+        return
+
+    # 7. Fallback: agent handle_question with in-place progress → final swap.
+    question = clean_text
+    if ticket_ref and not _REQ_RE.search(clean_text):
+        question = f"(Context: Jira ticket {ticket_ref}) {clean_text}"
+
+    on_step = _make_progress_callback(client, channel_id, progress_ts, logger)
+    answer = handle_question(question, logger, on_step=on_step, channel_id=channel_id)
+
+    posted = False
+    if progress_ts:
+        try:
+            client.chat_update(
+                channel=channel_id, ts=progress_ts,
+                blocks=_mrkdwn_blocks(answer), text=answer,
+            )
+            posted = True
+        except Exception:
+            if logger is not None:
+                logger.exception("final chat_update failed")
+    if not posted:
+        say(blocks=_mrkdwn_blocks(answer), text=answer, thread_ts=thread_ts)
+
+
+def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=None):
+    """Handle ONE user turn — shared by the @mention handler and non-mention thread
+    replies, so behaviour is identical whether or not the bot is tagged.
+
+    Resolves the ticket ref (message first, else Tier-2 thread memory), routes the
+    intent (discard / go-live / gen-testcase / clarify-ambiguities / general Q&A),
+    replies in-thread, and remembers the thread + ticket for follow-ups.
+    """
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+
+    if not text:
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(
+            "Hi! Ask me about a ticket, e.g. `@Tieu Kiwi thông tin CDM-268`.")),
+            text="Usage", **kwargs)
+        return
+
+    # Curator demo shortcut — recognised via @mention too (not only the slash command).
+    # Reuses the SAME _run_curator_demo: posts the candidate + Approve/Edit/Reject buttons
+    # and @mentions the QE Lead. Replies in-thread.
+    if "curator-test" in text.lower():
+        _run_curator_demo(client, channel_id, user_id, logger, thread_ts=thread_ts)
+        return
+
+    # Discard command -> cancel the in-progress draft. Handle before the interim ack.
+    if _discard_testcase_intent(text):
+        _do_discard_testcase(say, client, thread_ts, channel_id, user_id, logger)
+        return
+
+    # Resolve the ticket ref: message wins, else fall back to thread memory.
+    ref = _extract_ref(text)
+    _remember_thread(channel_id, thread_ts, ref, logger)  # mark participant (+ ref if any)
+    if not ref:
+        ref = _recall_ref(channel_id, thread_ts, logger)
+
+    # Interim ack in-thread so users see progress.
+    try:
+        say(text=slack_format.to_slack("Processing…"), **kwargs)
+    except Exception:
+        if logger is not None:
+            logger.exception("interim post failed")
+
+    project_id = _project_for_channel(channel_id, logger)
+
+    # Go-live readiness.
+    if _is_golive_question(text):
+        if ref:
+            _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+        else:
+            _ask_which_ticket(say, **kwargs)
+        return
+
+    # Generate test cases.
+    if _is_gen_testcase(text):
+        if ref:
+            _do_gen_testcase(say, client, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+        else:
+            _ask_which_ticket(say, **kwargs)
+        return
+
+    # Clarify / find ambiguities.
+    if _clarify_intent(text):
+        clarify_ref, raw_text = _clarify_target(text)
+        clarify_ref = clarify_ref or ref            # reuse remembered ticket if none in text
+        source_text = _requirement_text_for_clarify(clarify_ref, logger) if clarify_ref else raw_text
+        if not source_text:
+            _ask_which_ticket(say, **kwargs)
+            return
+        _do_clarify(say, clarify_ref, source_text, logger, thread_ts=thread_ts, project_id=project_id)
+        return
+
+    # General question. If the ref came from memory (not this message), scope the agent to it.
+    agent_text = text if _extract_ref(text) else (_with_ref_context(ref, text) if ref else text)
+    answer = handle_question(agent_text, logger)
+    # Bug / failing-test question -> route to the Dev owner after listing the issues.
+    if _is_bug_question(text):
+        dev = db.mention_for(routing.approver_role_for("bug"), project_id)  # "bug" -> "dev"
+        answer = answer + "\n\n" + slack_format.to_slack(f":bust_in_silhouette: *Dev owner:* {dev}")
+    say(blocks=_mrkdwn_blocks(answer), text=answer, **kwargs)
 
 
 def build_app():
@@ -784,7 +1396,22 @@ def build_app():
         # Generate-testcase request -> draft + Approve/Refine buttons.
         tc_ref = _gen_testcase_intent(text)
         if tc_ref:
-            _do_gen_testcase(say, tc_ref, logger, channel_id=command.get("channel_id"))
+            _do_gen_testcase(say, client, tc_ref, logger, channel_id=command.get("channel_id"))
+            return
+
+        # Clarify-requirements question -> find ambiguities + Slack interview modal.
+        if _clarify_intent(text):
+            clarify_ref, raw_text = _clarify_target(text)
+            project_id = _project_for_channel(command.get("channel_id"), logger)
+            source_text = _requirement_text_for_clarify(clarify_ref, logger) if clarify_ref else raw_text
+            if not source_text:
+                usage = slack_format.to_slack(
+                    "Usage: `/tieukiwi clarify <requirement ref>` or "
+                    "`/tieukiwi clarify <pasted BRD text>`"
+                )
+                say(blocks=_mrkdwn_blocks(usage), text="Usage")
+                return
+            _do_clarify(say, clarify_ref, source_text, logger, project_id=project_id)
             return
 
         # 3) Otherwise: call the Layer A agent (shared helper) and post the result.
@@ -881,7 +1508,7 @@ def build_app():
         try:
             channel = meta.get("channel")
             project_id = _project_for_channel(channel, logger)
-            mention = _resolve_mention(routing.curator_role_for(applies_to), project_id, logger)
+            mention = db.mention_for(routing.curator_role_for(applies_to), project_id)
             post_candidate_to_curator(client, channel, cid, new_text, applies_to, mention)
         except Exception:
             logger.exception("re-post after edit failed")
@@ -925,12 +1552,20 @@ def build_app():
     @app.action("tc_approve")
     def handle_tc_approve(ack, body, client, logger):
         ack()
-        channel_id = body["channel"]["id"]
-        thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
-        state = memory.get_thread_state(channel_id, thread_ts)
-        if not state:
+        try:
+            channel_id = body["channel"]["id"]
+            thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
+        except Exception:
+            logger.exception("tc_approve: bad payload")
+            return
+        state, status = _load_draft_state(channel_id, thread_ts, logger)
+        if status == "error":
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=":warning: No draft found for this thread.")
+                                     text=":warning: Couldn't read the draft (temporary storage error) — please try again.")
+            return
+        if status == "absent":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread — please regenerate the test cases.")
             return
         if _is_stale_draft_click(body, state):
             client.chat_postMessage(
@@ -940,6 +1575,15 @@ def build_app():
             )
             return
         user = body["user"]["id"]
+        # TODO (Level 2 — approver gating): restrict Approve to the QE Lead.
+        #   qe = db.resolve_role_slack_id("qe_lead", _project_for_channel(channel_id, logger))
+        #   if qe and user != qe:
+        #       client.chat_postEphemeral(channel=channel_id, user=user,
+        #           text="Chỉ QE Lead mới approve được.")  # (needs thread_ts for in-thread)
+        #       return
+        #   if not qe: logger.warning("qe_lead unresolved; allowing approve")  # never block demo
+        # Left as a TODO on purpose: with a seeded qe_lead this would block any other
+        # tester from approving during the demo. Enable once roles are finalized.
         try:
             testcase_gen.finalize_and_save(state, approved_by=user)
         except Exception as e:
@@ -947,15 +1591,22 @@ def build_app():
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
                                      text=slack_format.to_slack(f":warning: Error saving testcases: {e}"))
             return
+        # Mark the draft approved so a redelivery/double-click can't re-save (best-effort).
+        try:
+            state["status"] = "approved"
+            memory.save_thread_state(channel_id, thread_ts, state)
+        except Exception:
+            logger.exception("marking draft approved failed")
         # Remove the Approve/Refine buttons now that the DB write has succeeded,
         # so a double-click or Slack redelivery can't trigger a second export/upload.
         # Keep the rendered testcase list itself — only the actions block is
-        # dropped — so the reviewer can still see what they approved.
+        # dropped — so the reviewer can still see what they approved, and append a
+        # confirmation of exactly what was saved (TC ref -> covered ACs).
         try:
             kept_blocks = [b for b in (body["message"].get("blocks") or [])
                            if b.get("type") != "actions"]
             kept_blocks.append({"type": "section", "text": {"type": "mrkdwn",
-                                "text": f":white_check_mark: Approved by <@{user}> (v{state['version']})"}})
+                                "text": _saved_confirmation(state, user)}})
             client.chat_update(
                 channel=channel_id, ts=body["message"]["ts"],
                 blocks=kept_blocks,
@@ -963,34 +1614,34 @@ def build_app():
             )
         except Exception:
             logger.exception("removing tc_approve buttons failed")
-        try:
-            xlsx_bytes = testcase_export.export_excel(state["testcases"])
-            client.files_upload_v2(
-                channel=channel_id, thread_ts=thread_ts,
-                filename=f"{state['requirement_ref']}_testcases.xlsx",
-                content=xlsx_bytes,
-                initial_comment=f":white_check_mark: Approved by <@{user}> "
-                                 f"(v{state['version']}) — {len(state['testcases'])} testcase(s) saved.",
-            )
-        except Exception as e:
-            logger.exception("export/upload failed")
-            client.chat_postMessage(
-                channel=channel_id, thread_ts=thread_ts,
-                text=slack_format.to_slack(
-                    f":warning: {len(state['testcases'])} testcase(s) were saved successfully, "
-                    f"but exporting/uploading the Excel file failed: {e}"
-                ),
-            )
+        _upload_draft_excel(
+            client, channel_id, thread_ts, state["testcases"],
+            filename=f"{state['requirement_ref']}_testcases_v{state['version']}_approved.xlsx",
+            comment=f":white_check_mark: Approved by <@{user}> "
+                    f"(v{state['version']}) — {len(state['testcases'])} testcase(s) saved.",
+            error_context=f"{len(state['testcases'])} testcase(s) were saved successfully, "
+                          "but exporting/uploading the Excel file failed",
+            logger=logger,
+        )
+        _delete_superseded_excel(client, state.get("excel_file_id"), logger=logger)
 
     @app.action("tc_refine")
     def handle_tc_refine(ack, body, client, logger):
         ack()
-        channel_id = body["channel"]["id"]
-        thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
-        state = memory.get_thread_state(channel_id, thread_ts)
-        if not state:
+        try:
+            channel_id = body["channel"]["id"]
+            thread_ts = body["message"].get("thread_ts") or body["message"]["ts"]
+        except Exception:
+            logger.exception("tc_refine: bad payload")
+            return
+        state, status = _load_draft_state(channel_id, thread_ts, logger)
+        if status == "error":
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=":warning: No draft found for this thread.")
+                                     text=":warning: Couldn't read the draft (temporary storage error) — please try again.")
+            return
+        if status == "absent":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread — please regenerate the test cases.")
             return
         if _is_stale_draft_click(body, state):
             client.chat_postMessage(
@@ -1019,13 +1670,21 @@ def build_app():
     @app.view("tc_refine_submit")
     def handle_tc_refine_submit(ack, body, client, view, logger):
         ack()
-        meta = json.loads(view["private_metadata"])
-        channel_id, thread_ts = meta["channel_id"], meta["thread_ts"]
-        comment = view["state"]["values"]["comment_block"]["comment_input"]["value"]
-        state = memory.get_thread_state(channel_id, thread_ts)
-        if not state:
+        try:
+            meta = json.loads(view["private_metadata"])
+            channel_id, thread_ts = meta["channel_id"], meta["thread_ts"]
+            comment = view["state"]["values"]["comment_block"]["comment_input"]["value"]
+        except Exception:
+            logger.exception("tc_refine_submit: bad payload")
+            return
+        state, status = _load_draft_state(channel_id, thread_ts, logger)
+        if status == "error":
             client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
-                                     text=":warning: No draft found for this thread.")
+                                     text=":warning: Couldn't read the draft (temporary storage error) — please try again.")
+            return
+        if status == "absent":
+            client.chat_postMessage(channel=channel_id, thread_ts=thread_ts,
+                                     text=":warning: No draft found for this thread — please regenerate the test cases.")
             return
         # The refine LLM call can take several seconds; post an immediate
         # acknowledgement so the user doesn't think the click was dropped.
@@ -1059,13 +1718,95 @@ def build_app():
                 )
         except Exception:
             logger.exception("removing stale draft buttons failed")
+        qe_lead = db.mention_for(routing.approver_role_for("testcase"),
+                                  _project_for_channel(channel_id, logger))
         posted = client.chat_postMessage(
             channel=channel_id, thread_ts=thread_ts,
-            blocks=_testcase_draft_blocks(refined),
+            blocks=_testcase_draft_blocks(refined, qe_lead),
             text=f"Draft test cases for {refined['requirement_ref']} (v{refined['version']})",
         )
+        excel_file_id = _upload_draft_excel(
+            client, channel_id, thread_ts, refined["testcases"],
+            filename=f"{refined['requirement_ref']}_testcases_v{refined['version']}.xlsx",
+            comment=f":page_facing_up: Draft test cases (v{refined['version']}) — "
+                    f"{len(refined['testcases'])} testcase(s).",
+            error_context="Excel export for this draft failed", logger=logger,
+        )
+        _delete_superseded_excel(client, state.get("excel_file_id"), logger=logger)
         memory.save_thread_state(channel_id, thread_ts,
-                                  {"flow": "gen_testcase", "draft_message_ts": posted["ts"], **refined})
+                                  {"flow": "gen_testcase", "draft_message_ts": posted["ts"],
+                                   "excel_file_id": excel_file_id,
+                                   "bot_participant": True,
+                                   "current_ref": refined.get("requirement_ref"),
+                                   **refined})
+
+    @app.action("clarify_open_modal")
+    def handle_clarify_open_modal(ack, body, client, logger):
+        ack()
+        key = body["actions"][0]["value"]
+        payload = _pending_clarify.get(key)
+        if payload is None:
+            # Expired (app restarted) or double-clicked after submit already popped it.
+            client.chat_postEphemeral(
+                channel=body["channel"]["id"], user=body["user"]["id"],
+                text=slack_format.to_slack(
+                    ":warning: This clarification session has expired — please re-run the "
+                    "clarify command."
+                ),
+            )
+            return
+        ambiguities = payload.get("ambiguities") or []
+        # Fill in what's only known at click time; same cache entry, same key.
+        payload["channel"] = body["channel"]["id"]
+        payload["thread_ts"] = (body.get("message") or {}).get("thread_ts")
+        client.views_open(
+            trigger_id=body["trigger_id"],
+            view={
+                "type": "modal",
+                "callback_id": "clarify_interview_submit",
+                "private_metadata": key,
+                "title": {"type": "plain_text", "text": "Clarify requirements"},
+                "submit": {"type": "plain_text", "text": "Submit"},
+                "close": {"type": "plain_text", "text": "Cancel"},
+                "blocks": _clarify_modal_blocks(ambiguities),
+            },
+        )
+
+    @app.view("clarify_interview_submit")
+    def handle_clarify_interview_submit(ack, body, client, view, logger):
+        ack()
+        key = view.get("private_metadata") or ""
+        payload = _pending_clarify.pop(key, None)
+        if payload is None:
+            logger.warning("clarify_interview_submit: unknown/expired key %r", key)
+            return
+        ambiguities = payload.get("ambiguities") or []
+        requirement_ref = payload.get("requirement_ref")
+        channel = payload.get("channel")
+        thread_ts = payload.get("thread_ts")
+
+        text, rows, _open_items = _clarified_requirements_text(
+            ambiguities, view["state"]["values"], requirement_ref
+        )
+
+        kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+        try:
+            if channel:
+                client.chat_postMessage(
+                    channel=channel, blocks=_mrkdwn_blocks(text),
+                    text="Clarified Requirements", **kwargs,
+                )
+        except Exception:
+            logger.exception("post clarified requirements failed")
+
+        if requirement_ref and rows:
+            try:
+                db.update_node_props(
+                    requirement_ref, "clarified_requirements",
+                    [{"question": q, "answer": ans} for q, ans in rows],
+                )
+            except Exception:
+                logger.exception("persist clarified_requirements failed")
 
     @app.event("app_mention")
     def handle_app_mention(event, body, say, client, logger):
@@ -1087,121 +1828,77 @@ def build_app():
         channel_id = event.get("channel")
 
         clean_text = _strip_mention(event.get("text", "")).strip()
-        if not clean_text:
-            usage = slack_format.to_slack(
-                "Hi! Mention me with a QE question, e.g. "
-                "`@Tieu Kiwi is FRONT-3494 ready to go live?`"
-            )
-            say(blocks=_mrkdwn_blocks(usage), text="Usage", thread_ts=thread_ts)
-            return
 
-        # Refuse any thread-reassignment attempt BEFORE resolving/saving a sticky —
-        # otherwise a fresh-thread message like "thread này h trao đổi cho CDM-198"
-        # would silently set CDM-198 as the sticky before we get to reject it.
-        # Read the current sticky from thread_state only (no parent fetch here).
-        try:
-            prior_sticky = (memory.get_thread_state(channel_id, thread_ts) or {}).get("ticket_ref")
-        except Exception:
-            logger.exception("get_thread_state failed")
-            prior_sticky = None
-
-        switch_target = _detect_switch_target(clean_text)
-        if switch_target is not None and not (
-            prior_sticky and switch_target and prior_sticky == switch_target
-        ):
-            say(
-                blocks=_mrkdwn_blocks(slack_format.to_slack(
-                    _switch_refusal_text(prior_sticky, switch_target)
-                )),
-                text="Không thể đổi ticket của thread",
-                thread_ts=thread_ts,
-            )
-            return
-
-        # Discard command -> cancel the in-progress testcase draft in this thread.
-        # Checked before the interim "Processing…" ack so it stays snappy and
-        # doesn't look like a new generation request is starting.
-        if _discard_testcase_intent(clean_text):
-            _do_discard_testcase(say, client, thread_ts, event.get("channel"),
-                                  event.get("user"), logger)
-            return
-
-        # Interim ack in-thread — keep its ts so we can chat_update in place
-        # with live progress labels, then swap for the final answer.
-        progress_ts = None
-        try:
-            resp = say(text=slack_format.to_slack("🥝 Đang xử lý…"), thread_ts=thread_ts)
-            progress_ts = (resp or {}).get("ts")
-        except Exception:
-            logger.exception("interim post failed")
-
-        # Sticky Jira ticket per thread: first ref (in this msg or the thread parent)
-        # is persisted so later mentions don't have to repeat it. First-wins — a
-        # follow-up message cannot overwrite the thread's ticket.
-        ticket_ref = _resolve_thread_ref(
-            client, channel_id, thread_ts, clean_text, is_reply, logger
+        _handle_mention_turn(
+            say, client, channel_id, thread_ts, clean_text,
+            is_reply=is_reply, user_id=event.get("user"), logger=logger,
         )
 
-        # Pre-flight ingest: make sure the ticket is in the graph and reasonably
-        # fresh before any tool runs on it. Hash-gate keeps this cheap (~500ms)
-        # when the ticket hasn't changed. `force=True` when the user's message
-        # explicitly asks for a refresh ("cập nhật CDM-268", "refresh", ...).
-        if ticket_ref:
-            force_refresh = bool(_FORCE_REFRESH_RE.search(clean_text))
-            project_id = _project_for_channel(channel_id, logger)
-            _ensure_ticket_fresh(
-                client, channel_id, thread_ts, ticket_ref, project_id,
-                force=force_refresh, logger=logger,
-            )
+    @app.event("message")
+    def handle_thread_reply(event, body, say, client, context, logger):
+        # Continue the conversation in threads the bot is ALREADY part of, WITHOUT a
+        # mention — but stay silent on all other channel chatter. Proceed only if
+        # every guard passes; otherwise return without replying.
 
-        # Go-live question -> deterministic go_no_go + (on GO) curator sign-off buttons.
-        ref = _golive_intent(clean_text, fallback_ref=ticket_ref)
-        if ref:
-            _do_golive(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+        # (a) plain user messages only — skip edits/deletes/joins/file_share/bot_message.
+        if event.get("subtype"):
+            return
+        # (b) never react to bots or ourselves (prevents self-loops).
+        if event.get("bot_id"):
+            return
+        bot_user_id = context.get("bot_user_id")
+        if bot_user_id and event.get("user") == bot_user_id:
+            return
+        # (c) must be inside a thread.
+        thread_ts = event.get("thread_ts")
+        if not thread_ts:
+            return
+        # (d) if it explicitly @mentions the bot, app_mention handles it (no double-handling).
+        text = (event.get("text") or "").strip()
+        mentions_bot = (f"<@{bot_user_id}>" in text) if bot_user_id else ("<@" in text)
+        if mentions_bot:
+            return
+        # (e) dedup retries / already-handled events.
+        if body.get("retry_attempt"):
+            return
+        if _seen_before(body.get("event_id")):
+            return
+        # (f) bot must be a participant of THIS thread: thread_state must already exist.
+        channel_id = event.get("channel")
+        try:
+            state = memory.get_thread_state(channel_id, thread_ts)
+        except Exception:
+            logger.exception("get_thread_state failed")
+            return
+        if not state or not text:
             return
 
-        # "List ACs" -> deterministic AC dump; skips LLM.
-        ac_ref = _list_ac_intent(clean_text, fallback_ref=ticket_ref)
-        if ac_ref:
-            _do_list_acs(
-                say, ac_ref,
-                project_id=_project_for_channel(channel_id, logger),
-                thread_ts=thread_ts, channel_id=channel_id, logger=logger,
-            )
-            return
-
-        # For general questions: if the user didn't name a ticket but the thread has one,
-        # prepend it so the agent knows the ambient context.
-        question = clean_text
-        if ticket_ref and not _REQ_RE.search(clean_text):
-            question = f"(Context: Jira ticket {ticket_ref}) {clean_text}"
-
-        # Generate-testcase request -> draft + Approve/Refine buttons.
-        tc_ref = _gen_testcase_intent(clean_text)
-        if tc_ref:
-            _do_gen_testcase(say, tc_ref, logger, thread_ts=thread_ts, channel_id=event.get("channel"))
-            return
-
-        on_step = _make_progress_callback(client, channel_id, progress_ts, logger)
-        answer = handle_question(question, logger, on_step=on_step, channel_id=channel_id)
-
-        # Replace the "Processing…" message with the final answer in-place
-        # (single tidy message per question). Fall back to a new post if the
-        # update fails so the user always gets a reply.
-        posted = False
-        if progress_ts:
-            try:
-                client.chat_update(
-                    channel=channel_id, ts=progress_ts,
-                    blocks=_mrkdwn_blocks(answer), text=answer,
-                )
-                posted = True
-            except Exception:
-                logger.exception("final chat_update failed")
-        if not posted:
-            say(blocks=_mrkdwn_blocks(answer), text=answer, thread_ts=thread_ts)
+        _handle_mention_turn(
+            say, client, channel_id, thread_ts, text,
+            is_reply=True, user_id=event.get("user"), logger=logger,
+        )
 
     return app
+
+
+def _startup_role_check():
+    # Boot diagnostic: print exactly who each ROLE @mention resolves to, via the SAME
+    # path the curator/bug/go-live flows use (db.mention_for(routing.approver_role_for(...))).
+    # If this prints the wrong person at startup, the running process is stale OR pointed at
+    # a different DB — restart / check DATABASE_URL. If it prints the right ids but Slack still
+    # shows someone else, the live process was not restarted after the last code change.
+    checks = [
+        ("go_live      -> delivery_manager", "go_live"),
+        ("testcase     -> qe_lead", "testcase"),
+        ("bug          -> dev", "bug"),
+        ("po_confirm   -> po", "po_confirm"),
+    ]
+    try:
+        print(f"[role-check] build {_BOOT_TS} — role @mentions resolve to:")
+        for label, key in checks:
+            print(f"             {label:34s} = {db.mention_for(routing.approver_role_for(key))}")
+    except Exception as e:  # never block startup on a diagnostic
+        print(f"[role-check] skipped: {e}")
 
 
 def main():
@@ -1217,7 +1914,8 @@ def main():
 
     app = build_app()
     handler = SocketModeHandler(app, config.SLACK_APP_TOKEN)
-    print("Tieu Kiwi Slack app starting (Socket Mode). Ctrl+C to stop.")
+    print(f"Tieu Kiwi Slack app starting (Socket Mode), build {_BOOT_TS}. Ctrl+C to stop.")
+    _startup_role_check()
     handler.start()
 
 

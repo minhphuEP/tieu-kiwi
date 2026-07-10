@@ -125,6 +125,7 @@ def collect_docs():
                 # include_global=True) can still find them (its $or clause
                 # requires either a matching project_id or scope="global").
                 metadata["scope"] = "global"
+                metadata["doc_type"] = "reference"
 
             docs.append((doc_id, text, metadata))
     return docs
