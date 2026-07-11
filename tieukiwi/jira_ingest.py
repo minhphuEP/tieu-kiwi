@@ -220,11 +220,19 @@ _BUG_HEADER_ALIASES = {
 }
 
 
+_HEADER_ANNOTATION_RE = re.compile(r"\s*\([^)]*\)\s*")
+
+
 def _canonicalise_headers(header_row):
-    """[('Bug','Step','Actual','Expected','Priority','Find by')] → dict {canonical: col_idx}."""
+    """[('Bug','Step','Actual','Expected','Priority','Find by')] → dict {canonical: col_idx}.
+
+    Also tolerates parenthetical annotations the Jira template adds
+    ("Bug(Required)", "Root Cause(optional)") — the annotation carries no
+    semantic value for parsing, so strip it before alias lookup.
+    """
     mapping = {}
     for i, h in enumerate(header_row):
-        key = (h or "").strip().lower()
+        key = _HEADER_ANNOTATION_RE.sub(" ", (h or "").lower()).strip()
         canonical = _BUG_HEADER_ALIASES.get(key)
         if canonical and canonical not in mapping:
             mapping[canonical] = i
