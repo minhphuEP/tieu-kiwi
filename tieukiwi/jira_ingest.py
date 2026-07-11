@@ -883,6 +883,25 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
         summary["acs_kept"] = diff["kept_count"]
         summary["acs_obsoleted"] = diff["obsoleted"]
 
+    # 5b. Prune stale `derivedFrom` edges — BRDs no longer referenced by the
+    # current description. Cross-module policy: only remove the edge from
+    # THIS Requirement; the BRD node + its Chroma chunks stay (may still be
+    # useful to other Requirements semantically). Use deprecate_brd() (future)
+    # for full removal of a wrong-page BRD.
+    seen_brd_refs = {f"CFL-{pid}" for pid, _sec, _url in confluence_targets}
+    existing_brds = db.linked_brds(req_node_id)
+    orphan_brds = [b for b in existing_brds if b["ref"] not in seen_brd_refs]
+    if orphan_brds:
+        db.delete_edges_by_dst(
+            req_node_id, "derivedFrom", [b["id"] for b in orphan_brds]
+        )
+        summary["brds_pruned"] = [
+            {"ref": b["ref"],
+             "title": (b.get("props_json") or {}).get("title")}
+            for b in orphan_brds
+        ]
+        _sub(f"Đã prune {len(orphan_brds)} BRD link cũ khỏi {req_key}.")
+
     # 6. Route subtasks — TestRun / bug container / skip.
     # Do TestRuns first (need self-test TR id to link find_by=Testcase bugs).
     subtask_stubs = fields.get("subtasks") or []

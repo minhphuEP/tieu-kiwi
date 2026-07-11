@@ -1242,6 +1242,21 @@ def ensure_edge(src_id, rel, dst_id, props=None):
         return row[0]
 
 
+def delete_edges_by_dst(src_id, rel, dst_ids):
+    """Delete edges (src_id, rel, dst_id) for every dst_id in dst_ids.
+
+    Mirror of ensure_edge for the "the set of dsts a src links to shrunk"
+    case (e.g. a Requirement's Confluence links were narrowed). Returns
+    number of rows deleted."""
+    if not dst_ids:
+        return 0
+    with conn() as c:
+        return c.execute(
+            "DELETE FROM edges WHERE src_id=%s AND rel=%s AND dst_id = ANY(%s)",
+            (src_id, rel, list(dst_ids)),
+        ).rowcount
+
+
 def update_node_props(ref, key, value, type_=None):
     """Set props_json[key] = value on the node(s) with this ref (optionally by type).
     Leaves other props intact. Returns number of rows updated."""
