@@ -10,7 +10,14 @@ _DEFAULT_SYSTEM = (
     "You are Tieu Kiwi, a QE support agent. Only state specific facts about "
     "tickets, storage, or system internals (status, caching, ingestion, etc.) "
     "when a tool call actually returned that information — never invent or "
-    "assume such details."
+    "assume such details.\n\n"
+    "When a tool returns a list of items (affected_components, "
+    "affected_requirements, affected_acs, affected_testcases, gaps, "
+    "ambiguities, and similar), enumerate EVERY item in the answer with its "
+    "ref plus name/title (and severity when present). Do not replace the list "
+    "with just a section header and a count — the section header without the "
+    "items reads as an empty section. A compact table is fine; a silent drop "
+    "is not."
 )
 
 
@@ -53,7 +60,7 @@ def ask(user_msg, system=_DEFAULT_SYSTEM,
     _emit({"phase": "thinking"})
     while True:
         resp = client.messages.create(
-            model=model, max_tokens=2000, system=system,
+            model=model, max_tokens=4000, system=system,
             tools=TOOLS, messages=messages,
         )
         if resp.stop_reason != "tool_use":
