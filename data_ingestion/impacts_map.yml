@@ -1,0 +1,39 @@
+# Manual mapping: Jira ticket (Requirement) -> Component(s) impacted.
+#
+# Purpose:
+#   Seed `Requirement -impacts-> Component` edges so `feature_blast_radius`
+#   and `impact_from_jira` can answer "what QE needs to plan for this ticket".
+#
+# Usage:
+#   1. Add/edit entries below when a Requirement's scope becomes known.
+#   2. Run:  python scripts/ingest/impacts.py
+#   3. Idempotent — safe to re-run; existing edges get their props refreshed.
+#
+# Rules:
+#   - Requirement ref must already exist as a Requirement node (from Jira ingest).
+#   - Component ref must already exist as a Component node (from seed_components).
+#   - Unknown refs are warned and skipped — nothing is auto-created here.
+#   - Default project is CDM; override with `python scripts/ingest/impacts.py --project=<PROJ>`.
+#
+# Format:
+#   <jira_ref>:
+#     - COMP-CDM-XXX
+#     - COMP-CDM-YYY
+
+CDM-268:
+  - COMP-CDM-CREATOR-DIRECTORY
+  - COMP-CDM-SCRIPT-DUPLICATE
+  - COMP-CDM-SCRIPT-ASSIGN
+  - COMP-CDM-SCRIPT-MANAGE
+
+CDM-198:
+  - COMP-CDM-OFFER-REVIEWER
+  - COMP-CDM-SAMPLE-TRACKING
+
+CDM-194:
+  - COMP-CDM-OFFER-REVIEWER
+  - COMP-CDM-SAMPLE-TRACKING
+
+CDM-195:
+  - COMP-CDM-OFFER-REVIEWER
+  - COMP-CDM-SAMPLE-TRACKING

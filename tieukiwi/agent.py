@@ -10,12 +10,20 @@ _DEFAULT_SYSTEM = (
     "You are Tieu Kiwi, a QE support agent. Only state specific facts about "
     "tickets, storage, or system internals (status, caching, ingestion, etc.) "
     "when a tool call actually returned that information — never invent or "
-    "assume such details."
+    "assume such details.\n\n"
+    "When a tool returns a list of items — including any field named "
+    "target_*, at_risk_*, affected_*, impacted_*, self_coverage_gap, gaps, "
+    "ambiguities, and similar collections — enumerate EVERY item in the "
+    "answer with its ref plus name/title (and severity when present). Do not "
+    "replace the list with just a section header and a count, and do not drop "
+    "'target' items on the assumption the user already knows them; the user "
+    "expects to see the full scope. A compact table is fine; a silent drop is "
+    "not."
 )
 
 
 def ask(user_msg, system=_DEFAULT_SYSTEM,
-        project_id=None, role=None, model = None):
+        project_id=None, role=None, model=None, on_step=None):
     """Drive one tool-use conversation to completion and return the final text.
 
     Args:
@@ -25,8 +33,13 @@ def ask(user_msg, system=_DEFAULT_SYSTEM,
                   to this project by run_tool. Callers should set this via the
                   Slack layer (channel_id -> project_id).
       role:       persona for RAG filtering (e.g. 'QE'). Passed to search_kb.
+      on_step:    optional callback fired on model thinking / tool decisions.
+                  Signature: on_step({"phase": str, "name": str|None, ...}).
+                  Exceptions from the callback are swallowed so a broken UI
+                  never breaks the agent. Threaded into `context` so tools
+                  can emit sub-steps.
     """
-    context = {"project_id": project_id, "role": role}
+    context = {"project_id": project_id, "role": role, "on_step": on_step}
     if model is None:
         model = config.model_for("agent")
     if not isinstance(model, str):
@@ -35,10 +48,20 @@ def ask(user_msg, system=_DEFAULT_SYSTEM,
             f"Did you pass the config module by mistake? Use config.DEFAULT_MODEL "
             f"or config.model_for('agent')."
         )
+
+    def _emit(ev):
+        if on_step is None:
+            return
+        try:
+            on_step(ev)
+        except Exception:
+            pass
+
     messages = [{"role": "user", "content": user_msg}]
+    _emit({"phase": "thinking"})
     while True:
         resp = client.messages.create(
-            model=model, max_tokens=2000, system=system,
+            model=model, max_tokens=4000, system=system,
             tools=TOOLS, messages=messages,
         )
         if resp.stop_reason != "tool_use":
@@ -48,10 +71,13 @@ def ask(user_msg, system=_DEFAULT_SYSTEM,
         results = []
         for block in resp.content:
             if block.type == "tool_use":
+                _emit({"phase": "tool_start", "name": block.name, "args": block.input})
                 out = run_tool(block.name, block.input, context=context)
+                _emit({"phase": "tool_done", "name": block.name})
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
                     "content": str(out),
                 })
         messages.append({"role": "user", "content": results})
+        _emit({"phase": "thinking"})

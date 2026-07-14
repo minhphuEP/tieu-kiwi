@@ -13,10 +13,14 @@ ANTHROPIC_API_KEY for the agent). Importing this module does NOT require the tok
 
 import json
 import re
+import time
 import uuid
 from datetime import datetime
 
-from . import agent, config, db, memory, routing, slack_format, testcase_export, testcase_gen, tools
+from . import (
+    agent, config, db, jira_ingest, memory, progress, routing, slack_format,
+    testcase_export, testcase_gen, tools,
+)
 
 # In-memory dedup of handled invocations/events (single-process). Skips retries / duplicates.
 _seen_ids = set()
@@ -50,6 +54,42 @@ _MENTION_RE = re.compile(r"^\s*<@[A-Z0-9]+>\s*")
 _GOLIVE_RE = re.compile(r"go[\s\-]?live|đủ điều kiện|release|go\s*/?\s*no-?go|sẵn sàng", re.I)
 # A Jira-style requirement ref, e.g. FRONT-3494.
 _REQ_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{1,9}-\d+)\b")
+
+# Force-refresh intent: user asks to bypass hash-gate on pre-flight ingest.
+# Vietnamese + English phrasings; conservative enough that plain conversation
+# doesn't accidentally trigger. Matches "cập nhật", "refresh", "PRD đã update",
+# "chạy lại đi", "just updated", etc.
+_FORCE_REFRESH_RE = re.compile(
+    r"cập\s*nhật|làm\s*mới|đồng\s*bộ|refresh|resync|re-?fetch|reload|mới\s*nhất"
+    r"|(?:đã|vừa|mới|đang)(?:\s+được)?\s+(?:update|updated|sửa|chỉnh|thay\s*đổi|edit)"
+    r"|được\s+(?:update|updated)"
+    r"|(?:xem|review|check|chạy|run)\s+lại"
+    r"|(?:prd|brd|requirement|req|spec)\s+(?:mới|đã(?:\s+được)?\s*update"
+        r"|vừa(?:\s+được)?\s*update|updated|changed)"
+    r"|just\s+updated|please\s+re-?review|re-?check|re-?run",
+    re.I,
+)
+
+# "List ACs" — a pure data query the LLM tends to summarise/drop titles from.
+# Route it to a deterministic renderer instead so QE sees every AC verbatim.
+_LIST_AC_RE = re.compile(
+    r"(?:danh\s*sách|list|liệt\s*kê|show(?:\s+me)?|xem|các|những|all)"
+    r"\s+(?:the\s+)?ac"
+    r"|ac[^\n]{0,20}(?:là\s*gì|nào|có\s*gì|of\b)"
+    r"|acceptance\s+criteri",
+    re.I,
+)
+
+
+def _list_ac_intent(text, fallback_ref=None):
+    # Return the requirement ref if the message is asking for the AC list,
+    # else None. Sticky ticket kicks in when the message doesn't repeat the ref.
+    if not text or not _LIST_AC_RE.search(text):
+        return None
+    m = _REQ_RE.search(text)
+    if m:
+        return m.group(1).upper()
+    return fallback_ref
 
 # Clarify-requirements intent: mimics the .claude/agents/brd-clarifier interview
 # workflow (skills/requirement-clarity.md), but driven through Slack Block Kit
@@ -97,6 +137,23 @@ _GEN_TC_RE = re.compile(
 def _gen_testcase_intent(text):
     # Return the requirement ref if this looks like a "generate test cases" request, else None.
     if not text or not _GEN_TC_RE.search(text):
+        return None
+    m = _REQ_RE.search(text)
+    return m.group(1).upper() if m else None
+
+
+# Status-update intent, e.g. "Cập nhật trạng thái CDM-268",
+# "cap nhat trang thai CDM-268", "update status CDM-268". Fires the TR sync +
+# TC↔TR linker in tieukiwi.jira_ingest.sync_testruns_and_link_tcs.
+_STATUS_UPDATE_RE = re.compile(
+    r"c(?:ậ|a)p\s*nh(?:ậ|a)t\s*tr(?:ạ|a)ng\s*th(?:á|a)i"
+    r"|update\s*status",
+    re.I,
+)
+
+
+def _status_update_intent(text):
+    if not text or not _STATUS_UPDATE_RE.search(text):
         return None
     m = _REQ_RE.search(text)
     return m.group(1).upper() if m else None
@@ -228,12 +285,14 @@ def _strip_mention(text):
     return _MENTION_RE.sub("", text or "")
 
 
-def handle_question(text, logger=None):
+def handle_question(text, logger=None, on_step=None, channel_id=None):
     # Shared logic for both entry points: run the Layer A agent and return a
     # Slack-friendly answer string. Never raises — a failure comes back as an error message.
     # The agent returns GitHub Markdown; convert it to the canonical Slack format.
+    # on_step is an optional callback that fires as the agent thinks / calls tools,
+    # so the Slack layer can chat_update a progress message in-place.
     try:
-        answer = agent.ask(text)
+        answer = agent.ask(text, on_step=on_step)
     except Exception as e:
         if logger is not None:
             logger.exception("agent.ask failed")
@@ -423,6 +482,22 @@ def _testcase_draft_blocks(draft, approver_mention=None):
         {"type": "section", "text": {"type": "mrkdwn", "text": intro}},
         {"type": "divider"},
     ]
+    # Surface uncovered ACs so the reviewer sees them BEFORE the AC list —
+    # a partial draft is still returned (soft-fail after retry) rather than
+    # blocked, so this banner is the only signal the LLM left gaps.
+    gaps = draft.get("coverage_gaps") or []
+    if gaps:
+        gap_refs_by_id = {ac["ref"]: ac for ac in acs}
+        gap_lines = "\n".join(
+            f"• `{ref}` — {gap_refs_by_id.get(ref, {}).get('desc', '')[:100]}"
+            for ref in gaps
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": slack_format.to_slack(
+            f":warning: *{len(gaps)} AC chưa được cover* (LLM retry vẫn skip — "
+            f"thường do AC quá ngắn/mơ hồ như section header). Refine kèm hướng "
+            f"dẫn cụ thể để add testcase cho:\n{gap_lines}"
+        )}})
+        blocks.append({"type": "divider"})
     coverage_text = slack_format.render_ac_list(acs)
     chunks = _chunk_mrkdwn(coverage_text)
     truncated = len(chunks) > _MAX_SECTION_BLOCKS
@@ -496,13 +571,48 @@ def _delete_superseded_excel(client, file_id, logger=None):
 
 def _do_gen_testcase(say, client, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     project_id = _project_for_channel(channel_id, logger)
+    # Immediate progress message so the user doesn't stare at silence for
+    # 30-60s while the LLM streams. Retained ts is used to chat_update
+    # (or ignored on best-effort failure — the final draft post is what
+    # matters).
+    progress_kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    progress_ts = None
+    try:
+        progress_resp = say(
+            text=slack_format.to_slack(
+                f":hourglass_flowing_sand: Đang generate draft test cases cho `{requirement_ref}`… "
+                f"(LLM có thể mất 30-60s cho requirement nhiều AC)"
+            ),
+            **progress_kwargs,
+        )
+        progress_ts = progress_resp.get("ts") if progress_resp else None
+    except Exception:
+        if logger is not None:
+            logger.exception("posting progress message failed (non-fatal)")
+
     try:
         draft = testcase_gen.generate_draft(requirement_ref, project_id=project_id)
     except Exception as e:
         if logger is not None:
             logger.exception("generate_draft failed")
-        say(text=slack_format.to_slack(f":warning: Error: {e}"))
+        if progress_ts and channel_id:
+            try:
+                client.chat_update(
+                    channel=channel_id, ts=progress_ts,
+                    text=slack_format.to_slack(f":warning: Error: {e}"),
+                )
+            except Exception:
+                say(text=slack_format.to_slack(f":warning: Error: {e}"))
+        else:
+            say(text=slack_format.to_slack(f":warning: Error: {e}"))
         return
+    # Retire the progress placeholder now that the draft is ready.
+    if progress_ts and channel_id:
+        try:
+            client.chat_delete(channel=channel_id, ts=progress_ts)
+        except Exception:
+            if logger is not None:
+                logger.exception("deleting progress message failed (non-fatal)")
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
     qe_lead = db.mention_for(routing.approver_role_for("testcase"), project_id)
     posted = say(blocks=_testcase_draft_blocks(draft, qe_lead),
@@ -628,6 +738,45 @@ def _is_stale_draft_click(body, state):
     return current_ts is not None and clicked_ts != current_ts
 
 
+def _do_list_acs(say, requirement_ref, project_id=None, thread_ts=None,
+                 channel_id=None, logger=None):
+    """Deterministic 'list ACs' — bypasses the LLM. Prevents Claude from
+    silently rephrasing/dropping AC titles when the user just wants to see
+    every AC of a ticket."""
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    try:
+        res = db.get_ticket(requirement_ref, project_id=project_id)
+        trace = db.trace(requirement_ref, project_id=project_id)
+    except Exception as e:
+        if logger is not None:
+            logger.exception("list_acs failed")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(f":warning: Error: {e}")),
+            text="Error", **kwargs)
+        return
+    if not res or not res.get("found"):
+        text = (f":information_source: *{requirement_ref}* chưa có trong graph. "
+                f"Chạy `ingest_jira_ticket({requirement_ref})` để pull từ Jira trước.")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
+        return
+    acs = (trace or {}).get("acceptance_criteria") or []
+    if not acs:
+        text = (f":information_source: *{requirement_ref}* có 0 Acceptance Criterion "
+                f"trong graph. BRD có thể chưa được extract — chạy "
+                f"`ingest_jira_ticket({requirement_ref}, force=True)`.")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)), text=text, **kwargs)
+        return
+    # Reuse the same report shape + line renderer used by the story report /
+    # go-live output, so formatting stays consistent across all AC listings.
+    report = slack_format.report_from_graph(requirement_ref, res.get("props") or {}, trace)
+    header = f"*{report.get('title') or requirement_ref}*"
+    summary = (f"Story này có *{len(acs)} Acceptance Criteria*. "
+               f"Danh sách đầy đủ:")
+    ac_lines = [slack_format._ac_line(a) for a in report.get("acs") or []]
+    text = "\n".join([header, "", summary] + ac_lines)
+    say(blocks=_mrkdwn_blocks(slack_format.to_slack(text)),
+        text=f"AC list {requirement_ref}", **kwargs)
+
+
 def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     # Run go_no_go and post the analysis; add approve/reject buttons only on GO.
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
@@ -652,6 +801,55 @@ def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=Non
             res.get("requirement") or requirement_ref, mention
         )
     say(blocks=blocks, text=f"Go/No-Go {requirement_ref}", **kwargs)
+
+
+# ---------------------------------------------------------------- status-update (sync TR + link TC↔TR)
+
+def _render_status_update(result, requirement_ref):
+    trs = result.get("testruns") or []
+    warnings = result.get("warnings") or []
+    if not trs:
+        body = (f":information_source: Không tìm thấy TestRun nào cho *{requirement_ref}* "
+                "(chưa có subtask test-env nào được ingest).")
+        return slack_format.to_slack(body)
+    lines = [f"*Cập nhật trạng thái TestRun cho {requirement_ref}*"]
+    for tr in trs:
+        env = tr.get("environment") or "?"
+        old_s = tr.get("old_status") or "?"
+        new_s = tr.get("new_status") or "?"
+        arrow = f"{old_s} → {new_s}" if old_s != new_s else new_s
+        line = f"• `{tr['ref']}` ({env}): {arrow}"
+        if tr.get("new_status") == "done" and tr.get("linked_tc_refs"):
+            n_new = tr.get("edges_added") or 0
+            n_total = len(tr["linked_tc_refs"])
+            line += (f" — linked {n_total} TestCase(s) via `executedBy`"
+                     f" (+{n_new} mới)")
+        lines.append(line)
+    if warnings:
+        lines.append("")
+        lines.append("_Warnings:_")
+        for w in warnings:
+            lines.append(f"  - {w}")
+    return slack_format.to_slack("\n".join(lines))
+
+
+def _do_status_update(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
+    # Sync live Jira status for every TR of this Requirement and, when a TR
+    # flips to 'done', link every covering TestCase to it via executedBy.
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    project_id = _project_for_channel(channel_id, logger)
+    try:
+        result = jira_ingest.sync_testruns_and_link_tcs(
+            requirement_ref, project_id=project_id,
+        )
+    except Exception as e:
+        if logger is not None:
+            logger.exception("sync_testruns_and_link_tcs failed")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(f":warning: Error: {e}")),
+            text="Error", **kwargs)
+        return
+    text = _render_status_update(result, requirement_ref)
+    say(blocks=_mrkdwn_blocks(text), text=f"Status update {requirement_ref}", **kwargs)
 
 
 # ---------------------------------------------------------------- clarify-requirements interview
@@ -843,6 +1041,132 @@ def _ask_which_ticket(say, **kwargs):
     )
 
 
+def _make_progress_callback(client, channel_id, progress_ts, logger=None,
+                            min_interval=0.8):
+    """Return an on_step callback that updates the given "Đang xử lý…" message
+    in-place via chat_update. `tool_done` events are swallowed (avoid flicker
+    between tool finish and next thinking event). Throttled to `min_interval`
+    seconds so a burst of tool calls doesn't hit Slack rate limits.
+    """
+    if not progress_ts or not channel_id:
+        return None
+    last = [0.0]
+
+    def _cb(ev):
+        if (ev or {}).get("phase") == "tool_done":
+            return
+        now = time.monotonic()
+        if now - last[0] < min_interval:
+            return
+        last[0] = now
+        label = progress.label_for(ev)
+        try:
+            client.chat_update(
+                channel=channel_id, ts=progress_ts,
+                text=slack_format.to_slack(label),
+            )
+        except Exception:
+            if logger is not None:
+                logger.exception("progress chat_update failed")
+
+    return _cb
+
+
+def _update_or_post(client, channel_id, ts, thread_ts, text, logger=None):
+    """chat_update the progress message in place; fall back to a new post."""
+    slack_text = slack_format.to_slack(text)
+    if ts:
+        try:
+            client.chat_update(channel=channel_id, ts=ts, text=slack_text)
+            return
+        except Exception:
+            if logger is not None:
+                logger.exception("chat_update failed")
+    try:
+        client.chat_postMessage(channel=channel_id, thread_ts=thread_ts, text=slack_text)
+    except Exception:
+        if logger is not None:
+            logger.exception("chat_postMessage fallback failed")
+
+
+def _ensure_ticket_fresh(client, channel_id, thread_ts, ref, project_id,
+                          force=False, logger=None):
+    """Pre-flight: make sure `ref`'s subtree is in the graph (and reasonably
+    fresh) before the agent runs its tools. Called for every question that
+    resolves to a ticket.
+
+    Deterministic (dev controls flow, not the LLM): posts progress to the
+    thread and calls `jira_ingest.ingest_jira_ticket`. The tool itself hash-
+    gates internally, so a cached ticket returns in <1s with no Confluence
+    fetch and no LLM AC pass. On BRD drift, ingest auto-elevates to full
+    re-extract of ACs (see `jira_ingest._check_brd_freshness`).
+
+    Args:
+      force: bypass hash-gate. Set true when the user's message contains a
+             refresh keyword ("cập nhật", "refresh", …).
+
+    Returns: the ingest summary dict (or None on total failure so the caller
+    can still try to answer from whatever's already in the graph).
+    """
+    if not ref or not channel_id:
+        return None
+    progress_ts = None
+    try:
+        # Lightweight progress message; will be chat_update'd once ingest returns.
+        resp = client.chat_postMessage(
+            channel=channel_id,
+            thread_ts=thread_ts,
+            text=slack_format.to_slack(
+                f"🔄 Đang đồng bộ *{ref}* từ Jira{' (force)' if force else ''}…"
+            ),
+        )
+        progress_ts = (resp or {}).get("ts")
+    except Exception:
+        if logger is not None:
+            logger.exception("progress post failed")
+
+    try:
+        summary = jira_ingest.ingest_jira_ticket(
+            ref, project_id=project_id, force=force,
+            # Extract ACs on every fresh ingest (first-time or force). ~5-15s
+            # only hits when the ticket is genuinely new — cached tickets
+            # short-circuit at the hash-gate before the LLM pass runs. Without
+            # this, ACs are never populated from Slack, and downstream tools
+            # (coverage_gap, go_no_go, get_ticket) report 0 ACs.
+            extract_acs=True,
+        )
+    except Exception as e:
+        if logger is not None:
+            logger.exception("ingest_jira_ticket failed")
+        _update_or_post(client, channel_id, progress_ts, thread_ts,
+                        f":warning: Không đồng bộ được *{ref}*: {e}", logger)
+        return None
+
+    status = summary.get("status")
+    if status == "cached_fresh":
+        text_line = f"✅ *{ref}* đã có dữ liệu."
+    elif status == "ok":
+        n_bugs = len(summary.get("bugs") or [])
+        n_conf = len(summary.get("confluence_pages") or [])
+        n_tr = len(((summary.get("subtasks") or {}).get("testruns")) or [])
+        text_line = (f"✅ *{ref}* đã đồng bộ — "
+                     f"{n_tr} test run, {n_bugs} bug, {n_conf} BRD.")
+        # AC diff summary — only present when AC-extract actually ran.
+        ac_kept = summary.get("acs_kept")
+        if ac_kept is not None:
+            ac_created = len(summary.get("acs_extracted") or [])
+            ac_obsolete = len(summary.get("acs_obsoleted") or [])
+            if ac_created or ac_obsolete:
+                text_line += (f"\n📋 AC diff: *+{ac_created}* mới, "
+                              f"{ac_kept} giữ nguyên, *−{ac_obsolete}* obsolete.")
+            else:
+                text_line += f"\n📋 AC không đổi ({ac_kept} AC giữ nguyên)."
+    else:
+        text_line = f":warning: *{ref}* ingest status = `{status}`"
+    _update_or_post(client, channel_id, progress_ts, thread_ts, text_line, logger)
+    return summary
+
+
 def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=None):
     """Handle ONE user turn — shared by the @mention handler and non-mention thread
     replies, so behaviour is identical whether or not the bot is tagged.
@@ -891,14 +1215,39 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
     if not ref:
         ref = _recall_ref(channel_id, thread_ts, logger)
 
-    # Interim ack in-thread so users see progress.
+    project_id = _project_for_channel(channel_id, logger)
+
+    # Pre-flight ingest: sync the ticket's Jira + Confluence subtree BEFORE any
+    # downstream tool runs. Hash-gate keeps this ~500ms when nothing changed;
+    # detects PRD drift on Confluence and auto-re-extracts ACs. Users can force
+    # bypass with "cập nhật" / "refresh" / "PRD đã update" / … keywords.
+    # Skipped when there's no ref — general questions with no ticket context
+    # (e.g. "curator-test") don't need it.
+    if ref:
+        force_refresh = bool(_FORCE_REFRESH_RE.search(text))
+        _ensure_ticket_fresh(
+            client, channel_id, thread_ts, ref, project_id,
+            force=force_refresh, logger=logger,
+        )
+
+    # Interim ack in-thread — keep its ts so we can chat_update in place with
+    # per-step labels while the agent works, then swap it for the final answer.
+    progress_ts = None
     try:
-        say(text=slack_format.to_slack("Processing…"), **kwargs)
+        resp = say(text=slack_format.to_slack("🥝 Đang xử lý…"), **kwargs)
+        progress_ts = (resp or {}).get("ts")
     except Exception:
         if logger is not None:
             logger.exception("interim post failed")
 
-    project_id = _project_for_channel(channel_id, logger)
+    # "List ACs" — deterministic AC dump; skips LLM to preserve every AC title verbatim.
+    # Checked BEFORE go-live so a message like "list ACs of CDM-268 to check golive"
+    # goes through the deterministic path, not the LLM.
+    ac_ref = _list_ac_intent(text, fallback_ref=ref)
+    if ac_ref:
+        _do_list_acs(say, ac_ref, project_id=project_id,
+                     thread_ts=thread_ts, channel_id=channel_id, logger=logger)
+        return
 
     # Go-live readiness.
     if _is_golive_question(text):
@@ -916,6 +1265,14 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
             _ask_which_ticket(say, **kwargs)
         return
 
+    # Status-update: sync TR status + link TC↔TR when done.
+    if _STATUS_UPDATE_RE.search(text or ""):
+        if ref:
+            _do_status_update(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+        else:
+            _ask_which_ticket(say, **kwargs)
+        return
+
     # Clarify / find ambiguities.
     if _clarify_intent(text):
         clarify_ref, raw_text = _clarify_target(text)
@@ -929,12 +1286,29 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
 
     # General question. If the ref came from memory (not this message), scope the agent to it.
     agent_text = text if _extract_ref(text) else (_with_ref_context(ref, text) if ref else text)
-    answer = handle_question(agent_text, logger)
+    on_step = _make_progress_callback(client, channel_id, progress_ts, logger)
+    answer = handle_question(agent_text, logger, on_step=on_step, channel_id=channel_id)
     # Bug / failing-test question -> route to the Dev owner after listing the issues.
     if _is_bug_question(text):
         dev = db.mention_for(routing.approver_role_for("bug"), project_id)  # "bug" -> "dev"
         answer = answer + "\n\n" + slack_format.to_slack(f":bust_in_silhouette: *Dev owner:* {dev}")
-    say(blocks=_mrkdwn_blocks(answer), text=answer, **kwargs)
+
+    # Replace the interim "Đang xử lý…" message with the final answer in-place
+    # (single tidy message per question). Fall back to a new post if the update
+    # fails so the user always gets a reply.
+    posted = False
+    if progress_ts:
+        try:
+            client.chat_update(
+                channel=channel_id, ts=progress_ts,
+                blocks=_mrkdwn_blocks(answer), text=answer,
+            )
+            posted = True
+        except Exception:
+            if logger is not None:
+                logger.exception("final chat_update failed")
+    if not posted:
+        say(blocks=_mrkdwn_blocks(answer), text=answer, **kwargs)
 
 
 def build_app():
@@ -977,6 +1351,13 @@ def build_app():
         tc_ref = _gen_testcase_intent(text)
         if tc_ref:
             _do_gen_testcase(say, client, tc_ref, logger, channel_id=command.get("channel_id"))
+            return
+
+        # Status-update request -> sync live Jira status for TRs of this Story
+        # and link executedBy edges when a TR is 'done'.
+        status_ref = _status_update_intent(text)
+        if status_ref:
+            _do_status_update(say, status_ref, logger, channel_id=command.get("channel_id"))
             return
 
         # Clarify-requirements question -> find ambiguities + Slack interview modal.
