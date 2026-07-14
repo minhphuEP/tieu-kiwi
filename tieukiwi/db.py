@@ -1211,8 +1211,13 @@ def code_impact(target, direction='downstream', depth=3, project_id=None):
         #    Support two forms per target: a file path (contains '/') or a CodeUnit ref.
         seed_ids = []
         seed_files = []
+        # CodeUnit ref format is "<project_id>:<graph_node_id>" — no '/' allowed.
+        # Source file paths always contain '/'. Use '/' as the discriminator so
+        # detection works even when project_id is None (agent called without
+        # channel-project binding).
         for t in target:
-            if '/' in t and not t.startswith('CDM:') and not t.startswith(f"{project_id}:" if project_id else ''):
+            is_path = '/' in t
+            if is_path:
                 # Treat as source_file path
                 sql = "SELECT id FROM nodes WHERE type='CodeUnit' AND props_json->>'source_file' = %s"
                 params = [t]
