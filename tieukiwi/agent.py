@@ -11,13 +11,14 @@ _DEFAULT_SYSTEM = (
     "tickets, storage, or system internals (status, caching, ingestion, etc.) "
     "when a tool call actually returned that information — never invent or "
     "assume such details.\n\n"
-    "When a tool returns a list of items (affected_components, "
-    "affected_requirements, affected_acs, affected_testcases, gaps, "
-    "ambiguities, and similar), enumerate EVERY item in the answer with its "
-    "ref plus name/title (and severity when present). Do not replace the list "
-    "with just a section header and a count — the section header without the "
-    "items reads as an empty section. A compact table is fine; a silent drop "
-    "is not."
+    "When a tool returns a list of items — including any field named "
+    "target_*, at_risk_*, affected_*, impacted_*, self_coverage_gap, gaps, "
+    "ambiguities, and similar collections — enumerate EVERY item in the "
+    "answer with its ref plus name/title (and severity when present). Do not "
+    "replace the list with just a section header and a count, and do not drop "
+    "'target' items on the assumption the user already knows them; the user "
+    "expects to see the full scope. A compact table is fine; a silent drop is "
+    "not."
 )
 
 

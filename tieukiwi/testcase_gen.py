@@ -290,16 +290,61 @@ def generate_draft(requirement_ref, project_id=None, llm_fn=None):
     testcases = _validate_testcases(raw["testcases"])
     if existing:
         testcases = _merge_returned(existing, testcases, raw.get("deleted_refs"))
+    summary_text = raw.get("summary", "")
+
+    # First pass may skip vague/section-header ACs (e.g. "Entry point"). Give
+    # the LLM one focused retry over just the uncovered refs before giving up —
+    # the pattern is: (existing = first-pass testcases, ac_lines = gaps only,
+    # prompt = "add coverage for these"). Retrying blind with the full prompt
+    # tends to reproduce the same skip.
+    #
+    # BUT skip the retry when gaps are large (>40% of ACs OR >5 refs): that
+    # usually signals structural noise (section headings extracted as ACs) that
+    # a retry won't fix — and each retry call adds ~30s of LLM latency, which
+    # hurts UX far more than the missing coverage. In that case return the
+    # partial draft immediately; reviewer refines by hand.
     gaps = _ac_gap_refs(prd, testcases)
-    if gaps:
-        raise ValueError(f"LLM draft still leaves AC(s) uncovered: {gaps}")
+    total_acs = len(prd.get("acs") or []) or 1
+    retry_worth_it = 0 < len(gaps) <= max(3, total_acs * 4 // 10)
+    if gaps and retry_worth_it:
+        gap_ac_lines = "\n".join(
+            f"- {ac['ref']}: {ac['desc']}" for ac in prd["acs"] if ac["ref"] in gaps
+        )
+        existing_text = json.dumps(testcases, ensure_ascii=False, indent=2)
+        retry_prompt = (
+            f"{context}\n\n"
+            f"Project code: {project_code}\n\n"
+            f"Requirement {prd['ref']}: {prd.get('title', '')}\n{prd.get('detail', '')}\n\n"
+            f"Existing testcases (do NOT modify these; do NOT emit them again):\n{existing_text}\n\n"
+            f"UNCOVERED Acceptance Criteria — add ONE testcase per AC below "
+            f"even if the AC text is short/vague (treat vague ACs as sanity checks: "
+            f"e.g. \"Entry point\" → verify the flow's entry navigation reaches "
+            f"the expected screen). Every ref below MUST appear in a returned "
+            f"testcase's ac_refs:\n{gap_ac_lines}\n\n"
+            f"Return only the NEW testcases (deleted_refs=[])."
+        )
+        try:
+            retry_raw = _call_llm_json(
+                llm_fn, retry_prompt, _SYSTEM_PROMPT,
+                _max_tokens_for(len(testcases) + len(gaps)),
+            )
+            added = _validate_testcases(retry_raw.get("testcases") or [])
+            testcases = _merge_returned(testcases, added, retry_raw.get("deleted_refs"))
+            if retry_raw.get("summary"):
+                summary_text = (summary_text + " " + retry_raw["summary"]).strip()
+        except Exception:
+            # Retry itself failed — fall through with original gaps recorded.
+            pass
+        gaps = _ac_gap_refs(prd, testcases)
+
     return {
         "requirement_ref": requirement_ref,
         "project_id": project_id,
         "version": 1,
         "acs": prd["acs"],
         "testcases": testcases,
-        "summary": raw.get("summary", ""),
+        "summary": summary_text,
+        "coverage_gaps": gaps,
     }
 
 

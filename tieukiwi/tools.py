@@ -5,7 +5,7 @@ from html import unescape
 import httpx
 from anthropic import Anthropic
 
-from . import config, db, rag, testcase_gen
+from . import adf, config, confluence, db, jira_ingest, rag, testcase_gen
 
 _client = Anthropic(api_key=config.ANTHROPIC_API_KEY)
 
@@ -23,8 +23,10 @@ def gen_testcase(requirement_ref, project_id=None):
     testcase_gen.generate_draft — plain-chat use (no Slack Approve/Refine loop;
     that loop is driven directly from tieukiwi/slack_app.py, see docs/Gen-testcase-design.md).
     Returns a {"tool": "gen_testcase", "status": "error", "error": ...} dict (instead of
-    raising) if the requirement isn't found, the LLM leaves an AC uncovered, or the LLM
-    returns malformed/incomplete JSON — consistent with fetch_jira's error convention."""
+    raising) if the requirement isn't found or the LLM returns malformed/incomplete
+    JSON — consistent with fetch_jira's error convention. Partial coverage (some ACs
+    uncovered even after retry) is NOT an error: the draft is returned with a
+    non-empty `coverage_gaps` list so the caller can surface it."""
     try:
         return testcase_gen.generate_draft(requirement_ref, project_id=project_id)
     except (ValueError, KeyError) as e:
@@ -50,6 +52,17 @@ Phrase each ambiguity as a direct question the PO can answer inline, per the rub
 found, prioritize the rubric's "Top 3 PO Questions" first — missing/invalid data
 handling, feature-flag/rollout gating, and conflicting-requirement resolution — before
 filling remaining slots with other findings.
+
+Section scoping — the user message may include a block titled
+"## Other sections in this PRD (context only for conflict detection)" listing
+headings + a first line for other sections of the same PRD page. Treat that block
+as read-only reference material: ONLY emit ambiguities about the target section
+(the requirement text and any linked section BEFORE that block). For the
+"Conflicts" dimension, you MAY compare the target section against those outline
+items and flag contradictions — cite the specific other section in `gap` when you
+do. Never emit "Behaviour and Edge Cases" or "Constraints" ambiguities whose gap
+is entirely inside a context-only outline item; those belong to a different
+requirement's review.
 
 Return ONLY valid JSON (no prose, no markdown fences), exactly this shape:
 {"ambiguities": [{"dimension": "Behaviour and Edge Cases" | "Constraints" | "Conflicts", "question": "<direct question for the PO>", "gap": "<one-sentence description of what's missing>"}]}
@@ -258,24 +271,192 @@ def fetch_confluence_page(page_id):
     return _html_to_text(html) or None
 
 
-def expand_with_confluence(text):
-    """Append the body of any linked Confluence page(s) found in `text`.
+# Matches a full Confluence Cloud URL (with optional `#section-anchor`).
+# Used by expand_with_confluence to preserve the fragment — the old page-id-only
+# regex above dropped the anchor, which is what forced find_ambiguities to reason
+# over the ENTIRE PRD instead of the linked section.
+_CONFLUENCE_URL_RE = re.compile(
+    r"https?://[^/\s]+\.atlassian\.net/wiki/[^\s\)>\"'\]]+",
+)
 
-    Jira descriptions often link OUT to the real PRD (an inlineCard) instead of
-    containing it inline — see _adf_to_text. Without this, tools like
-    find_ambiguities only ever sees the label + URL, never the spec.
+# When emitting the "other sections" outline for conflict detection, cap each
+# section's first-line preview at this many chars so a paragraph-length lead
+# doesn't blow the ambiguity-checker's input past the model's context window.
+_OUTLINE_PREVIEW_MAX = 200
+
+
+def _fetch_confluence_body_pretty(page_id):
+    """Fetch a Confluence page body as pretty text with headings preserved
+    (`# Heading` markers). Uses the v2 ADF endpoint via confluence._confluence_get
+    so heading levels survive — needed by jira_ingest._slice_section, whose
+    heading regex looks for `^(#+)\s+`. Returns None on any failure (missing
+    config, HTTP error, unparseable ADF).
+
+    Kept SEPARATE from the legacy fetch_confluence_page (REST v1 storage HTML
+    → _html_to_text) so callers of that function are not affected.
+    """
+    if not (config.JIRA_BASE_URL and config.JIRA_EMAIL and config.JIRA_API_TOKEN):
+        return None
+    try:
+        page = confluence._confluence_get(
+            f"/api/v2/pages/{page_id}?body-format=atlas_doc_format"
+        )
+    except (httpx.HTTPError, RuntimeError):
+        return None
+    body_val = ((page.get("body") or {}).get("atlas_doc_format") or {}).get("value")
+    if isinstance(body_val, str):
+        try:
+            body_adf = json.loads(body_val)
+        except json.JSONDecodeError:
+            return None
+    elif isinstance(body_val, dict):
+        body_adf = body_val
+    else:
+        return None
+    return adf.to_pretty_text(body_adf) if body_adf else None
+
+
+def _other_headings_outline(body_text, target_heading_texts):
+    """Walk headings in `body_text`; emit an outline that lists every heading
+    EXCEPT ones in `target_heading_texts` (case-insensitive set), with the
+    first non-empty line under each as context. Cross-section conflict
+    detection needs to see 'section X says A, section Y says B' at the level
+    of facts stated in each section's lead paragraph — the full body of
+    non-target sections is dropped.
+    """
+    lines = body_text.splitlines()
+    targets_lower = {(t or "").strip().lower() for t in (target_heading_texts or ())}
+    out = []
+    heading_re = re.compile(r"^(#+)\s+(.*)")
+    i = 0
+    while i < len(lines):
+        m = heading_re.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        heading = m.group(2).strip()
+        level = len(m.group(1))
+        if heading.lower() in targets_lower:
+            # Skip everything inside a target section — it's already in the
+            # section body emitted separately. Advance past this heading's
+            # body up to the next heading (any level) so we don't re-emit
+            # its subsections in the outline.
+            i += 1
+            while i < len(lines) and not heading_re.match(lines[i]):
+                i += 1
+            continue
+        # Take the first non-empty content line under this heading.
+        j = i + 1
+        first_line = None
+        while j < len(lines):
+            if heading_re.match(lines[j]):
+                break
+            stripped = lines[j].strip()
+            if stripped:
+                first_line = stripped[:_OUTLINE_PREVIEW_MAX]
+                break
+            j += 1
+        prefix = "#" * level
+        out.append(f"{prefix} {heading}" + (f" — {first_line}" if first_line else ""))
+        i = j
+    return "\n".join(out)
+
+
+def _scope_to_sections(body_text, anchors):
+    """Slice a Confluence page body to ONE OR MORE linked sections.
+
+    Args:
+      body_text: pretty-text body of the page (headings preserved as `#`).
+      anchors: list of section-anchor slugs. Order preserved. `None` in the
+        list means "whole page requested via this URL" — dominates the rest
+        (returns full body, no outline).
+
+    Returns the concatenated target-section bodies + an outline block listing
+    every OTHER heading (excluding every target heading). Falls back to the
+    full body when no anchor resolves — safer than returning empty text.
+    """
+    if not body_text:
+        return body_text
+    if not anchors or None in anchors:
+        # A single anchorless URL for this page means the caller wants the
+        # whole thing. No outline needed since nothing is "other".
+        return body_text
+    target_bodies = []
+    target_headings = []
+    for anchor in anchors:
+        section_text, matched, heading_text = jira_ingest._slice_section(body_text, anchor)
+        if not matched:
+            continue
+        target_bodies.append(section_text)
+        if heading_text:
+            target_headings.append(heading_text)
+    if not target_bodies:
+        # Every anchor was stale — fall back to full body rather than
+        # returning an empty spec to the ambiguity checker.
+        return body_text
+    outline = _other_headings_outline(body_text, target_headings)
+    joined = "\n\n".join(target_bodies)
+    if not outline:
+        return joined
+    return (
+        f"{joined}\n\n"
+        "## Other sections in this PRD (context only for conflict detection)\n"
+        f"{outline}"
+    )
+
+
+def expand_with_confluence(text):
+    """Append the LINKED SECTION body of any Confluence page(s) referenced in
+    `text`, plus a heading+first-line outline of the page's other sections so
+    a downstream LLM can still surface cross-section conflicts without having
+    to reason about unrelated Requirements' content.
+
+    Jira descriptions often link OUT to the real PRD (an inlineCard, whose
+    URL includes a `#section-anchor` fragment pointing at THIS Requirement's
+    section) instead of containing it inline — see _adf_to_text. Without
+    this, tools like find_ambiguities only see the label + URL, never the
+    spec. Section-scoping (rather than full-page dumping) prevents the
+    ambiguity checker from emitting findings about other Requirements'
+    sections that happen to live on the same PRD page.
+
+    One Requirement can link MULTIPLE anchors on the SAME page (e.g. CDM-268
+    covers both §14 Duplicate script and §15 Assign new creator) — every
+    unique anchor per page is included in the target scope, not just the
+    first one seen.
     """
     if not text:
         return text
-    page_ids = list(dict.fromkeys(_CONFLUENCE_PAGE_RE.findall(text)))[:MAX_CONFLUENCE_LINKS]
+    # Group anchors by page while preserving first-seen order (both across
+    # pages and within a page's anchor list). `None` means "the URL had no
+    # #fragment" — kept distinct from a real anchor so _scope_to_sections
+    # can detect the whole-page-requested case.
+    anchors_by_page = {}
+    for url in _CONFLUENCE_URL_RE.findall(text):
+        parsed = adf.parse_confluence_url(url)
+        if not parsed:
+            continue
+        page_id = parsed["page_id"]
+        anchor = parsed.get("section_anchor")
+        anchors = anchors_by_page.setdefault(page_id, [])
+        if anchor not in anchors:
+            anchors.append(anchor)
     parts = [text]
-    for page_id in page_ids:
+    for i, (page_id, anchors) in enumerate(anchors_by_page.items()):
+        if i >= MAX_CONFLUENCE_LINKS:
+            break
         try:
-            body = fetch_confluence_page(page_id)
+            body_text = _fetch_confluence_body_pretty(page_id)
         except Exception:
-            body = None
-        if body:
-            parts.append(f"## Linked Confluence page ({page_id})\n{body}")
+            body_text = None
+        if not body_text:
+            continue
+        scoped = _scope_to_sections(body_text, anchors)
+        anchor_labels = [a for a in anchors if a]
+        header = f"## Linked Confluence page ({page_id}"
+        if anchor_labels:
+            header += ", sections " + ", ".join(f"'{a}'" for a in anchor_labels)
+        header += ")"
+        parts.append(f"{header}\n{scoped}")
     return "\n\n".join(parts)
 
 
@@ -400,6 +581,36 @@ TOOLS = [
     },
   },
   {
+    "name": "impact_from_jira",
+    "description": (
+        "QE blast radius for a whole Jira ticket (Requirement) — aggregates "
+        "`feature_blast_radius` across EVERY Component the Requirement declares "
+        "`impacts` on. Use when the user asks 'CDM-268 impact gì?', 'what "
+        "should QE plan for <ticket>?', 'nếu ship ticket này thì risk ở đâu?'. "
+        "Returns: target_components (declared impacts — the features THIS "
+        "ticket ships/changes), at_risk_components (transitive dependents), "
+        "at_risk_requirements (OTHER tickets sharing components — regression "
+        "risk), affected ACs + TestCases, and self_coverage_gap (ACs on this "
+        "ticket without TestCase coverage). When you report the answer, list "
+        "EVERY entry in target_components AND at_risk_components with ref + "
+        "name — target items are the scope QE needs to plan for; never drop "
+        "them assuming the user already knows. If the Requirement has no "
+        "`impacts` edges the response includes a `warning` — surface it "
+        "verbatim, do NOT invent components."
+    ),
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "jira_ref": {
+          "type": "string",
+          "description": "Jira ticket ref, e.g. 'CDM-268'. Must be a Requirement "
+                         "already ingested via ingest_jira_ticket.",
+        },
+      },
+      "required": ["jira_ref"],
+    },
+  },
+  {
     "name": "code_impact",
     "description": (
         "Impact analysis for a code change (e.g. an MR diff): given a list of "
@@ -407,7 +618,8 @@ TOOLS = [
         "Components, Requirements, and AcceptanceCriteria might be affected. "
         "Walks the code graph (imports/calls/references) to find transitive "
         "consumers, then joins to Component ownership and Component dependsOn "
-        "closure. Use this to answer 'what should I re-test for this MR?'."
+        "closure. Use this to answer 'what should I re-test for this MR?'.If you have not a code diff instead, "
+        "use `feature_blast_radius`"
     ),
     "input_schema": {
       "type": "object",
@@ -621,6 +833,8 @@ def run_tool(name, args, context=None):
         )
     if name == "feature_blast_radius":
         return db.feature_blast_radius(args["component_ref"], project_id=project_id)
+    if name == "impact_from_jira":
+        return db.impact_from_jira(args["jira_ref"], project_id=project_id)
     if name == "code_impact":
         return db.code_impact(
             args["files"],

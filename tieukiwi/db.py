@@ -273,6 +273,38 @@ def count_acs(req_node_id):
         return row[0] if row else 0
 
 
+def count_acs_by_anchor(req_node_id, section_anchor):
+    """Return AC count for a Requirement scoped to one BRD section anchor.
+
+    Same semantics as count_acs() but keyed on props_json->>'section_anchor'.
+    Lets ingest gate per (page, anchor) instead of per-Requirement — needed
+    when one Requirement links to multiple sections of the SAME BRD page
+    (URL#14 + URL#15 case): the second section's extraction must not be
+    skipped just because the first section already produced ACs.
+
+    When section_anchor is None, falls back to counting anchor-less ACs
+    (whole-doc extractions).
+    """
+    with conn() as c:
+        if section_anchor is None:
+            row = c.execute(
+                "SELECT count(*) FROM nodes ac "
+                "JOIN edges e ON e.dst_id=ac.id AND e.rel='has' "
+                "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion' "
+                "AND (ac.props_json->>'section_anchor') IS NULL",
+                (req_node_id,),
+            ).fetchone()
+        else:
+            row = c.execute(
+                "SELECT count(*) FROM nodes ac "
+                "JOIN edges e ON e.dst_id=ac.id AND e.rel='has' "
+                "WHERE e.src_id=%s AND ac.type='AcceptanceCriterion' "
+                "AND ac.props_json->>'section_anchor' = %s",
+                (req_node_id, section_anchor),
+            ).fetchone()
+        return row[0] if row else 0
+
+
 def linked_brds(src_id):
     """Return BRD nodes reachable via `src -derivedFrom-> BRD`.
 
@@ -892,6 +924,228 @@ def feature_blast_radius(component_ref, project_id=None):
             "requirements": {s: sum(1 for r in req_list  if r["severity"] == s) for s in ("high","medium","low")},
             "acs":          {s: sum(1 for a in ac_list   if a["severity"] == s) for s in ("high","medium","low")},
             "testcases":    {s: sum(1 for t in tc_list   if t["severity"] == s) for s in ("high","medium","low")},
+        },
+    }
+
+
+def impact_from_jira(jira_ref, project_id=None):
+    """Impact analysis starting from a Jira ticket (Requirement), aggregating
+    over every Component the Requirement declares `impacts` on.
+
+    Answers: "For CDM-268, what's the total QE blast radius?" Walks:
+      - target Components:    every Component `impacts`-linked to the Requirement.
+      - at-risk Components:   Components that `dependsOn` any target (transitively).
+      - at-risk Requirements: OTHER Requirements impacting ANY Component in the
+                              closure — signals cross-feature regression risk.
+      - ACs / TestCases:      self ACs + at-risk req ACs + their TCs.
+
+    Severity:
+      - target Components:               HIGH
+      - direct dependents (dep=1):       HIGH
+      - transitive dependents (dep>1):   MEDIUM
+      - Requirements/ACs/TCs:            inherit MAX severity of Components they touch;
+                                         self-Req + its ACs pinned HIGH.
+
+    Contract with `impacts_map.yml`: this tool is USELESS if the Requirement has
+    no `impacts` edges. Returns a `warning` in that case so the caller (agent /
+    Slack) can prompt for map seeding instead of silently returning empty.
+    """
+    _sev_rank = {"high": 3, "medium": 2, "low": 1}
+    with conn() as c:
+        sql = "SELECT id, ref, props_json->>'title' FROM nodes WHERE type='Requirement' AND ref=%s"
+        params = [jira_ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"; params.append(project_id)
+        row = c.execute(sql, params).fetchone()
+        if not row:
+            return {"requirement": {"ref": jira_ref, "title": None},
+                    "target_components": [], "at_risk_components": [],
+                    "at_risk_requirements": [], "affected_acs": [],
+                    "affected_testcases": [], "self_coverage_gap": [],
+                    "severity_counts": {"components": {"high":0,"medium":0,"low":0},
+                                        "requirements": {"high":0,"medium":0,"low":0},
+                                        "acs":          {"high":0,"medium":0,"low":0},
+                                        "testcases":    {"high":0,"medium":0,"low":0}},
+                    "warning": f"No Requirement found with ref={jira_ref}"
+                               + (f" in project {project_id}" if project_id else "")}
+        req_id, req_ref, req_title = row
+
+        # Target Components — every `impacts`-linked Component of this Requirement.
+        rows = c.execute(
+            """
+            SELECT n.id, n.ref, n.props_json->>'name'
+              FROM edges e
+              JOIN nodes n ON n.id = e.dst_id
+             WHERE e.src_id = %s AND e.rel = 'impacts' AND n.type = 'Component'
+                   """ + ("AND n.project_id = %s" if project_id else "") + """
+             ORDER BY n.ref
+            """,
+            ([req_id, project_id] if project_id else [req_id]),
+        ).fetchall()
+        target_comp_ids = [r[0] for r in rows]
+        target_comp_meta = {r[0]: {"ref": r[1], "name": r[2]} for r in rows}
+
+        if not target_comp_ids:
+            # Bail early with a directive warning so the caller can guide the user.
+            return {"requirement": {"ref": req_ref, "title": req_title},
+                    "target_components": [], "at_risk_components": [],
+                    "at_risk_requirements": [], "affected_acs": [],
+                    "affected_testcases": [], "self_coverage_gap": [],
+                    "severity_counts": {"components": {"high":0,"medium":0,"low":0},
+                                        "requirements": {"high":0,"medium":0,"low":0},
+                                        "acs":          {"high":0,"medium":0,"low":0},
+                                        "testcases":    {"high":0,"medium":0,"low":0}},
+                    "warning": (f"Requirement {req_ref} has no `impacts` edges. "
+                                f"Seed data_ingestion/impacts_map.yml with the Components "
+                                f"this Requirement scopes, then run "
+                                f"`python scripts/ingest/impacts.py` and retry.")}
+
+        # dep_closure — walk INCOMING dependsOn edges from every target (multi-seed).
+        # Result: {comp_id: min_dep_depth_from_any_target}
+        rows = c.execute(
+            """
+            WITH RECURSIVE dep_closure(comp_id, d) AS (
+              SELECT id::bigint, 0 FROM nodes WHERE id = ANY(%s)
+              UNION
+              SELECT e.src_id, dc.d + 1
+                FROM dep_closure dc
+                JOIN edges e ON e.dst_id = dc.comp_id AND e.rel = 'dependsOn'
+               WHERE dc.d < 5
+            )
+            SELECT DISTINCT n.id, n.ref, n.props_json->>'name', MIN(dc.d)
+              FROM dep_closure dc
+              JOIN nodes n ON n.id = dc.comp_id
+             WHERE n.type = 'Component'
+                   """ + ("AND n.project_id = %s" if project_id else "") + """
+             GROUP BY n.id, n.ref, n.props_json->>'name'
+             ORDER BY MIN(dc.d), n.ref
+            """,
+            ([target_comp_ids, project_id] if project_id else [target_comp_ids]),
+        ).fetchall()
+        all_comp = {}
+        for cid, cref, cname, dep_d in rows:
+            is_target = cid in target_comp_meta
+            all_comp[cid] = {
+                "id": cid, "ref": cref, "name": cname,
+                "severity": "high" if (is_target or dep_d <= 1) else "medium",
+                "via": "target" if is_target else "dependsOn",
+                "dep_depth": dep_d,
+            }
+
+        # At-risk Requirements — OTHER Requirements impacting any Component in closure.
+        # Exclude self so the caller sees external regression risk only.
+        comp_ids = list(all_comp.keys())
+        rows = c.execute(
+            """
+            SELECT r.id, r.ref, r.props_json->>'title', e.dst_id
+              FROM nodes r
+              JOIN edges e ON e.src_id = r.id AND e.rel = 'impacts' AND e.dst_id = ANY(%s)
+             WHERE r.type = 'Requirement' AND r.id <> %s
+                   """ + ("AND r.project_id = %s" if project_id else "") + """
+            """,
+            ([comp_ids, req_id, project_id] if project_id else [comp_ids, req_id]),
+        ).fetchall()
+        at_risk_reqs = {}
+        for rid, rref, rtitle, comp_id in rows:
+            entry = at_risk_reqs.setdefault(rid, {
+                "id": rid, "ref": rref, "title": rtitle,
+                "impacted_components": [], "severity": "low",
+            })
+            csev = all_comp[comp_id]["severity"]
+            entry["impacted_components"].append(all_comp[comp_id]["ref"])
+            if _sev_rank[csev] > _sev_rank[entry["severity"]]:
+                entry["severity"] = csev
+
+        # ACs — self Requirement (severity HIGH) + at-risk Requirements (inherit).
+        acs_by_id = {}
+        req_scope_ids = [req_id] + list(at_risk_reqs.keys())
+        sev_by_req = {req_id: "high"}
+        ref_by_req = {req_id: req_ref}
+        for r in at_risk_reqs.values():
+            sev_by_req[r["id"]] = r["severity"]
+            ref_by_req[r["id"]] = r["ref"]
+        rows = c.execute(
+            """
+            SELECT a.id, a.ref, a.props_json->>'title', e.src_id
+              FROM nodes a
+              JOIN edges e ON e.dst_id = a.id AND e.rel = 'has' AND e.src_id = ANY(%s)
+             WHERE a.type = 'AcceptanceCriterion'
+                   """ + ("AND a.project_id = %s" if project_id else "") + """
+            """,
+            ([req_scope_ids, project_id] if project_id else [req_scope_ids]),
+        ).fetchall()
+        self_ac_ids = set()
+        for aid, aref, atitle, rid in rows:
+            acs_by_id.setdefault(aid, {
+                "id": aid, "ref": aref, "title": atitle,
+                "severity": sev_by_req[rid],
+                "parent_requirement": ref_by_req[rid],
+            })
+            if rid == req_id:
+                self_ac_ids.add(aid)
+
+        # TestCases — coveredBy the collected ACs. Also track which self ACs have
+        # zero TestCase coverage for the `self_coverage_gap` bucket.
+        tcs_by_id = {}
+        covered_self_ac_ids = set()
+        if acs_by_id:
+            ac_ids = list(acs_by_id.keys())
+            sev_by_ac = {a["id"]: a["severity"] for a in acs_by_id.values()}
+            ref_by_ac = {a["id"]: a["ref"]      for a in acs_by_id.values()}
+            rows = c.execute(
+                """
+                SELECT t.id, t.ref, t.props_json->>'title', t.props_json->>'priority', e.src_id
+                  FROM nodes t
+                  JOIN edges e ON e.dst_id = t.id AND e.rel = 'coveredBy' AND e.src_id = ANY(%s)
+                 WHERE t.type = 'TestCase'
+                       """ + ("AND t.project_id = %s" if project_id else "") + """
+                """,
+                ([ac_ids, project_id] if project_id else [ac_ids]),
+            ).fetchall()
+            for tid, tref, ttitle, tprio, ac_id in rows:
+                entry = tcs_by_id.setdefault(tid, {
+                    "id": tid, "ref": tref, "title": ttitle,
+                    "priority": tprio,
+                    "severity": sev_by_ac[ac_id],
+                    "covers_acs": [],
+                })
+                entry["covers_acs"].append(ref_by_ac[ac_id])
+                asev = sev_by_ac[ac_id]
+                if _sev_rank[asev] > _sev_rank[entry["severity"]]:
+                    entry["severity"] = asev
+                if ac_id in self_ac_ids:
+                    covered_self_ac_ids.add(ac_id)
+
+    self_gap = [
+        {"ref": v["ref"], "title": v["title"]}
+        for k, v in acs_by_id.items()
+        if k in self_ac_ids and k not in covered_self_ac_ids
+    ]
+
+    def _sev_key(x): return (-_sev_rank[x["severity"]], x.get("ref", ""))
+    def _strip(x): return {k: v for k, v in x.items() if k != "id"}
+
+    target_list = sorted(
+        [v for v in all_comp.values() if v["via"] == "target"], key=_sev_key)
+    at_risk_comp_list = sorted(
+        [v for v in all_comp.values() if v["via"] == "dependsOn"], key=_sev_key)
+    req_list = sorted(at_risk_reqs.values(), key=_sev_key)
+    ac_list  = sorted(acs_by_id.values(), key=_sev_key)
+    tc_list  = sorted(tcs_by_id.values(), key=_sev_key)
+
+    return {
+        "requirement":            {"ref": req_ref, "title": req_title},
+        "target_components":      [_strip(v) for v in target_list],
+        "at_risk_components":     [_strip(v) for v in at_risk_comp_list],
+        "at_risk_requirements":   [_strip(r) for r in req_list],
+        "affected_acs":           [_strip(a) for a in ac_list],
+        "affected_testcases":     [_strip(t) for t in tc_list],
+        "self_coverage_gap":      self_gap,
+        "severity_counts": {
+            "components":   {s: sum(1 for v in all_comp.values() if v["severity"] == s) for s in ("high","medium","low")},
+            "requirements": {s: sum(1 for r in req_list if r["severity"] == s) for s in ("high","medium","low")},
+            "acs":          {s: sum(1 for a in ac_list  if a["severity"] == s) for s in ("high","medium","low")},
+            "testcases":    {s: sum(1 for t in tc_list  if t["severity"] == s) for s in ("high","medium","low")},
         },
     }
 

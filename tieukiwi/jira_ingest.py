@@ -505,37 +505,40 @@ Rules:
 _MAX_AC_INPUT_CHARS = 60000  # cap prompt so a huge PRD doesn't blow the LLM window
 
 # Explicit AC markers PMs use in Confluence PRDs. Matches:
-#   AC1: ...            AC-01: ...           AC 1. ...
-#   CC1: ...            CC-01: ...           (corner-case sub-ACs)
-# Kept intentionally strict — leading anchor + digit + colon/period — so
-# arbitrary "abc:" lines are not mistaken for AC markers.
-_AC_MARKER_RE = re.compile(
-    # Optional bullet prefix ([-*•]) — PMs often nest CCs as bullets under
-    # a parent AC. We treat CC1..N as their own ACs so QE can trace coverage
-    # per corner case.
-    r"^\s*[-*•]?\s*(AC|CC)[- ]?(\d{1,3})\s*[:\.]\s*(.+?)\s*$",
-    re.MULTILINE | re.IGNORECASE,
-)
-
-
-def _extract_acs_by_regex(section_text):
-    """Deterministic AC extraction for PRDs that use explicit markers.
-
-    Each AC's description is the marker line ONLY — the text after `ACn:` /
-    `CCn:` on the same line. Sub-bullets, tables, and continuation lines
-    below the marker are intentionally NOT concatenated, so the AC stays a
-    single-line testable statement (matches how QE reads them in the doc).
-
-    Returns:
-      list[str]: extracted AC titles (empty when no markers found —
-                 caller may fall back to LLM extraction).
-    """
-    if not section_text:
-        return []
-    matches = list(_AC_MARKER_RE.finditer(section_text))
-    if not matches:
-        return []
-    return [m.group(3).strip()[:500] for m in matches]
+# NOTE: The regex fast-path (`_AC_MARKER_RE` + `_extract_acs_by_regex`) was
+# disabled 2026-07-14 — it extracted section headings as ACs on PRDs that
+# didn't use disciplined AC1:/CC1: markers, poisoning coverage checks. AC
+# extraction now runs LLM-only, matching master behaviour. Code is kept
+# commented (not deleted) so it can be re-enabled if PRD marker discipline
+# improves.
+#
+# _AC_MARKER_RE = re.compile(
+#     # Optional bullet prefix ([-*•]) — PMs often nest CCs as bullets under
+#     # a parent AC. We treat CC1..N as their own ACs so QE can trace coverage
+#     # per corner case.
+#     r"^\s*[-*•]?\s*(AC|CC)[- ]?(\d{1,3})\s*[:\.]\s*(.+?)\s*$",
+#     re.MULTILINE | re.IGNORECASE,
+# )
+#
+#
+# def _extract_acs_by_regex(section_text):
+#     """Deterministic AC extraction for PRDs that use explicit markers.
+#
+#     Each AC's description is the marker line ONLY — the text after `ACn:` /
+#     `CCn:` on the same line. Sub-bullets, tables, and continuation lines
+#     below the marker are intentionally NOT concatenated, so the AC stays a
+#     single-line testable statement (matches how QE reads them in the doc).
+#
+#     Returns:
+#       list[str]: extracted AC titles (empty when no markers found —
+#                  caller may fall back to LLM extraction).
+#     """
+#     if not section_text:
+#         return []
+#     matches = list(_AC_MARKER_RE.finditer(section_text))
+#     if not matches:
+#         return []
+#     return [m.group(3).strip()[:500] for m in matches]
 
 
 def _slice_section(body_text, section_anchor):
@@ -601,10 +604,14 @@ def _slice_section(body_text, section_anchor):
 def extract_acs_via_llm(brd_text, section_anchor=None):
     """Ask the ingestion LLM to extract ACs from a PRD section.
 
-    Returns (acs: list[str], warnings: list[str], section_title: str|None).
+    Returns (acs: list[str], warnings: list[str], section_title: str|None,
+             method: str|None).
     section_title = the actual heading line matched in the PRD, so callers
     can store it on AC nodes for query-by-feature. None when no anchor was
     supplied OR when the anchor didn't match any heading.
+    method = "regex" (deterministic marker match) | "llm" (free-form section)
+             | None (nothing extracted). Caller stamps this on each AC's
+             _meta.extraction_source so provenance stays accurate.
 
     Warnings surface silent failure modes (anchor miss, truncation, LLM
     error, empty output).
@@ -618,15 +625,17 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
             "extract từ toàn bộ doc (có thể miss/nhiễu). Check heading text trên Confluence."
         )
 
-    # Fast path: PRD uses explicit AC markers (AC1:, CC1:, ...). Deterministic,
-    # no LLM cost, no over-splitting. Only fall through to LLM when the doc
-    # has zero markers (free-flowing prose).
-    regex_acs = _extract_acs_by_regex(section_text)
-    if regex_acs:
-        warnings.append(
-            f"[regex] Extracted {len(regex_acs)} AC(s) via explicit ACn:/CCn: markers — LLM skipped."
-        )
-        return (regex_acs, warnings, section_title)
+    # Fast path (DISABLED 2026-07-14 — kept commented for future re-enable):
+    # PRD uses explicit AC markers (AC1:, CC1:, ...) → deterministic regex
+    # skip LLM. Turned off because most PRDs don't use disciplined markers and
+    # the regex was pulling section headings ("Entry point") as ACs.
+    #
+    # regex_acs = _extract_acs_by_regex(section_text)
+    # if regex_acs:
+    #     warnings.append(
+    #         f"[regex] Extracted {len(regex_acs)} AC(s) via explicit ACn:/CCn: markers — LLM skipped."
+    #     )
+    #     return (regex_acs, warnings, section_title, "regex")
 
     if len(section_text) > _MAX_AC_INPUT_CHARS:
         warnings.append(
@@ -636,13 +645,13 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
         section_text = section_text[:_MAX_AC_INPUT_CHARS] + "\n\n[...truncated for LLM window...]"
     if not section_text.strip():
         warnings.append("PRD section rỗng sau khi slice — không có gì để extract.")
-        return ([], warnings, section_title)
+        return ([], warnings, section_title, None)
     try:
         data = complete_json(section_text, system=_AC_EXTRACT_SYSTEM,
                              max_tokens=2000, temperature=0.1)
     except Exception as e:
         warnings.append(f"LLM extract AC fail: {e}")
-        return ([], warnings, section_title)
+        return ([], warnings, section_title, None)
     acs = data.get("acceptance_criteria") or []
     out = []
     for ac in acs:
@@ -653,7 +662,8 @@ def extract_acs_via_llm(brd_text, section_anchor=None):
     if not out:
         warnings.append("LLM chạy xong nhưng trả về 0 AC — có thể section không có AC rõ ràng "
                         "hoặc anchor match sai heading.")
-    return (out, warnings, section_title)
+        return (out, warnings, section_title, None)
+    return (out, warnings, section_title, "llm")
 
 
 # --- Orchestrator ---------------------------------------------------------
@@ -843,11 +853,17 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
             # Re-run when:
             #   - BRD content just changed (status="ok" → fresh chunks indexed)
             #   - force=True (user explicitly refresh)
-            #   - Requirement has 0 ACs (previous extraction failed silently)
-            # Skip only when: content unchanged AND ACs already exist.
+            #   - Requirement has 0 ACs FOR THIS ANCHOR (previous extraction
+            #     failed silently, OR this anchor was never extracted — the
+            #     latter matters when one Requirement links to multiple
+            #     sections of the SAME page: without anchor-scoping the second
+            #     section is skipped just because the first produced ACs).
+            # Skip only when: content unchanged AND ACs already exist for
+            # THIS anchor scope.
             should_extract = extract_acs and cf_result.get("status") in ("ok", "cached")
             if should_extract and cf_result.get("status") == "cached":
-                if not force and db.count_acs(req_node_id) > 0:
+                gate_anchor = unquote(section_anchor) if section_anchor else None
+                if not force and db.count_acs_by_anchor(req_node_id, gate_anchor) > 0:
                     should_extract = False
             if should_extract:
                 brd_node = db.get_node_by_ref("BRD", f"CFL-{page_id}", project_id=project_id)
@@ -855,7 +871,7 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
                     # rag stored the full text as chunks; we don't have raw text.
                     # Re-derive by asking Chroma or refetch. Cheapest: refetch once.
                     _sub(f"LLM tách Acceptance Criteria từ BRD (page {page_id})…")
-                    ac_texts, ac_warnings, section_title = _extract_acs_for_page(
+                    ac_texts, ac_warnings, section_title, ac_method = _extract_acs_for_page(
                         page_id, section_anchor
                     )
                     summary["warnings"].extend(ac_warnings)
@@ -870,6 +886,7 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
                             "source_url": page_url,
                             "section_anchor": decoded_anchor,
                             "section_title": section_title,
+                            "extraction_method": ac_method,
                         })
 
     if any_extract_ran:
@@ -932,6 +949,21 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
     old_bug_hashes = (existing_req.get("props_json") or {}).get("bug_container_hashes") or {}
     new_bug_hashes = dict(old_bug_hashes)   # copy — mutated when we (re-)parse
 
+    # Bugs inherit their parent Story's `impacts` Components as `affects` — a
+    # bug under Story X is by definition a defect in one of the Components X
+    # is scoped to. If impacts_map.yml hasn't seeded the parent yet, this is
+    # empty and bug_blast_radius will return P4 until the mapping is added.
+    req_component_ids = []
+    if existing_req.get("id"):
+        with db.conn() as _c:
+            req_component_ids = [
+                r[0] for r in _c.execute(
+                    "SELECT e.dst_id FROM edges e JOIN nodes c ON c.id=e.dst_id "
+                    "WHERE e.src_id=%s AND e.rel='impacts' AND c.type='Component'",
+                    (existing_req["id"],),
+                ).fetchall()
+            ]
+
     self_test_tr_id = testrun_by_env.get("self")
     for st_key, st_summary in bug_container_stubs:
         _sub(f"Parse bảng bug trong subtask {st_key}…")
@@ -955,7 +987,8 @@ def ingest_jira_ticket(issue_key, project_id=None, extract_acs=True, on_step=Non
 
         bugs_raw = parse_bug_subtask_table(desc_adf)
         bug_nodes = _upsert_bugs_from_table(
-            st_key, st_summary, req_key, bugs_raw, project_id, component_ids=[],
+            st_key, st_summary, req_key, bugs_raw, project_id,
+            component_ids=req_component_ids,
         )
         # Team convention: find_by=Testcase means QE's self-test caught it →
         # add TR_self -finds-> Bug so classify_bug returns caught_by_test.
@@ -1042,6 +1075,10 @@ def _diff_and_upsert_acs(new_acs, req_node_id, req_key, project_id):
         source_url = ac.get("source_url")
         section_anchor = ac.get("section_anchor")
         section_title = ac.get("section_title")
+        # Extraction method comes from _extract_acs_for_page — "regex" for
+        # explicit-marker docs (deterministic, confidence 1.0), "llm" for
+        # free-form sections (confidence 0.75). Missing key = legacy default.
+        method = ac.get("extraction_method") or "llm"
         h = _ac_content_hash(desc)
         ref = f"AC-{req_key}-{h}"
         if ref in seen_refs:
@@ -1057,8 +1094,8 @@ def _diff_and_upsert_acs(new_acs, req_node_id, req_key, project_id):
         new_props = {
             "desc": desc,
             "_meta": {
-                "extraction_source": "llm",
-                "confidence": 0.75,
+                "extraction_source": method,
+                "confidence": 1.0 if method == "regex" else 0.75,
                 "source_file": source_url,
                 "review_status": "draft",
                 "ingested_at": _now_iso(),
@@ -1103,7 +1140,8 @@ def _diff_and_upsert_acs(new_acs, req_node_id, req_key, project_id):
 def _extract_acs_for_page(page_id, section_anchor):
     """Helper: re-fetch page body and hand to LLM for AC extraction.
 
-    Returns (acs: list[str], warnings: list[str], section_title: str|None).
+    Returns (acs: list[str], warnings: list[str], section_title: str|None,
+             method: str|None). See extract_acs_via_llm for method semantics.
     Propagates warnings from extract_acs_via_llm plus surfaces fetch/parse
     failures. section_title = the matched PRD heading, for storing on the AC.
     """
@@ -1112,14 +1150,156 @@ def _extract_acs_for_page(page_id, section_anchor):
             f"/api/v2/pages/{page_id}?body-format=atlas_doc_format"
         )
     except (httpx.HTTPError, RuntimeError) as e:
-        return ([], [f"Confluence fetch page {page_id} fail: {e}"], None)
+        return ([], [f"Confluence fetch page {page_id} fail: {e}"], None, None)
     body_val = ((page.get("body") or {}).get("atlas_doc_format") or {}).get("value")
     if isinstance(body_val, str):
         try:
             body_adf = json.loads(body_val)
         except json.JSONDecodeError:
-            return ([], [f"Confluence page {page_id}: ADF body không parse được."], None)
+            return ([], [f"Confluence page {page_id}: ADF body không parse được."], None, None)
     else:
         body_adf = body_val
     body_text = adf.to_pretty_text(body_adf) if body_adf else ""
     return extract_acs_via_llm(body_text, section_anchor)
+
+
+# --- TestRun status sync + TC↔TR linker ---------------------------------
+
+_JIRA_STATUS_MAP = {
+    "done": "done", "closed": "done", "fixed": "done", "resolved": "done",
+    "open": "open", "todo": "open", "to do": "open", "backlog": "open",
+    "inprogress": "inprogress", "in progress": "inprogress",
+    "in_progress": "inprogress", "doing": "inprogress",
+    "blocked": "blocked",
+}
+
+
+def _normalise_jira_status(raw):
+    if not raw:
+        return None
+    return _JIRA_STATUS_MAP.get(raw.strip().lower(), raw.strip().lower())
+
+
+def sync_testruns_and_link_tcs(requirement_ref, project_id=None):
+    """Refresh live Jira status for every TestRun of a Requirement, and when a
+    TR flips to 'done' ensure `executedBy` edges from every TestCase covering
+    that Requirement's ACs → the TR (ontology: TC -executedBy-> TR).
+
+    Steps per TR (identified by `jira_parent_ref == requirement_ref`):
+      1. Fetch Jira live via `fetch_jira_issue(jira_key)`.
+      2. Normalise Jira status (Done/Closed/Fixed/Resolved → 'done', ...).
+      3. Merge {status: <new>} into the TR node's props_json (partial update
+         via upsert_node_by_ref merge_props — preserves environment/title/etc).
+      4. If normalised status == 'done': for every TestCase reachable via
+         Requirement -has-> AC -coveredBy-> TC, `ensure_edge(tc.id, 'executedBy',
+         tr.id)` — idempotent (dedupes on re-run).
+
+    Returns:
+      {"requirement_ref": ..., "project_id": ..., "testruns": [{
+          "ref": "TR-CDM-289", "jira_key": "CDM-289", "environment": "prod",
+          "old_status": "pending", "new_status": "done",
+          "edges_added": 3, "linked_tc_refs": ["CDM_Login_001", ...]
+      }], "warnings": [...]}
+    """
+    warnings = []
+    with db.conn() as c:
+        # 1. Find every TestRun of this Requirement (via stored jira_parent_ref).
+        sql = (
+            "SELECT id, ref, props_json FROM nodes "
+            "WHERE type='TestRun' AND props_json->>'jira_parent_ref'=%s"
+        )
+        params = [requirement_ref]
+        if project_id is not None:
+            sql += " AND project_id=%s"
+            params.append(project_id)
+        sql += " ORDER BY ref"
+        tr_rows = c.execute(sql, params).fetchall()
+
+        # 2. Find every TestCase covering any AC of this Requirement — done once
+        #    per call so multiple TRs share the same TC set (no redundant lookups).
+        tc_rows = c.execute(
+            """
+            SELECT DISTINCT tc.id, tc.ref FROM nodes tc
+            JOIN edges cov ON cov.dst_id = tc.id AND cov.rel = 'coveredBy'
+            JOIN nodes ac ON ac.id = cov.src_id AND ac.type = 'AcceptanceCriterion'
+            JOIN edges h ON h.dst_id = ac.id AND h.rel = 'has'
+            JOIN nodes req ON req.id = h.src_id AND req.type = 'Requirement' AND req.ref = %s
+            WHERE tc.type = 'TestCase'
+            ORDER BY tc.ref
+            """,
+            (requirement_ref,),
+        ).fetchall()
+    tc_pairs = [(tc_id, tc_ref) for tc_id, tc_ref in tc_rows]
+
+    out_testruns = []
+    for tr_id, tr_ref, tr_props in tr_rows:
+        tr_props = tr_props or {}
+        jira_key = tr_props.get("jira_key")
+        environment = tr_props.get("environment")
+        old_status = tr_props.get("status")
+        if not jira_key:
+            warnings.append(
+                f"{tr_ref}: missing props.jira_key — cannot fetch live status."
+            )
+            out_testruns.append({
+                "ref": tr_ref, "jira_key": None, "environment": environment,
+                "old_status": old_status, "new_status": old_status,
+                "edges_added": 0, "linked_tc_refs": [],
+            })
+            continue
+
+        try:
+            issue = fetch_jira_issue(jira_key, expand_subtasks=False)
+        except (httpx.HTTPError, RuntimeError) as e:
+            warnings.append(f"{tr_ref}: Jira fetch failed for {jira_key}: {e}")
+            out_testruns.append({
+                "ref": tr_ref, "jira_key": jira_key, "environment": environment,
+                "old_status": old_status, "new_status": old_status,
+                "edges_added": 0, "linked_tc_refs": [],
+            })
+            continue
+
+        raw_status = ((issue.get("fields") or {}).get("status") or {}).get("name")
+        new_status = _normalise_jira_status(raw_status) or old_status
+
+        if new_status and new_status != old_status:
+            db.upsert_node_by_ref(
+                "TestRun", tr_ref, {"status": new_status},
+                project_id=project_id, merge_props=True,
+            )
+
+        edges_added = 0
+        linked_tc_refs = []
+        if new_status == "done" and tc_pairs:
+            tc_ids = [tc_id for tc_id, _ in tc_pairs]
+            with db.conn() as c:
+                existing = {
+                    row[0] for row in c.execute(
+                        "SELECT src_id FROM edges "
+                        "WHERE rel='executedBy' AND dst_id=%s AND src_id = ANY(%s)",
+                        (tr_id, tc_ids),
+                    ).fetchall()
+                }
+                missing = [(tc_id, tc_ref) for tc_id, tc_ref in tc_pairs
+                           if tc_id not in existing]
+                if missing:
+                    c.executemany(
+                        "INSERT INTO edges(src_id, rel, dst_id, props_json) "
+                        "VALUES (%s,'executedBy',%s,'{}'::jsonb)",
+                        [(tc_id, tr_id) for tc_id, _ in missing],
+                    )
+            edges_added = len(missing)
+            linked_tc_refs = [tc_ref for _, tc_ref in tc_pairs]
+
+        out_testruns.append({
+            "ref": tr_ref, "jira_key": jira_key, "environment": environment,
+            "old_status": old_status, "new_status": new_status,
+            "edges_added": edges_added, "linked_tc_refs": linked_tc_refs,
+        })
+
+    return {
+        "requirement_ref": requirement_ref,
+        "project_id": project_id,
+        "testruns": out_testruns,
+        "warnings": warnings,
+    }

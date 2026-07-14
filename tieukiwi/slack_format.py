@@ -475,7 +475,17 @@ render_report = _render
 def _plain(text):
     out = []
     for ln in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        if _HR.match(ln) or ("|" in ln and ln.strip().startswith("|")):
+        if _HR.match(ln):
+            continue
+        stripped = ln.strip()
+        if "|" in ln and stripped.startswith("|"):
+            cells = _cells(ln)
+            if _is_sep(cells):
+                continue
+            cells = [c for c in cells if c]
+            if not cells:
+                continue
+            out.append("• " + " — ".join(cells))
             continue
         ln = re.sub(r"\*\*(.+?)\*\*", r"*\1*", ln)
         ln = re.sub(r"__(.+?)__", r"*\1*", ln)
@@ -716,7 +726,25 @@ def _ac_list_selftest():
     return out
 
 
+def _plain_table_selftest():
+    src = (
+        ":jigsaw: *Components (2)*\n"
+        "| Ref | Component |\n"
+        "|---|---|\n"
+        "| COMP-CDM-AUTH | Authentication |\n"
+        "| COMP-CDM-OFFER-CREATOR | Offer — Creator Side |\n"
+    )
+    out = to_slack(src)
+    assert "COMP-CDM-AUTH" in out and "Authentication" in out, out
+    assert "COMP-CDM-OFFER-CREATOR" in out, out
+    assert "•" in out, out
+    assert "---" not in out, out
+    return out
+
+
 if __name__ == "__main__":
     print(_selftest())
     print()
     print(_ac_list_selftest())
+    print()
+    print(_plain_table_selftest())

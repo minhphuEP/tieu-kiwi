@@ -142,6 +142,23 @@ def _gen_testcase_intent(text):
     return m.group(1).upper() if m else None
 
 
+# Status-update intent, e.g. "Cập nhật trạng thái CDM-268",
+# "cap nhat trang thai CDM-268", "update status CDM-268". Fires the TR sync +
+# TC↔TR linker in tieukiwi.jira_ingest.sync_testruns_and_link_tcs.
+_STATUS_UPDATE_RE = re.compile(
+    r"c(?:ậ|a)p\s*nh(?:ậ|a)t\s*tr(?:ạ|a)ng\s*th(?:á|a)i"
+    r"|update\s*status",
+    re.I,
+)
+
+
+def _status_update_intent(text):
+    if not text or not _STATUS_UPDATE_RE.search(text):
+        return None
+    m = _REQ_RE.search(text)
+    return m.group(1).upper() if m else None
+
+
 # Discard intent: a command (not a button) to cancel the in-progress draft in this
 # thread, e.g. "discard test case", "cancel test cases", "hủy test case".
 _DISCARD_TC_RE = re.compile(r"(discard|cancel|h(ủ|u)y|b(ỏ|o))\s*(the\s*)?test\s*case", re.I)
@@ -465,6 +482,22 @@ def _testcase_draft_blocks(draft, approver_mention=None):
         {"type": "section", "text": {"type": "mrkdwn", "text": intro}},
         {"type": "divider"},
     ]
+    # Surface uncovered ACs so the reviewer sees them BEFORE the AC list —
+    # a partial draft is still returned (soft-fail after retry) rather than
+    # blocked, so this banner is the only signal the LLM left gaps.
+    gaps = draft.get("coverage_gaps") or []
+    if gaps:
+        gap_refs_by_id = {ac["ref"]: ac for ac in acs}
+        gap_lines = "\n".join(
+            f"• `{ref}` — {gap_refs_by_id.get(ref, {}).get('desc', '')[:100]}"
+            for ref in gaps
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": slack_format.to_slack(
+            f":warning: *{len(gaps)} AC chưa được cover* (LLM retry vẫn skip — "
+            f"thường do AC quá ngắn/mơ hồ như section header). Refine kèm hướng "
+            f"dẫn cụ thể để add testcase cho:\n{gap_lines}"
+        )}})
+        blocks.append({"type": "divider"})
     coverage_text = slack_format.render_ac_list(acs)
     chunks = _chunk_mrkdwn(coverage_text)
     truncated = len(chunks) > _MAX_SECTION_BLOCKS
@@ -538,13 +571,48 @@ def _delete_superseded_excel(client, file_id, logger=None):
 
 def _do_gen_testcase(say, client, requirement_ref, logger=None, thread_ts=None, channel_id=None):
     project_id = _project_for_channel(channel_id, logger)
+    # Immediate progress message so the user doesn't stare at silence for
+    # 30-60s while the LLM streams. Retained ts is used to chat_update
+    # (or ignored on best-effort failure — the final draft post is what
+    # matters).
+    progress_kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    progress_ts = None
+    try:
+        progress_resp = say(
+            text=slack_format.to_slack(
+                f":hourglass_flowing_sand: Đang generate draft test cases cho `{requirement_ref}`… "
+                f"(LLM có thể mất 30-60s cho requirement nhiều AC)"
+            ),
+            **progress_kwargs,
+        )
+        progress_ts = progress_resp.get("ts") if progress_resp else None
+    except Exception:
+        if logger is not None:
+            logger.exception("posting progress message failed (non-fatal)")
+
     try:
         draft = testcase_gen.generate_draft(requirement_ref, project_id=project_id)
     except Exception as e:
         if logger is not None:
             logger.exception("generate_draft failed")
-        say(text=slack_format.to_slack(f":warning: Error: {e}"))
+        if progress_ts and channel_id:
+            try:
+                client.chat_update(
+                    channel=channel_id, ts=progress_ts,
+                    text=slack_format.to_slack(f":warning: Error: {e}"),
+                )
+            except Exception:
+                say(text=slack_format.to_slack(f":warning: Error: {e}"))
+        else:
+            say(text=slack_format.to_slack(f":warning: Error: {e}"))
         return
+    # Retire the progress placeholder now that the draft is ready.
+    if progress_ts and channel_id:
+        try:
+            client.chat_delete(channel=channel_id, ts=progress_ts)
+        except Exception:
+            if logger is not None:
+                logger.exception("deleting progress message failed (non-fatal)")
     kwargs = {"thread_ts": thread_ts} if thread_ts else {}
     qe_lead = db.mention_for(routing.approver_role_for("testcase"), project_id)
     posted = say(blocks=_testcase_draft_blocks(draft, qe_lead),
@@ -733,6 +801,55 @@ def _do_golive(say, requirement_ref, logger=None, thread_ts=None, channel_id=Non
             res.get("requirement") or requirement_ref, mention
         )
     say(blocks=blocks, text=f"Go/No-Go {requirement_ref}", **kwargs)
+
+
+# ---------------------------------------------------------------- status-update (sync TR + link TC↔TR)
+
+def _render_status_update(result, requirement_ref):
+    trs = result.get("testruns") or []
+    warnings = result.get("warnings") or []
+    if not trs:
+        body = (f":information_source: Không tìm thấy TestRun nào cho *{requirement_ref}* "
+                "(chưa có subtask test-env nào được ingest).")
+        return slack_format.to_slack(body)
+    lines = [f"*Cập nhật trạng thái TestRun cho {requirement_ref}*"]
+    for tr in trs:
+        env = tr.get("environment") or "?"
+        old_s = tr.get("old_status") or "?"
+        new_s = tr.get("new_status") or "?"
+        arrow = f"{old_s} → {new_s}" if old_s != new_s else new_s
+        line = f"• `{tr['ref']}` ({env}): {arrow}"
+        if tr.get("new_status") == "done" and tr.get("linked_tc_refs"):
+            n_new = tr.get("edges_added") or 0
+            n_total = len(tr["linked_tc_refs"])
+            line += (f" — linked {n_total} TestCase(s) via `executedBy`"
+                     f" (+{n_new} mới)")
+        lines.append(line)
+    if warnings:
+        lines.append("")
+        lines.append("_Warnings:_")
+        for w in warnings:
+            lines.append(f"  - {w}")
+    return slack_format.to_slack("\n".join(lines))
+
+
+def _do_status_update(say, requirement_ref, logger=None, thread_ts=None, channel_id=None):
+    # Sync live Jira status for every TR of this Requirement and, when a TR
+    # flips to 'done', link every covering TestCase to it via executedBy.
+    kwargs = {"thread_ts": thread_ts} if thread_ts else {}
+    project_id = _project_for_channel(channel_id, logger)
+    try:
+        result = jira_ingest.sync_testruns_and_link_tcs(
+            requirement_ref, project_id=project_id,
+        )
+    except Exception as e:
+        if logger is not None:
+            logger.exception("sync_testruns_and_link_tcs failed")
+        say(blocks=_mrkdwn_blocks(slack_format.to_slack(f":warning: Error: {e}")),
+            text="Error", **kwargs)
+        return
+    text = _render_status_update(result, requirement_ref)
+    say(blocks=_mrkdwn_blocks(text), text=f"Status update {requirement_ref}", **kwargs)
 
 
 # ---------------------------------------------------------------- clarify-requirements interview
@@ -1027,7 +1144,7 @@ def _ensure_ticket_fresh(client, channel_id, thread_ts, ref, project_id,
 
     status = summary.get("status")
     if status == "cached_fresh":
-        text_line = f"✅ *{ref}* đã cached (hash không đổi)."
+        text_line = f"✅ *{ref}* đã có dữ liệu."
     elif status == "ok":
         n_bugs = len(summary.get("bugs") or [])
         n_conf = len(summary.get("confluence_pages") or [])
@@ -1148,6 +1265,14 @@ def _handle_turn(say, client, channel_id, thread_ts, text, logger=None, user_id=
             _ask_which_ticket(say, **kwargs)
         return
 
+    # Status-update: sync TR status + link TC↔TR when done.
+    if _STATUS_UPDATE_RE.search(text or ""):
+        if ref:
+            _do_status_update(say, ref, logger, thread_ts=thread_ts, channel_id=channel_id)
+        else:
+            _ask_which_ticket(say, **kwargs)
+        return
+
     # Clarify / find ambiguities.
     if _clarify_intent(text):
         clarify_ref, raw_text = _clarify_target(text)
@@ -1226,6 +1351,13 @@ def build_app():
         tc_ref = _gen_testcase_intent(text)
         if tc_ref:
             _do_gen_testcase(say, client, tc_ref, logger, channel_id=command.get("channel_id"))
+            return
+
+        # Status-update request -> sync live Jira status for TRs of this Story
+        # and link executedBy edges when a TR is 'done'.
+        status_ref = _status_update_intent(text)
+        if status_ref:
+            _do_status_update(say, status_ref, logger, channel_id=command.get("channel_id"))
             return
 
         # Clarify-requirements question -> find ambiguities + Slack interview modal.
